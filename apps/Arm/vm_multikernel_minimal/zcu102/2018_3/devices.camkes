@@ -58,47 +58,12 @@ assembly {
             "clean_cache" : false,
         };
         vm0_1.vm_image_config = {
-            "kernel_name" : "linux_kernel",
-            "kernel_image_size" : VAR_STRINGIZE(FILE_linux_kernel_SIZE),
-            "initrd_size" : VAR_STRINGIZE(FILE_linux_initrd_SIZE),
-            "initrd_name" : "linux_initrd",
             "dtb_base_name" : "linux_dtb",
-            "kernel_bootcmdline" : "console=ttyPS1,115200 root=/dev/ram rw earlycon clk_ignore_unused  xilinx_tsn_ep.st_pcp=4 init_fatal_sh=1 ",
-            "kernel_stdout" : "serial1:115200n8",
             "generate_dtb" : false,
             "provide_dtb" : false,
-            "map_one_to_one" : false,
-            "provide_initrd": true,
-            "clean_cache" : false,
         };
-        vm0_2.vm_image_config = {
-            "kernel_name" : "linux_kernel",
-            "kernel_image_size" : VAR_STRINGIZE(FILE_linux_kernel_SIZE),
-            "initrd_size" : VAR_STRINGIZE(FILE_linux_initrd_SIZE),
-            "initrd_name" : "linux_initrd",
-            "dtb_base_name" : "linux_dtb",
-            "kernel_bootcmdline" : "console=ttyPS1,115200 root=/dev/ram rw earlycon clk_ignore_unused  xilinx_tsn_ep.st_pcp=4 init_fatal_sh=1 ",
-            "kernel_stdout" : "serial1:115200n8",
-            "generate_dtb" : false,
-            "provide_dtb" : false,
-            "map_one_to_one" : false,
-            "provide_initrd": true,
-            "clean_cache" : false,
-        };
-        vm0_3.vm_image_config = {
-            "kernel_name" : "linux_kernel",
-            "kernel_image_size" : VAR_STRINGIZE(FILE_linux_kernel_SIZE),
-            "initrd_size" : VAR_STRINGIZE(FILE_linux_initrd_SIZE),
-            "initrd_name" : "linux_initrd",
-            "dtb_base_name" : "linux_dtb",
-            "kernel_bootcmdline" : "console=ttyPS1,115200 root=/dev/ram rw earlycon clk_ignore_unused  xilinx_tsn_ep.st_pcp=4 init_fatal_sh=1 ",
-            "kernel_stdout" : "serial1:115200n8",
-            "generate_dtb" : false,
-            "provide_dtb" : false,
-            "map_one_to_one" : false,
-            "provide_initrd": true,
-            "clean_cache" : false,
-        };
+        vm0_2.vm_image_config <- vm0_1.vm_image_config;
+        vm0_3.vm_image_config <- vm0_1.vm_image_config;
         vm0.dtb = dtb([{"path": "/amba/serial@ff000000"} ]);
       //  vm0_1.dtb <- vm0.dtb;
 

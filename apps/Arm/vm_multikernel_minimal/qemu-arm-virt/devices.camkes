@@ -1,0 +1,79 @@
+/*
+ * Copyright 2018, Data61, CSIRO (ABN 41 687 119 230)
+ * Copyright 2025, Kry10 Pty. Ltd.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <configurations/vm.h>
+#include "vm_file_sizes.h"
+#define VM_INITRD_MAX_SIZE 0x1900000 //25 MB
+#define VM_RAM_BASE 0x40000000
+#define VM_RAM_SIZE 0x20000000
+#define VM_RAM_PAGE_SIZE_BITS 21
+#define VM_RAM_OFFSET 0x00000000
+#define VM_DTB_ADDR 0x4F000000
+#define VM_INITRD_ADDR 0x4D700000
+#define VM_ENTRY_ADDR 0x40000000
+
+
+assembly {
+	composition {}
+	configuration {
+
+        vm0.vm_address_config = {
+            "ram_base" : VAR_STRINGIZE(VM_RAM_BASE),
+            "ram_paddr_base" : VAR_STRINGIZE(VM_RAM_BASE),
+            "ram_page_size_bits" : VAR_STRINGIZE(VM_RAM_PAGE_SIZE_BITS),
+            "ram_size" : VAR_STRINGIZE(VM_RAM_SIZE),
+            "dtb_addr" : VAR_STRINGIZE(VM_DTB_ADDR),
+            "initrd_addr" : VAR_STRINGIZE(VM_INITRD_ADDR),
+            "kernel_entry_addr" : VAR_STRINGIZE(VM_ENTRY_ADDR),
+        };
+
+        vm0_1.vm_address_config <- vm0.vm_address_config;
+        vm0_2.vm_address_config <- vm0.vm_address_config;
+        vm0_3.vm_address_config <- vm0.vm_address_config;
+
+        vm0.memdev_hardware_cached = true;
+        vm0_1.memdev_hardware_cached = true;
+        vm0_2.memdev_hardware_cached = true;
+        vm0_3.memdev_hardware_cached = true;
+        vm_memdev0.paddr = VM_RAM_BASE;
+        vm_memdev0.size = VM_RAM_SIZE;
+
+        vm0.vm_image_config = {
+            "kernel_name" : "linux_kernel",
+            "kernel_image_size" : VAR_STRINGIZE(FILE_linux_kernel_SIZE),
+            "initrd_size" : VAR_STRINGIZE(FILE_linux_initrd_SIZE),
+            "initrd_name" : "linux_initrd",
+            "dtb_base_name" : "linux_dtb",
+            "kernel_bootcmdline" : "console=ttyS0 earlycon=pl011,0x9000000 earlyprintk=serial debug loglevel=8 ",
+            "generate_dtb" : true,
+            "provide_dtb" : true,
+            "provide_initrd": true,
+            "clean_cache" : false,
+        };
+
+        vm0_1.vm_image_config <- vm0.vm_image_config;
+        vm0_2.vm_image_config <- vm0.vm_image_config;
+        vm0_3.vm_image_config <- vm0.vm_image_config;
+
+
+
+        vm0.dtb = dtb([
+                        {"path": "/pl011@9000000"},
+                    ]);
+
+        vm0.mmios = [
+                        "0x8040000:0x1000:12", // Interrupt Controller Virtual CPU interface (Virtual Machine view)
+                    ];
+        vm0_1.mmios = [
+                        "0x8040000:0x1000:12", // Interrupt Controller Virtual CPU interface (Virtual Machine view)
+                        "0x9000000:0x1000:12", // pl011@9000000
+                    ];
+        vm0_2.mmios <- vm0_1.mmios;
+        vm0_3.mmios <- vm0_1.mmios;
+
+	}
+}

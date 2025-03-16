@@ -1,0 +1,22 @@
+/*
+ * Copyright 2025, Kry10 Pty. Ltd.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+/ {
+
+
+	reserved-memory {
+		#address-cells = < 0x02 >;
+		#size-cells = < 0x02 >;
+		ranges;
+
+		vm-memory@10000000 {
+			reg = <0x0 0x20000000 0x0 0x60000000>;
+			no-map;
+		};
+	};
+
+
+};

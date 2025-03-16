@@ -1,0 +1,127 @@
+/*
+ * Copyright 2023, DornerWorks
+ * Copyright 2025, Kry10 Pty. Ltd.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <plat/smc.h>
+#include <configurations/vm.h>
+#include "vm_file_sizes.h"
+
+#define VM_INITRD_MAX_SIZE 0x1900000 //25 MB
+#define VM_RAM_BASE 0x20000000
+#define VM_RAM_SIZE 0x30000000
+#define VM_RAM_PAGE_SIZE_BITS 21
+#define VM_ENTRY_ADDR 0x20080000
+#define VM_RAM_OFFSET 0
+#define VM_DTB_ADDR 0x22000000
+#define VM_INITRD_ADDR 0x23000000
+
+assembly {
+    composition {}
+    configuration {
+
+        vm0.vm_address_config = {
+            "ram_base" : VAR_STRINGIZE(VM_RAM_BASE),
+            "ram_paddr_base" : VAR_STRINGIZE(VM_RAM_BASE),
+            "ram_page_size_bits" : VAR_STRINGIZE(VM_RAM_PAGE_SIZE_BITS),
+            "ram_size" : VAR_STRINGIZE(VM_RAM_SIZE),
+            "dtb_addr" : VAR_STRINGIZE(VM_DTB_ADDR),
+            "initrd_addr" : VAR_STRINGIZE(VM_INITRD_ADDR),
+            "kernel_entry_addr" : VAR_STRINGIZE(VM_ENTRY_ADDR),
+        };
+        vm0_1.vm_address_config <- vm0.vm_address_config;
+        vm0_2.vm_address_config <- vm0.vm_address_config;
+        vm0_3.vm_address_config <- vm0.vm_address_config;
+
+
+        vm0.memdev_hardware_cached = true;
+        vm0_1.memdev_hardware_cached = true;
+        vm0_2.memdev_hardware_cached = true;
+        vm0_3.memdev_hardware_cached = true;
+        vm_memdev0.paddr = VM_RAM_BASE;
+        vm_memdev0.size = VM_RAM_SIZE;
+
+        vm0.vm_image_config = {
+            "kernel_name" : "linux_kernel",
+            "kernel_image_size" : VAR_STRINGIZE(FILE_linux_kernel_SIZE),
+            "initrd_size" : VAR_STRINGIZE(FILE_linux_initrd_SIZE),
+            "initrd_name" : "linux_initrd",
+            "dtb_base_name" : "linux_dtb",
+            "kernel_bootcmdline" : "console=ttyPS0,115200 root=/dev/ram rw earlycon clk_ignore_unused",
+            "kernel_stdout" : "serial0:115200n8",
+            "generate_dtb" : true,
+            "provide_dtb" : true,
+            "map_one_to_one" : false,
+            "provide_initrd": true,
+            "clean_cache" : false,
+        };
+        vm0_1.vm_image_config = {
+            "dtb_base_name" : "linux_dtb",
+            "generate_dtb" : false,
+            "provide_dtb" : false,
+        };
+        vm0_2.vm_image_config <- vm0_1.vm_image_config;
+        vm0_3.vm_image_config <- vm0_1.vm_image_config;
+
+        vm0.mmios = ["0xf9060000:0x1000:12"]; // Interrupt Controller Virtual CPU interface (Virtual Machine view)
+        vm0_1.mmios <- vm0.mmios;
+        vm0_2.mmios <- vm0.mmios;
+        vm0_3.mmios <- vm0.mmios;
+        vm0.plat_keep_devices = [
+            "/pss_ref_clk",
+            "/gt_crx_ref_clk",
+            "/pss_alt_ref_clk",
+            "/aux_ref_clk",
+            "/video_clk",
+            "/pmu",
+            "/psci",
+            "/timer",
+            "/aliases",
+            "/amba/serial@ff000000",
+            "/cpus/cpu@0",
+            "/cpus/cpu@1",
+            "/cpus/cpu@2",
+            "/cpus/cpu@3"
+        ];
+        vm0_1.plat_keep_devices <- vm0.plat_keep_devices;
+        vm0_2.plat_keep_devices <- vm0.plat_keep_devices;
+        vm0_3.plat_keep_devices <- vm0.plat_keep_devices;
+
+        vm0.plat_keep_devices_and_subtree = [
+            "/firmware",
+            "/amba/pinctrl@ff180000"
+        ];
+
+        vm0_1.plat_keep_devices_and_subtree <- vm0.plat_keep_devices_and_subtree;
+        vm0_2.plat_keep_devices_and_subtree <- vm0.plat_keep_devices_and_subtree;
+        vm0_3.plat_keep_devices_and_subtree <- vm0.plat_keep_devices_and_subtree;
+
+        vm0.allow_smc = true;
+        vm0_1.allow_smc = true;
+        vm0_2.allow_smc = true;
+        vm0_3.allow_smc = true;
+        vm0.allowed_smc_functions = [
+            SMC_PM_GET_API_VERSION,
+            SMC_PM_REQUEST_NODE,
+            SMC_PM_SET_REQUIREMENT,
+            SMC_PM_INIT_FINALIZE,
+            SMC_PM_PINCTRL_REQUEST,
+            SMC_PM_PINCTRL_RELEASE,
+            SMC_PM_PINCTRL_SET_FUNCTION,
+            SMC_PM_PINCTRL_CONFIG_PARAM_SET,
+            SMC_PM_IOCTL,
+            SMC_PM_QUERY_DATA,
+            SMC_PM_CLOCK_ENABLE,
+            SMC_PM_CLOCK_GETSTATE,
+            SMC_PM_CLOCK_GETDIVIDER,
+            SMC_PM_CLOCK_GETPARENT,
+            SMC_PM_GET_TRUSTZONE_VERSION,
+
+        ];
+        vm0_1.allowed_smc_functions <- vm0.allowed_smc_functions;
+        vm0_2.allowed_smc_functions <- vm0.allowed_smc_functions;
+        vm0_3.allowed_smc_functions <- vm0.allowed_smc_functions;
+    }
+}

@@ -1,0 +1,186 @@
+/*
+ * Copyright 2017, Data61, CSIRO (ABN 41 687 119 230)
+ * Copyright 2025, Kry10 Pty. Ltd.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <configurations/vm.h>
+
+import <std_connector.camkes>;
+import <global-connectors.camkes>;
+
+import <seL4VMDTBPassthrough.idl4>;
+import <FileServerInterface.camkes>;
+import <SerialServer/SerialServer.camkes>;
+import <TimeServer/TimeServer.camkes>;
+
+import <vm-connectors.camkes>;
+import <vm0_devices.camkes>;
+import <vm1_devices.camkes>;
+import <multikernel.camkes>;
+
+component VM {
+    VM_INIT_DEF()
+}
+
+component VM_Ram {
+    hardware;
+    dataport Buf memdev;
+}
+
+assembly {
+    composition {
+        VM_GENERAL_COMPOSITION_DEF()
+        VM_VIRTUAL_SERIAL_COMPONENTS_DEF()
+
+        // Declare 4 VMM camkes applications (one for each core)
+        VM_COMPOSITION_DEF(0)
+        VM_COMPOSITION_DEF(0_1)
+        VM_COMPOSITION_DEF(0_2)
+        VM_COMPOSITION_DEF(0_3)
+
+        // Only passthrough to a single node because IRQs can't be dynamically remapped.
+        connection seL4VMDTBPassthrough vm_dtb(from vm0.dtb_self, to vm0.dtb);
+
+        // Shared virtual DRAM device, directly mapped
+        component VM_Ram vm0_ram;
+        connection seL4HWSharedDataWithCaps vm_memdev0(from vm0_ram.memdev,
+                                                               to vm0.memdev, to vm0_1.memdev, to vm0_2.memdev, to vm0_3.memdev);
+        // Communication transport between the vmms
+        connection seL4MultikernelInterconnect interconnect(from vm0.iq_multikernel, to vm0_1.iq_multikernel, to vm0_2.iq_multikernel, to vm0_3.iq_multikernel);
+        PER_VM_VIRTUAL_SERIAL_CONNECTIONS_DEF(0)
+
+        // // Declare 4 VMM camkes applications (one for each core)
+        VM_COMPOSITION_DEF(1)
+        VM_COMPOSITION_DEF(1_1)
+        VM_COMPOSITION_DEF(1_2)
+        VM_COMPOSITION_DEF(1_3)
+
+        // Only passthrough to a single node because IRQs can't be dynamically remapped.
+        connection seL4VMDTBPassthrough vm1_dtb(from vm1.dtb_self, to vm1.dtb);
+
+        // Shared virtual DRAM device, directly mapped
+        component VM_Ram vm1_ram;
+        connection seL4HWSharedDataWithCaps vm_memdev1(from vm1_ram.memdev,
+                                                               to vm1.memdev, to vm1_1.memdev, to vm1_2.memdev, to vm1_3.memdev);
+        // Communication transport between the vmms
+        connection seL4MultikernelInterconnect interconnect1(from vm1.iq_multikernel, to vm1_1.iq_multikernel, to vm1_2.iq_multikernel, to vm1_3.iq_multikernel);
+        PER_VM_VIRTUAL_SERIAL_CONNECTIONS_DEF(1)
+
+    }
+    configuration {
+        VM_GENERAL_CONFIGURATION_DEF()
+        VM_VIRTUAL_SERIAL_GENERAL_CONFIGURATION_DEF()
+        VM_CONFIGURATION_DEF(0)
+        VM_CONFIGURATION_DEF(0_1)
+        VM_CONFIGURATION_DEF(0_2)
+        VM_CONFIGURATION_DEF(0_3)
+        PER_VM_VIRTUAL_SERIAL_CONFIGURATION_DEF(0)
+
+        VM_CONFIGURATION_DEF(1)
+        VM_CONFIGURATION_DEF(1_1)
+        VM_CONFIGURATION_DEF(1_2)
+        VM_CONFIGURATION_DEF(1_3)
+        PER_VM_VIRTUAL_SERIAL_CONFIGURATION_DEF(1)
+        // Assign each camkes app to the node declared in the multikernel.camkes platform file
+        vm0.node = "node0";
+        vm0_1.node = "node1";
+        vm0_2.node = "node2";
+        vm0_3.node = "node3";
+        vm1.node = "node0";
+        vm1_1.node = "node1";
+        vm1_2.node = "node2";
+        vm1_3.node = "node3";
+
+        serial.node = "node0";
+        time_server.node = "node0";
+
+        // Interconnect settings:
+        // These control the mpidr given to each of the guest cpu cores
+        // and is used to identify the vmm instances to each other when sending
+        // and receiving IPI messages via the interconnect
+        vm0.vm_id = 0;
+        vm0_1.vm_id = 1;
+        vm0_2.vm_id = 2;
+        vm0_3.vm_id = 3;
+        interconnect.num_nodes = 4;
+        interconnect.extra_len = 0x1000;
+
+        vm1.vm_id = 0;
+        vm1_1.vm_id = 1;
+        vm1_2.vm_id = 2;
+        vm1_3.vm_id = 3;
+        interconnect1.num_nodes = 4;
+        interconnect1.extra_len = 0x1000;
+
+        // Assign the general VMM camkes app settings.
+        // Reassign the same settings for all cores:
+        vm0.num_extra_frame_caps = 0;
+        vm0.extra_frame_map_address = 0;
+        vm0.cnode_size_bits = 17;
+        vm0.simple_untyped22_pool = 1;
+
+        // 6 is a magic number here and below which means the maximum number
+        // of camkes connections that can send signals to the VM
+        // before an error will be generated at build time. At this point,
+        // the number 6 could be increased, but this reduces the number of
+        // slots available for IRQ passthrough. If there's too many IRQs,
+        // the VMM will fail an assert during startup time.
+        vm0.global_endpoint_mask = (1 << 6) - 1;
+
+        vm0_1.num_extra_frame_caps <- vm0.num_extra_frame_caps;
+        vm0_1.extra_frame_map_address <- vm0.extra_frame_map_address;
+        vm0_1.cnode_size_bits <- vm0.cnode_size_bits;
+        vm0_1.simple_untyped22_pool <- vm0.simple_untyped22_pool;
+        vm0_1.global_endpoint_mask <- vm0.global_endpoint_mask;
+
+        vm0_2.num_extra_frame_caps <- vm0.num_extra_frame_caps;
+        vm0_2.extra_frame_map_address <- vm0.extra_frame_map_address;
+        vm0_2.cnode_size_bits <- vm0.cnode_size_bits;
+        vm0_2.simple_untyped22_pool <- vm0.simple_untyped22_pool;
+        vm0_2.global_endpoint_mask <- vm0.global_endpoint_mask;
+
+        vm0_3.num_extra_frame_caps <- vm0.num_extra_frame_caps;
+        vm0_3.extra_frame_map_address <- vm0.extra_frame_map_address;
+        vm0_3.cnode_size_bits <- vm0.cnode_size_bits;
+        vm0_3.simple_untyped22_pool <- vm0.simple_untyped22_pool;
+        vm0_3.global_endpoint_mask <- vm0.global_endpoint_mask;
+
+
+        // Assign the general VMM camkes app settings.
+        // Reassign the same settings for all cores:
+        vm1.num_extra_frame_caps = 0;
+        vm1.extra_frame_map_address = 0;
+        vm1.cnode_size_bits = 17;
+        vm1.simple_untyped22_pool = 1;
+
+        // 6 is a magic number here and below which means the maximum number
+        // of camkes connections that can send signals to the VM
+        // before an error will be generated at build time. At this point,
+        // the number 6 could be increased, but this reduces the number of
+        // slots available for IRQ passthrough. If there's too many IRQs,
+        // the VMM will fail an assert during startup time.
+        vm1.global_endpoint_mask = (1 << 6) - 1;
+
+        vm1_1.num_extra_frame_caps <- vm1.num_extra_frame_caps;
+        vm1_1.extra_frame_map_address <- vm1.extra_frame_map_address;
+        vm1_1.cnode_size_bits <- vm1.cnode_size_bits;
+        vm1_1.simple_untyped22_pool <- vm1.simple_untyped22_pool;
+        vm1_1.global_endpoint_mask <- vm1.global_endpoint_mask;
+
+        vm1_2.num_extra_frame_caps <- vm1.num_extra_frame_caps;
+        vm1_2.extra_frame_map_address <- vm1.extra_frame_map_address;
+        vm1_2.cnode_size_bits <- vm1.cnode_size_bits;
+        vm1_2.simple_untyped22_pool <- vm1.simple_untyped22_pool;
+        vm1_2.global_endpoint_mask <- vm1.global_endpoint_mask;
+
+        vm1_3.num_extra_frame_caps <- vm1.num_extra_frame_caps;
+        vm1_3.extra_frame_map_address <- vm1.extra_frame_map_address;
+        vm1_3.cnode_size_bits <- vm1.cnode_size_bits;
+        vm1_3.simple_untyped22_pool <- vm1.simple_untyped22_pool;
+        vm1_3.global_endpoint_mask <- vm1.global_endpoint_mask;
+
+
+    }
+}

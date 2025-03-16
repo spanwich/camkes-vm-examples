@@ -1,0 +1,101 @@
+/*
+ * Copyright 2025, Kry10 Pty. Ltd.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+component Kernel {
+    hardware;
+}
+
+/*
+ * This multikernel set up has 4 nodes.
+ * 
+ * DRAM on this platform runs from 0x00000000 to 0x80000000+ (2GiB+)
+ * - 0x20000000 - 0x50000000 is reserved for the VM ram device
+ * - 0x00000000 - 0x04000000 is assigned to node 0 kernel
+ * - 0x04000000 - 0x08000000 is assigned to node 1 kernel
+ * - 0x08000000 - 0x0c000000 is assigned to node 2 kernel
+ * - 0x0c000000 - 0x10000000 is assigned to node 3 kernel
+ * - 0x10000000 - 0x20000000 is assigned as the shared pool.
+ * 
+ * Each kernel has to mark the private memory of other kernels as reserved
+ * to ensure no device ut are handed out for those regions.
+ * Device ut will be handed out for the VM Ram device region and the shared pool region
+ * for all 4 nodes.
+ * 
+ */
+
+#define decl_mem(start, size) \
+	[{ \
+        "node": "/memory@0", \
+        "#size-cells": 2, \
+        "#address-cells": 2, \
+        "reg": [ \
+            {"start": start, "size": size }, \
+        ]}]
+
+
+assembly {
+    composition {
+        component Kernel node0;
+        component Kernel node1;
+        component Kernel node2;
+        component Kernel node3;
+    }
+
+    configuration {
+        node0.node_id = 0;
+        node1.node_id = 1;
+        node2.node_id = 2;
+        node3.node_id = 3;
+
+
+        // Memory assignment
+        node0.memory = decl_mem(0x00000000, 0x4000000);
+        node1.memory = decl_mem(0x04000000, 0x4000000);
+        node2.memory = decl_mem(0x08000000, 0x4000000);
+        node3.memory = decl_mem(0x0c000000, 0x4000000);
+
+        // Shared pool assignment
+        node0.shared_pool = [
+            {"start": 0x10000000, "size": 0x1000000 },
+        ];
+        node1.shared_pool <- node0.shared_pool;
+        node2.shared_pool <- node0.shared_pool;
+        node3.shared_pool <- node0.shared_pool;
+
+        // Reserved memory assignment
+        node0.reserved = [
+                {"start": 0x04000000, "size": 0xc000000 },
+            ];
+
+        node1.reserved = [
+                {"start": 0x00000000, "size": 0x4000000 },
+                {"start": 0x08000000, "size": 0x8000000 },
+            ];
+
+        node2.reserved = [
+                {"start": 0x00000000, "size": 0x8000000 },
+                {"start": 0x0c000000, "size": 0x4000000 },
+            ];
+
+        node3.reserved = [
+                {"start": 0x00000000, "size": 0xc000000 },
+            ];
+
+        // Shared peripheral IRQ node assignment
+        node0.spi_irqs = [
+            53, // serial@ff000000
+            68, // timer@ff110000
+            69, // timer@ff110000
+            70, // timer@ff110000
+            71, // timer@ff120000
+            72, // timer@ff120000
+            73  // timer@ff120000
+        ];
+
+
+    }
+
+}

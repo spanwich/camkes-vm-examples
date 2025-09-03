@@ -1,0 +1,52 @@
+# Build directories
+build/
+build-*/
+build_*/
+test-build/
+test-debug/
+test_*/
+
+# Cache directories
+.sel4_cache/
+
+# Generated files
+*.o
+*.a
+*.bin
+*.elf
+*.dtb
+*.dts
+*.pickle
+*.pickle.*
+*.log
+*.deps
+*.cmake
+CMakeCache.txt
+CMakeFiles/
+.ninja_*
+
+# Temporary files
+*~
+*.tmp
+*.temp
+.DS_Store
+.vscode/
+.idea/
+
+# Generated configuration
+autoconf/
+gen_config/
+gen_headers/
+generated/
+generated_prune/
+
+# Archives and images
+*.cpio
+*.cpio.gz
+*.tar.gz
+images/
+
+# Simulation artifacts
+simulate
+launch_gdb
+*.dot

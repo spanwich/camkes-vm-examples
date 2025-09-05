@@ -1,0 +1,54 @@
+#!/bin/sh
+#
+# Copyright 2019, Data61, CSIRO (ABN 41 687 119 230)
+#
+# SPDX-License-Identifier: BSD-2-Clause
+#
+
+set -e
+
+echo "=== Echo Service Test ==="
+
+# Read initial message from echo service
+echo "1. Reading initial message from echo service:"
+dataport_read /dev/uio0 4096
+echo -ne "This is a test user string\n\0" | dataport_write /dev/uio0 4096
+dataport_read /dev/uio0 4096
+consumes_event_wait /dev/uio0 &
+sleep 1
+emits_event_emit /dev/uio0
+wait
+echo "Finished step 1."
+
+# Test message 1
+echo "2. Sending test message 1: 'Hello from VM!'"
+dataport_read /dev/uio0 4096
+echo -ne "Hello from VM!\n\0" | dataport_write /dev/uio1 4096  # Write to src buffer
+dataport_read /dev/uio0 4096
+consumes_event_wait /dev/uio0 &
+sleep 1
+emits_event_emit /dev/uio0
+wait
+echo "Finished step 2"
+
+# Test message 2  
+echo "3. Sending test message 2: 'CAmkES VM Cross-Connector Test'"
+dataport_read /dev/uio0 4096
+echo -ne "CAmkES VM Cross-Connector Test\n\0" | dataport_write /dev/uio1 4096
+dataport_read /dev/uio0 4096
+consumes_event_wait /dev/uio0 &
+sleep 1
+emits_event_emit /dev/uio0
+wait
+echo "Finished step 3."
+
+# Test message 3
+echo "4. Sending test message 3: 'seL4 Microkernel Virtualization'"
+dataport_read /dev/uio0 4096
+echo -ne "CAmkES VM Cross-Connector Test\n\0" | dataport_write /dev/uio1 4096
+dataport_read /dev/uio0 4096
+consumes_event_wait /dev/uio0 &
+sleep 1
+emits_event_emit /dev/uio0
+wait
+echo "Finished step 4."

@@ -1,0 +1,167 @@
+/*
+ * vm_echo_net.camkes - Network Filter + Echo Component Architecture
+ *
+ * This demonstrates a three-component system:
+ *   VM ↔ (VirtQueues) ↔ NetworkFilter ↔ (Dataports) ↔ NetworkEcho
+ *
+ * Architecture:
+ * - VM sends network packets via VirtQueue to NetworkFilter
+ * - NetworkFilter forwards packets to NetworkEcho via dataport
+ * - NetworkEcho processes and echoes packets back via dataport
+ * - NetworkFilter receives echoed packets and forwards to VM
+ *
+ * This proves the bridge component pattern where NetworkFilter acts as
+ * a gateway between VM network traffic and native processing components.
+ */
+
+#include <configurations/vm.h>
+
+import <std_connector.camkes>;
+import <global-connectors.camkes>;
+import <seL4VMDTBPassthrough.idl4>;
+import <FileServerInterface.camkes>;
+import <FileServer/FileServer.camkes>;
+import <SerialServer/SerialServer.camkes>;
+import <TimeServer/TimeServer.camkes>;
+import <vm-connectors.camkes>;
+import <devices.camkes>;
+
+/* VSwitch mapping structure for VM network configuration */
+struct vswitch_mapping {
+    string mac_addr;
+    int send_id;
+    int recv_id;
+};
+
+/* NetworkFilter component with VirtQueue interfaces for VM communication
+ * and dataport interfaces for NetworkEcho communication */
+component NetworkFilter {
+    control;
+
+    /* VirtQueue interfaces for VM communication */
+    uses VirtQueueDev vm_recv;
+    uses VirtQueueDrv vm_send;
+    emits Callback self;
+    consumes Callback network_wait;
+
+    /* VSwitch MAC address for network peer identification */
+    attribute string vswitch_mac_address = "";
+
+    /* Dataport interfaces for NetworkEcho communication */
+    dataport Buf(4096) packet_to_echo;      /* Send packets to NetworkEcho */
+    dataport Buf(4096) packet_from_echo;    /* Receive packets from NetworkEcho */
+
+    /* Event signaling for NetworkEcho synchronization */
+    emits Ready echo_ready;                 /* Signal NetworkEcho: packet ready */
+    consumes Done echo_done;                /* Receive NetworkEcho: processing done */
+};
+
+/* NetworkEcho component processes packets received via dataports */
+component NetworkEcho {
+    control;
+
+    /* Dataport interfaces (NetworkFilter's perspective is reversed) */
+    dataport Buf(4096) packet_in;           /* Receive packets from NetworkFilter */
+    dataport Buf(4096) packet_out;          /* Send processed packets to NetworkFilter */
+
+    /* Event handling */
+    consumes Ready ready;                   /* NetworkFilter signals packet ready */
+    emits Done done;                        /* Signal NetworkFilter: processing done */
+};
+
+/* VM component with VirtQueue and vswitch configuration */
+component VM {
+    VM_INIT_DEF()
+
+    /* VSwitch configuration (VirtQueue interfaces already in VM_INIT_DEF) */
+    attribute vswitch_mapping vswitch_layout[] = [];
+    attribute string vswitch_mac_address = "";
+}
+
+assembly {
+    composition {
+        VM_GENERAL_COMPOSITION_DEF()
+        VM_COMPOSITION_DEF(0)
+
+        /* Instantiate components */
+        component NetworkFilter network_filter;
+        component NetworkEcho network_echo;
+
+        /* VirtQueue initialization components for VM ↔ NetworkFilter */
+        component VirtQueueInit net_vqinit_vm_to_filter;
+        component VirtQueueInit net_vqinit_filter_to_vm;
+
+        /* VM → NetworkFilter VirtQueue connection (VM sends packets) */
+        connection seL4VirtQueues net_virtq_vm_to_filter(
+            to net_vqinit_vm_to_filter.init,
+            from network_filter.vm_recv,
+            from vm0.send
+        );
+
+        /* NetworkFilter → VM VirtQueue connection (NetworkFilter sends packets) */
+        connection seL4VirtQueues net_virtq_filter_to_vm(
+            to net_vqinit_filter_to_vm.init,
+            from network_filter.vm_send,
+            from vm0.recv
+        );
+
+        /* NetworkFilter event loop callback */
+        connection seL4GlobalAsynchCallback net_global_callback(
+            from network_filter.self,
+            to network_filter.network_wait
+        );
+
+        /* NetworkFilter → NetworkEcho dataport connections */
+        connection seL4SharedDataWithCaps filter_to_echo_data(
+            from network_filter.packet_to_echo,
+            to network_echo.packet_in
+        );
+
+        connection seL4SharedDataWithCaps echo_to_filter_data(
+            from network_filter.packet_from_echo,
+            to network_echo.packet_out
+        );
+
+        /* NetworkFilter → NetworkEcho event signaling */
+        connection seL4Notification echo_ready_event(
+            from network_filter.echo_ready,
+            to network_echo.ready
+        );
+
+        connection seL4GlobalAsynch echo_done_event(
+            from network_echo.done,
+            to network_filter.echo_done
+        );
+
+        /* VM device tree passthrough */
+        connection seL4VMDTBPassthrough vm_dtb(from vm0.dtb_self, to vm0.dtb);
+    }
+
+    configuration {
+        VM_GENERAL_CONFIGURATION_DEF()
+        VM_CONFIGURATION_DEF(0)
+
+        /* VM configuration */
+        vm0.num_extra_frame_caps = 0;
+        vm0.extra_frame_map_address = 0;
+        vm0.cnode_size_bits = 23;
+        vm0.simple_untyped24_pool = 12;
+
+        /* VM VirtQueue configuration for NetworkFilter communication */
+        vm0.recv_id = 1;                    /* Receive from NetworkFilter */
+        vm0.recv_shmem_size = 32768;
+        vm0.send_id = 0;                    /* Send to NetworkFilter */
+        vm0.send_shmem_size = 32768;
+
+        /* VM network configuration */
+        vm0.vswitch_mac_address = "02:00:00:00:AA:01";
+        vm0.vswitch_layout = [{"mac_addr": "02:00:00:00:AA:02", "recv_id": 1, "send_id": 0}];
+
+        /* NetworkFilter VirtQueue configuration */
+        network_filter.vm_recv_id = 0;      /* Receive from VM (matches vm0.send_id) */
+        network_filter.vm_recv_shmem_size = 32768;
+        network_filter.vm_send_id = 1;      /* Send to VM (matches vm0.recv_id) */
+        network_filter.vm_send_shmem_size = 32768;
+        network_filter.vswitch_mac_address = "02:00:00:00:AA:02";  /* Network peer MAC */
+    }
+}

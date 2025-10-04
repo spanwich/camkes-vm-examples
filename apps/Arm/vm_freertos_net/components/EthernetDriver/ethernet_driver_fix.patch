@@ -1,0 +1,14 @@
+--- ethernet_driver.c.orig
++++ ethernet_driver.c
+@@ -551,7 +551,10 @@
+            mac_addr[3], mac_addr[4], mac_addr[5]);
+ 
+     /* Setup virtqueues */
+-    uint8_t *ring_base = (uint8_t *)virtio_mmio_regs;
++    /* Allocate hardware ring buffer from component's heap */
++    static uint8_t hw_buffer[0x10000] __attribute__((aligned(4096)));
++    memset(hw_buffer, 0, sizeof(hw_buffer));
++    uint8_t *ring_base = hw_buffer;
+ 
+     /* RX queue */
+     regs->QueueSel = VIRTIO_NET_RX_QUEUE;

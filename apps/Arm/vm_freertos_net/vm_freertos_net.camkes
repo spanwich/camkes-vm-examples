@@ -1,0 +1,207 @@
+/*
+ * vm_freertos_net.camkes - FreeRTOS VM with Network Filtering
+ *
+ * This CAmkES assembly demonstrates sDDF-inspired network filtering
+ * for virtual machines. The NetworkFilter component sits between
+ * the external network and the FreeRTOS VM, providing:
+ *
+ * - Deep packet inspection
+ * - Security filtering and firewall rules
+ * - Protocol analysis and logging
+ * - Packet forwarding to/from VM
+ *
+ * Architecture:
+ *
+ *   External Network (future)
+ *           ↕
+ *   ┌─────────────────┐
+ *   │ NetworkFilter   │  ← Native CAmkES component
+ *   │   Component     │     (sDDF-inspired logic)
+ *   └────────┬────────┘
+ *            ↕ VirtQueues (send_virtqueue / recv_virtqueue)
+ *   ┌────────┴────────┐
+ *   │  VM Component   │
+ *   │  ┌───────────┐  │
+ *   │  │ FreeRTOS  │  │  ← Guest OS with virtio-net driver
+ *   │  │  Guest    │  │
+ *   │  └───────────┘  │
+ *   └─────────────────┘
+ */
+
+#include <configurations/vm.h>
+
+import <std_connector.camkes>;
+import <global-connectors.camkes>;
+import <seL4VMDTBPassthrough.idl4>;
+import <FileServerInterface.camkes>;
+import <FileServer/FileServer.camkes>;
+import <SerialServer/SerialServer.camkes>;
+import <TimeServer/TimeServer.camkes>;
+import <vm-connectors.camkes>;
+import <devices.camkes>;
+
+/*
+ * Virtual network switch mapping structure
+ *
+ * IMPORTANT: Must be defined BEFORE it's used in component attributes
+ */
+struct vswitch_mapping {
+    string mac_addr;
+    int send_id;
+    int recv_id;
+};
+
+/*
+ * NetworkFilter Component Definition
+ *
+ * This component provides network filtering services similar to
+ * sDDF's network virtualizer architecture, but implemented as a
+ * CAmkES component that can work with VMs.
+ */
+component NetworkFilter {
+    control;
+
+    /* VirtQueue interfaces for VM communication */
+    uses VirtQueueDev vm_recv;   /* Receive packets FROM VM */
+    uses VirtQueueDrv vm_send;   /* Send packets TO VM */
+
+    /* Event handling for virtqueue notifications */
+    emits Callback self;
+    consumes Callback network_wait;
+
+    /* Future: External network interface could be added here */
+    /* dataport Buf(4096) external_rx; */
+    /* dataport Buf(4096) external_tx; */
+
+    /* Configuration attributes */
+    attribute string mac_address = "02:00:00:00:AA:02";
+    attribute string ip_address = "192.168.1.254";
+};
+
+/*
+ * VM Component Definition
+ *
+ * Extended VM component with virtqueue connections for network.
+ * The vswitch_layout attribute configures the virtual network switch
+ * to route packets between the VM and NetworkFilter component.
+ */
+component VM {
+    VM_INIT_DEF()
+
+    /* Virtual network switch configuration */
+    attribute vswitch_mapping vswitch_layout[] = [];
+    attribute string vswitch_mac_address = "";
+};
+
+/*
+ * System Assembly
+ */
+assembly {
+    composition {
+        /* Standard VM components (FileServer, SerialServer, etc.) */
+        VM_GENERAL_COMPOSITION_DEF()
+        VM_COMPOSITION_DEF(0)
+
+        /* NetworkFilter component */
+        component NetworkFilter network_filter;
+
+        /* VirtQueue initialization components */
+        component VirtQueueInit net_vqinit_vm_to_filter;
+        component VirtQueueInit net_vqinit_filter_to_vm;
+
+        /*
+         * VirtQueue Connection: VM → NetworkFilter
+         *
+         * This virtqueue carries packets FROM the FreeRTOS VM TO the NetworkFilter.
+         * The VM's virtio-net driver sends packets here, and the NetworkFilter
+         * receives them via its vm_recv interface.
+         */
+        connection seL4VirtQueues net_virtq_vm_to_filter(
+            to net_vqinit_vm_to_filter.init,
+            from network_filter.vm_recv,    /* NetworkFilter receives */
+            from vm0.send                    /* VM sends */
+        );
+
+        /*
+         * VirtQueue Connection: NetworkFilter → VM
+         *
+         * This virtqueue carries packets FROM the NetworkFilter TO the FreeRTOS VM.
+         * The NetworkFilter sends packets here, and the VM's virtio-net driver
+         * receives them via its recv interface.
+         */
+        connection seL4VirtQueues net_virtq_filter_to_vm(
+            to net_vqinit_filter_to_vm.init,
+            from network_filter.vm_send,     /* NetworkFilter sends */
+            from vm0.recv                     /* VM receives */
+        );
+
+        /*
+         * Event notification for NetworkFilter
+         *
+         * This allows the NetworkFilter to wait for virtqueue events
+         * using the standard CAmkES async callback pattern.
+         */
+        connection seL4GlobalAsynchCallback network_filter_callback(
+            from network_filter.self,
+            to network_filter.network_wait
+        );
+
+        /* Device tree passthrough for VM */
+        connection seL4VMDTBPassthrough vm_dtb(from vm0.dtb_self, to vm0.dtb);
+    }
+
+    configuration {
+        /* Standard VM configuration */
+        VM_GENERAL_CONFIGURATION_DEF()
+        VM_CONFIGURATION_DEF(0)
+
+        /*
+         * VM Resource Configuration
+         */
+        vm0.num_extra_frame_caps = 0;
+        vm0.extra_frame_map_address = 0;
+        vm0.cnode_size_bits = 23;
+        vm0.simple_untyped24_pool = 12;
+
+        /*
+         * VM VirtQueue Configuration
+         *
+         * recv_id: VirtQueue ID for receiving packets (from NetworkFilter)
+         * send_id: VirtQueue ID for sending packets (to NetworkFilter)
+         * shmem_size: Shared memory size for packet buffers (32KB each)
+         */
+        vm0.recv_id = 0;
+        vm0.recv_shmem_size = 32768;
+        vm0.send_id = 1;
+        vm0.send_shmem_size = 32768;
+
+        /*
+         * VM Virtual Network Configuration
+         *
+         * vswitch_mac_address: MAC address for VM's network interface
+         * vswitch_layout: Routing table mapping MAC to virtqueue IDs
+         */
+        vm0.vswitch_mac_address = "02:00:00:00:AA:01";
+        vm0.vswitch_layout = [{
+            "mac_addr": "02:00:00:00:AA:02",  /* NetworkFilter MAC */
+            "recv_id": 0,                      /* VM receives on ID 0 */
+            "send_id": 1                       /* VM sends on ID 1 */
+        }];
+
+        /*
+         * NetworkFilter VirtQueue Configuration
+         *
+         * Must match the VM's configuration for proper packet routing.
+         */
+        network_filter.vm_recv_id = 0;
+        network_filter.vm_recv_shmem_size = 32768;
+        network_filter.vm_send_id = 1;
+        network_filter.vm_send_shmem_size = 32768;
+
+        /*
+         * NetworkFilter Network Configuration
+         */
+        network_filter.mac_address = "02:00:00:00:AA:02";
+        network_filter.ip_address = "192.168.1.254";
+    }
+}

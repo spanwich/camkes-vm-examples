@@ -1,0 +1,507 @@
+/*
+ * NetworkFilter Component - Proof of Concept
+ *
+ * This component demonstrates sDDF-inspired network filtering for CAmkES VMs.
+ * It sits between external network sources and the FreeRTOS VM, providing:
+ * - Packet inspection and filtering
+ * - Protocol parsing (Ethernet, IP, TCP, UDP, ICMP)
+ * - Security policy enforcement
+ * - Logging and monitoring
+ *
+ * Based on the PingClient pattern from vm_virtio_net example.
+ */
+
+#include <autoconf.h>
+#include <camkes.h>
+#include <stdio.h>
+#include <string.h>
+#include <virtqueue.h>
+#include <camkes/virtqueue.h>
+#include <utils/util.h>
+
+#include <net/ethernet.h>
+#include <netinet/ether.h>
+#include <netinet/in.h>
+#include <netinet/ip.h>
+#include <netinet/ip_icmp.h>
+#include <netinet/tcp.h>
+#include <netinet/udp.h>
+#include <arpa/inet.h>
+
+/* ========================================================================
+ * CONFIGURATION
+ * ======================================================================== */
+
+#define FILTER_COMPONENT_NAME "NetworkFilter"
+#define MAX_PACKET_SIZE 1514  /* Standard Ethernet MTU + header */
+#define FILTER_VERBOSE 1      /* Enable detailed logging */
+
+/* Filter actions */
+typedef enum {
+    FILTER_ALLOW,
+    FILTER_DROP,
+    FILTER_LOG_AND_ALLOW,
+    FILTER_MODIFY
+} filter_action_t;
+
+/* Statistics tracking */
+struct filter_stats {
+    uint64_t packets_from_vm;
+    uint64_t packets_to_vm;
+    uint64_t packets_dropped;
+    uint64_t bytes_from_vm;
+    uint64_t bytes_to_vm;
+};
+
+static struct filter_stats stats = {0};
+
+/* ========================================================================
+ * VIRTQUEUE MANAGEMENT
+ * ======================================================================== */
+
+virtqueue_device_t vm_recv_virtqueue;  /* Receive packets FROM VM */
+virtqueue_driver_t vm_send_virtqueue;  /* Send packets TO VM */
+
+/* ========================================================================
+ * PACKET FILTERING LOGIC
+ * ======================================================================== */
+
+static void print_ethernet_header(struct ethhdr *eth)
+{
+    printf("%s: ETH | ", FILTER_COMPONENT_NAME);
+    printf("src=%02x:%02x:%02x:%02x:%02x:%02x -> ",
+           eth->h_source[0], eth->h_source[1], eth->h_source[2],
+           eth->h_source[3], eth->h_source[4], eth->h_source[5]);
+    printf("dst=%02x:%02x:%02x:%02x:%02x:%02x | ",
+           eth->h_dest[0], eth->h_dest[1], eth->h_dest[2],
+           eth->h_dest[3], eth->h_dest[4], eth->h_dest[5]);
+    printf("type=0x%04x", ntohs(eth->h_proto));
+}
+
+static void print_ip_header(struct iphdr *ip)
+{
+    struct in_addr saddr = {ip->saddr};
+    struct in_addr daddr = {ip->daddr};
+
+    printf("%s: IP  | ", FILTER_COMPONENT_NAME);
+    printf("v%d proto=%d len=%d | ",
+           ip->version, ip->protocol, ntohs(ip->tot_len));
+    printf("src=%s -> ", inet_ntoa(saddr));
+    printf("dst=%s", inet_ntoa(daddr));
+}
+
+static void print_icmp_header(struct icmphdr *icmp)
+{
+    printf("%s: ICMP| ", FILTER_COMPONENT_NAME);
+    printf("type=%d code=%d ", icmp->type, icmp->code);
+
+    if (icmp->type == ICMP_ECHO || icmp->type == ICMP_ECHOREPLY) {
+        printf("id=%d seq=%d",
+               ntohs(icmp->un.echo.id),
+               ntohs(icmp->un.echo.sequence));
+    }
+}
+
+static void print_tcp_header(struct tcphdr *tcp)
+{
+    printf("%s: TCP | ", FILTER_COMPONENT_NAME);
+    printf("sport=%d -> dport=%d | ",
+           ntohs(tcp->source), ntohs(tcp->dest));
+    printf("seq=%u ack=%u | ",
+           ntohl(tcp->seq), ntohl(tcp->ack_seq));
+    printf("flags=%s%s%s%s%s%s",
+           tcp->syn ? "SYN " : "",
+           tcp->ack ? "ACK " : "",
+           tcp->fin ? "FIN " : "",
+           tcp->rst ? "RST " : "",
+           tcp->psh ? "PSH " : "",
+           tcp->urg ? "URG " : "");
+}
+
+static void print_udp_header(struct udphdr *udp)
+{
+    printf("%s: UDP | ", FILTER_COMPONENT_NAME);
+    printf("sport=%d -> dport=%d | len=%d",
+           ntohs(udp->source), ntohs(udp->dest), ntohs(udp->len));
+}
+
+/**
+ * inspect_packet - Deep packet inspection and logging
+ *
+ * Analyzes packet contents and prints protocol information.
+ * This demonstrates the full packet visibility that sDDF-style
+ * components can have.
+ */
+static void inspect_packet(char *packet, size_t packet_size)
+{
+    struct ethhdr *eth = (struct ethhdr *)packet;
+
+    if (FILTER_VERBOSE) {
+        print_ethernet_header(eth);
+        printf("\n");
+    }
+
+    uint16_t eth_proto = ntohs(eth->h_proto);
+
+    /* Handle different Ethernet protocols */
+    switch (eth_proto) {
+        case ETH_P_IP: {
+            struct iphdr *ip = (struct iphdr *)(packet + sizeof(struct ethhdr));
+
+            if (FILTER_VERBOSE) {
+                print_ip_header(ip);
+                printf("\n");
+            }
+
+            /* Handle IP protocols */
+            switch (ip->protocol) {
+                case IPPROTO_ICMP: {
+                    struct icmphdr *icmp = (struct icmphdr *)(
+                        packet + sizeof(struct ethhdr) + sizeof(struct iphdr)
+                    );
+                    if (FILTER_VERBOSE) {
+                        print_icmp_header(icmp);
+                        printf("\n");
+                    }
+                    break;
+                }
+
+                case IPPROTO_TCP: {
+                    struct tcphdr *tcp = (struct tcphdr *)(
+                        packet + sizeof(struct ethhdr) + (ip->ihl * 4)
+                    );
+                    if (FILTER_VERBOSE) {
+                        print_tcp_header(tcp);
+                        printf("\n");
+                    }
+                    break;
+                }
+
+                case IPPROTO_UDP: {
+                    struct udphdr *udp = (struct udphdr *)(
+                        packet + sizeof(struct ethhdr) + (ip->ihl * 4)
+                    );
+                    if (FILTER_VERBOSE) {
+                        print_udp_header(udp);
+                        printf("\n");
+                    }
+                    break;
+                }
+
+                default:
+                    if (FILTER_VERBOSE) {
+                        printf("%s: Unknown IP protocol: %d\n",
+                               FILTER_COMPONENT_NAME, ip->protocol);
+                    }
+                    break;
+            }
+            break;
+        }
+
+        case ETH_P_ARP:
+            if (FILTER_VERBOSE) {
+                printf("%s: ARP packet\n", FILTER_COMPONENT_NAME);
+            }
+            break;
+
+        default:
+            if (FILTER_VERBOSE) {
+                printf("%s: Unknown Ethernet protocol: 0x%04x\n",
+                       FILTER_COMPONENT_NAME, eth_proto);
+            }
+            break;
+    }
+}
+
+/**
+ * apply_filter_rules - Security policy enforcement
+ *
+ * This is where you would implement sDDF-inspired filtering logic:
+ * - Firewall rules
+ * - Rate limiting
+ * - Intrusion detection
+ * - Protocol validation
+ */
+static filter_action_t apply_filter_rules(char *packet, size_t packet_size)
+{
+    struct ethhdr *eth = (struct ethhdr *)packet;
+    uint16_t eth_proto = ntohs(eth->h_proto);
+
+    /* Example Filter Rule 1: Block all non-IP/ARP traffic */
+    if (eth_proto != ETH_P_IP && eth_proto != ETH_P_ARP) {
+        printf("%s: DROPPED - Non-IP/ARP packet (proto=0x%04x)\n",
+               FILTER_COMPONENT_NAME, eth_proto);
+        stats.packets_dropped++;
+        return FILTER_DROP;
+    }
+
+    /* Example Filter Rule 2: Inspect and log all ICMP */
+    if (eth_proto == ETH_P_IP) {
+        struct iphdr *ip = (struct iphdr *)(packet + sizeof(struct ethhdr));
+
+        if (ip->protocol == IPPROTO_ICMP) {
+            /* Could add rate limiting, size checks, etc. */
+            return FILTER_LOG_AND_ALLOW;
+        }
+
+        /* Example Filter Rule 3: Block SSH attempts (port 22) */
+        if (ip->protocol == IPPROTO_TCP) {
+            struct tcphdr *tcp = (struct tcphdr *)(
+                packet + sizeof(struct ethhdr) + (ip->ihl * 4)
+            );
+
+            if (ntohs(tcp->dest) == 22 || ntohs(tcp->source) == 22) {
+                printf("%s: DROPPED - SSH traffic blocked (port 22)\n",
+                       FILTER_COMPONENT_NAME);
+                stats.packets_dropped++;
+                return FILTER_DROP;
+            }
+        }
+    }
+
+    /* Default: Allow packet */
+    return FILTER_ALLOW;
+}
+
+/* ========================================================================
+ * PACKET FORWARDING
+ * ======================================================================== */
+
+/**
+ * send_packet_to_vm - Forward packet to FreeRTOS VM
+ *
+ * Uses virtqueue driver interface to send packet to VM.
+ * This is where packets from external network are delivered to the guest.
+ */
+static int send_packet_to_vm(char *packet, size_t packet_size)
+{
+    void *buf = NULL;
+
+    /* Allocate buffer from virtqueue */
+    int err = camkes_virtqueue_buffer_alloc(&vm_send_virtqueue, &buf, packet_size);
+    if (err) {
+        printf("%s: ERROR - Failed to allocate send buffer\n", FILTER_COMPONENT_NAME);
+        return -1;
+    }
+
+    /* Copy packet data */
+    memcpy(buf, packet, packet_size);
+
+    /* Send buffer to VM */
+    if (camkes_virtqueue_driver_send_buffer(&vm_send_virtqueue, buf, packet_size) != 0) {
+        printf("%s: ERROR - Failed to send buffer to VM\n", FILTER_COMPONENT_NAME);
+        camkes_virtqueue_buffer_free(&vm_send_virtqueue, buf);
+        return -1;
+    }
+
+    /* Notify VM that data is available */
+    vm_send_virtqueue.notify();
+
+    stats.packets_to_vm++;
+    stats.bytes_to_vm += packet_size;
+
+    return 0;
+}
+
+/**
+ * handle_packet_from_vm - Process packet received from VM
+ *
+ * This is where packets from FreeRTOS guest arrive.
+ * In a full implementation, these would be forwarded to external network.
+ */
+static void handle_packet_from_vm(char *packet, unsigned int packet_size)
+{
+    stats.packets_from_vm++;
+    stats.bytes_from_vm += packet_size;
+
+    printf("%s: ← Received %u bytes from VM\n", FILTER_COMPONENT_NAME, packet_size);
+
+    /* Inspect packet contents */
+    inspect_packet(packet, packet_size);
+
+    /* Apply filtering rules */
+    filter_action_t action = apply_filter_rules(packet, packet_size);
+
+    switch (action) {
+        case FILTER_ALLOW:
+            printf("%s: ✓ ALLOW - Forwarding to external network\n", FILTER_COMPONENT_NAME);
+            /* TODO: Forward to external network interface */
+            /* For now, we'll echo it back to demonstrate bidirectional flow */
+            send_packet_to_vm(packet, packet_size);
+            break;
+
+        case FILTER_DROP:
+            printf("%s: ✗ DROP - Packet blocked by filter rules\n", FILTER_COMPONENT_NAME);
+            break;
+
+        case FILTER_LOG_AND_ALLOW:
+            printf("%s: ⓘ LOG+ALLOW - Logging packet and forwarding\n", FILTER_COMPONENT_NAME);
+            /* TODO: Log to file or monitoring system */
+            /* TODO: Forward to external network */
+            send_packet_to_vm(packet, packet_size);
+            break;
+
+        case FILTER_MODIFY:
+            printf("%s: ⚙ MODIFY - Applying packet transformations\n", FILTER_COMPONENT_NAME);
+            /* TODO: NAT, header rewriting, etc. */
+            send_packet_to_vm(packet, packet_size);
+            break;
+    }
+
+    printf("%s: ----------------------------------------\n", FILTER_COMPONENT_NAME);
+}
+
+/* ========================================================================
+ * VIRTQUEUE CALLBACKS
+ * ======================================================================== */
+
+/**
+ * handle_recv_from_vm_callback - VirtQueue device callback
+ *
+ * Called when VM sends packets to the filter component.
+ */
+static void handle_recv_from_vm_callback(virtqueue_device_t *vq)
+{
+    void *buf = NULL;
+    unsigned int buf_size = 0;
+    vq_flags_t flag;
+    virtqueue_ring_object_t handle;
+
+    /* Get available buffer from VM */
+    if (!virtqueue_get_available_buf(vq, &handle)) {
+        printf("%s: ERROR - Failed to dequeue recv buffer from VM\n", FILTER_COMPONENT_NAME);
+        return;
+    }
+
+    /* Gather buffer contents */
+    while (camkes_virtqueue_device_gather_buffer(vq, &handle, &buf, &buf_size, &flag) >= 0) {
+        handle_packet_from_vm((char *)buf, buf_size);
+    }
+
+    /* Return buffer to VM */
+    if (!virtqueue_add_used_buf(&vm_recv_virtqueue, &handle, 0)) {
+        printf("%s: ERROR - Unable to return used recv buffer to VM\n", FILTER_COMPONENT_NAME);
+        return;
+    }
+
+    /* Notify VM that buffer is returned */
+    vm_recv_virtqueue.notify();
+}
+
+/**
+ * handle_send_to_vm_callback - VirtQueue driver callback
+ *
+ * Called when VM acknowledges receiving packets from the filter component.
+ */
+static void handle_send_to_vm_callback(virtqueue_driver_t *vq)
+{
+    void *buf = NULL;
+    unsigned int buf_size = 0;
+    uint32_t wr_len = 0;
+    vq_flags_t flag;
+    virtqueue_ring_object_t handle;
+
+    /* Get used buffer from VM */
+    if (!virtqueue_get_used_buf(vq, &handle, &wr_len)) {
+        printf("%s: ERROR - Failed to dequeue send buffer\n", FILTER_COMPONENT_NAME);
+        return;
+    }
+
+    /* Free buffers we allocated */
+    while (camkes_virtqueue_driver_gather_buffer(vq, &handle, &buf, &buf_size, &flag) >= 0) {
+        camkes_virtqueue_buffer_free(vq, buf);
+    }
+}
+
+/* ========================================================================
+ * EVENT LOOP
+ * ======================================================================== */
+
+/**
+ * network_wait_callback - Main event loop callback
+ *
+ * This is called when virtqueue notifications arrive.
+ * Polls both send and receive queues.
+ */
+void network_wait_callback(void)
+{
+    /* Check for packets from VM */
+    if (VQ_DEV_POLL(&vm_recv_virtqueue)) {
+        handle_recv_from_vm_callback(&vm_recv_virtqueue);
+    }
+
+    /* Check for completed sends to VM */
+    if (VQ_DRV_POLL(&vm_send_virtqueue)) {
+        handle_send_to_vm_callback(&vm_send_virtqueue);
+    }
+}
+
+/* ========================================================================
+ * INITIALIZATION
+ * ======================================================================== */
+
+/**
+ * print_statistics - Display current filter statistics
+ */
+static void print_statistics(void)
+{
+    printf("\n");
+    printf("╔════════════════════════════════════════════════════════════╗\n");
+    printf("║        NetworkFilter Component - Statistics               ║\n");
+    printf("╠════════════════════════════════════════════════════════════╣\n");
+    printf("║ Packets from VM:      %10lu                         ║\n", stats.packets_from_vm);
+    printf("║ Packets to VM:        %10lu                         ║\n", stats.packets_to_vm);
+    printf("║ Packets dropped:      %10lu                         ║\n", stats.packets_dropped);
+    printf("║ Bytes from VM:        %10lu                         ║\n", stats.bytes_from_vm);
+    printf("║ Bytes to VM:          %10lu                         ║\n", stats.bytes_to_vm);
+    printf("╚════════════════════════════════════════════════════════════╝\n");
+    printf("\n");
+}
+
+/**
+ * run - Component entry point
+ *
+ * Initializes virtqueues and starts the network filter service.
+ */
+int run(void)
+{
+    printf("\n");
+    printf("╔════════════════════════════════════════════════════════════╗\n");
+    printf("║     NetworkFilter Component - Proof of Concept            ║\n");
+    printf("║     sDDF-Inspired Network Filtering for CAmkES VMs        ║\n");
+    printf("╚════════════════════════════════════════════════════════════╝\n");
+    printf("\n");
+
+    printf("%s: Initializing virtqueues...\n", FILTER_COMPONENT_NAME);
+
+    /* Initialize receive virtqueue (from VM) */
+    int err = camkes_virtqueue_device_init(&vm_recv_virtqueue, 0);
+    if (err) {
+        printf("%s: FATAL - Failed to initialize recv virtqueue (err=%d)\n",
+               FILTER_COMPONENT_NAME, err);
+        return 1;
+    }
+    printf("%s: ✓ Recv virtqueue initialized (ID=0)\n", FILTER_COMPONENT_NAME);
+
+    /* Initialize send virtqueue (to VM) */
+    err = camkes_virtqueue_driver_init(&vm_send_virtqueue, 1);
+    if (err) {
+        printf("%s: FATAL - Failed to initialize send virtqueue (err=%d)\n",
+               FILTER_COMPONENT_NAME, err);
+        return 1;
+    }
+    printf("%s: ✓ Send virtqueue initialized (ID=1)\n", FILTER_COMPONENT_NAME);
+
+    printf("\n");
+    printf("%s: ════════════════════════════════════════════════════\n", FILTER_COMPONENT_NAME);
+    printf("%s: NetworkFilter is READY\n", FILTER_COMPONENT_NAME);
+    printf("%s: - Monitoring packets from FreeRTOS VM\n", FILTER_COMPONENT_NAME);
+    printf("%s: - Applying security filter rules\n", FILTER_COMPONENT_NAME);
+    printf("%s: - Forwarding allowed packets\n", FILTER_COMPONENT_NAME);
+    printf("%s: ════════════════════════════════════════════════════\n", FILTER_COMPONENT_NAME);
+    printf("\n");
+
+    print_statistics();
+
+    return 0;
+}

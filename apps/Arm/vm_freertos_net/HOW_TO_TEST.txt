@@ -1,0 +1,85 @@
+═══════════════════════════════════════════════════════════════
+  TIER 2 ECHO SERVER - QUICK TESTING GUIDE
+═══════════════════════════════════════════════════════════════
+
+EASIEST METHOD (no root required):
+───────────────────────────────────────────────────────────────
+
+Terminal 1: Start QEMU with socket backend
+  cd /home/konton-otome/phd/camkes-vm-examples/projects/vm-examples/apps/Arm/vm_freertos_net
+  ./test_echo.sh
+  # Select option 2 (Socket Backend)
+
+Terminal 2: Send test packets
+  cd /home/konton-otome/phd/camkes-vm-examples/projects/vm-examples/apps/Arm/vm_freertos_net
+  python3 test_packet_sender.py
+
+You should see:
+  - Terminal 1: "📥 RX packet #1" and "📤 TX echo #1"
+  - Terminal 2: "✓✓✓ SUCCESS! Packet was echoed correctly!"
+
+
+BEST METHOD (requires root - more realistic):
+───────────────────────────────────────────────────────────────
+
+  cd /home/konton-otome/phd/camkes-vm-examples/projects/vm-examples/apps/Arm/vm_freertos_net
+  sudo ./test_echo.sh
+  # Select option 1 (TAP Networking)
+
+Then in another terminal:
+  sudo arping -I tap0 192.168.100.2
+
+You should see echoed ARP packets in QEMU console.
+
+
+VERIFICATION ONLY (just check initialization):
+───────────────────────────────────────────────────────────────
+
+  cd /home/konton-otome/phd/camkes-vm-examples/projects/vm-examples/apps/Arm/vm_freertos_net
+  ./test_echo.sh
+  # Select option 3 (User Networking)
+
+This won't show packet echoes (wrong network layer), but you can
+verify the echo server initializes correctly.
+
+
+WHY NETCAT DOESN'T WORK:
+───────────────────────────────────────────────────────────────
+
+The echo server operates at Layer 2 (raw Ethernet frames).
+netcat operates at Layer 4 (TCP), which requires:
+  - Layer 3: IP stack
+  - Layer 2: Ethernet → IP mapping
+
+QEMU's user networking (-netdev user) works at Layer 3 and doesn't
+expose raw Ethernet frames to the guest.
+
+To use netcat, you'd need to implement a full TCP/IP stack in the
+guest (that's Tier 3!).
+
+
+TROUBLESHOOTING:
+───────────────────────────────────────────────────────────────
+
+No packets received:
+  → Are you using TAP or socket backend? (user networking won't work)
+  → Check MAC address: 52:54:00:12:34:56
+  → Look for "Echo server is LIVE!" message
+
+Build errors:
+  cd /home/konton-otome/phd/camkes-vm-examples/build
+  ninja clean
+  env PYTHONPATH=../projects/camkes-tool:../projects/capdl/python-capdl-tool \
+      ../init-build.sh -DCAMKES_VM_APP=vm_freertos_net -DAARCH64=1 \
+                       -DPLATFORM=qemu-arm-virt -DSIMULATION=1 -DLibUSB=OFF
+  ninja
+
+Socket connection refused:
+  → Make sure QEMU is running first (terminal 1)
+  → Check port: 1234
+
+
+MORE INFO:
+───────────────────────────────────────────────────────────────
+
+See TESTING.md for detailed instructions and advanced options.

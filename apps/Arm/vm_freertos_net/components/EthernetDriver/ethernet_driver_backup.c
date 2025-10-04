@@ -125,7 +125,7 @@ static volatile uint32_t *virtio_regs_base;
 #define VIRTQ_DESC_F_WRITE              2
 
 /* VirtIO Net Header (required before each packet) */
-#define VIRTIO_NET_HDR_SIZE             12  /* Modern VirtIO header size (with num_buffers field) */
+#define VIRTIO_NET_HDR_SIZE             10  /* Legacy header size (without num_buffers) */
 #define VIRTIO_NET_HDR_GSO_NONE         0
 
 typedef struct virtio_net_hdr {
@@ -277,89 +277,6 @@ uint32_t sys_now(void)
 }
 
 /* Forward declarations */
-
-/* ═══════════════════════════════════════════════════════════
- * Network Traffic Logging Helpers
- * ═══════════════════════════════════════════════════════════ */
-
-/* Ethernet header structure */
-struct ethhdr {
-    uint8_t h_dest[6];
-    uint8_t h_source[6];
-    uint16_t h_proto;
-} __attribute__((packed));
-
-/* IP header structure (simplified) */
-struct iphdr {
-    uint8_t ihl:4;
-    uint8_t version:4;
-    uint8_t tos;
-    uint16_t tot_len;
-    uint16_t id;
-    uint16_t frag_off;
-    uint8_t ttl;
-    uint8_t protocol;
-    uint16_t check;
-    uint32_t saddr;
-    uint32_t daddr;
-} __attribute__((packed));
-
-/* TCP header structure (simplified) */
-struct tcphdr {
-    uint16_t source;
-    uint16_t dest;
-    uint32_t seq;
-    uint32_t ack_seq;
-    uint16_t res1:4;
-    uint16_t doff:4;
-    uint16_t fin:1;
-    uint16_t syn:1;
-    uint16_t rst:1;
-    uint16_t psh:1;
-    uint16_t ack:1;
-    uint16_t urg:1;
-    uint16_t res2:2;
-    uint16_t window;
-    uint16_t check;
-    uint16_t urg_ptr;
-} __attribute__((packed));
-
-/* Network byte order conversions - provided by lwIP */
-/* ntohs() and ntohl() are already defined in lwip/def.h */
-
-static void hex_dump_packet(const char *prefix, const uint8_t *data, size_t len, size_t max_display)
-{
-    printf("%s: ", prefix);
-
-    size_t display_len = (len < max_display) ? len : max_display;
-
-    for (size_t i = 0; i < display_len; i++) {
-        printf("%02x ", data[i]);
-        if ((i + 1) % 16 == 0 && (i + 1) < display_len) {
-            printf("\n%*s", (int)strlen(prefix) + 2, "");
-        }
-    }
-
-    if (len > max_display) {
-        printf("... (%zu more bytes)", len - max_display);
-    }
-    printf("\n");
-}
-
-static void print_ascii_payload(const uint8_t *data, size_t len)
-{
-    printf("  ASCII: \"");
-    for (size_t i = 0; i < len && i < 80; i++) {
-        if (data[i] >= 32 && data[i] <= 126) {
-            printf("%c", data[i]);
-        } else {
-            printf(".");
-        }
-    }
-    if (len > 80) printf("...");
-    printf("\"\n");
-}
-
 static void process_rx_packets(void);
 static void refill_rx_queue(void);
 static err_t netif_output(struct netif *netif, struct pbuf *p);
@@ -449,13 +366,8 @@ static err_t netif_output(struct netif *netif, struct pbuf *p)
     static uint32_t tx_count = 0;
 
     tx_count++;
-
-    /* Detailed TX logging for first 10 packets */
-    if (tx_count <= 10) {
-        printf("\n╔══════════════════════════════════════════════════════════╗\n");
-        printf("║  📤 OUTGOING PACKET #%u                                   ║\n", tx_count);
-        printf("╚══════════════════════════════════════════════════════════╝\n");
-        printf("  Size: %u bytes\n", p->tot_len);
+    if (tx_count <= 3) {
+        printf("%s: TX #%u: sending %u bytes\n", COMPONENT_NAME, tx_count, p->tot_len);
     }
 
     /* Get TX descriptor pair (header + packet) - need 2 consecutive descriptors */
@@ -473,67 +385,6 @@ static err_t netif_output(struct netif *netif, struct pbuf *p)
         printf("%s: Failed to copy pbuf: %u/%u bytes\n",
                COMPONENT_NAME, copied, p->tot_len);
         return ERR_BUF;
-    }
-
-    /* Detailed TX packet inspection for first 10 packets */
-    if (tx_count <= 10) {
-        uint8_t *tx_data = packet_buffers[tx_buf_idx];
-
-        /* Hex dump */
-        hex_dump_packet("  Raw packet", tx_data, p->tot_len, 128);
-
-        /* Parse Ethernet header */
-        if (p->tot_len >= sizeof(struct ethhdr)) {
-            struct ethhdr *eth = (struct ethhdr *)tx_data;
-            printf("  Ethernet: %02x:%02x:%02x:%02x:%02x:%02x → %02x:%02x:%02x:%02x:%02x:%02x\n",
-                   eth->h_source[0], eth->h_source[1], eth->h_source[2],
-                   eth->h_source[3], eth->h_source[4], eth->h_source[5],
-                   eth->h_dest[0], eth->h_dest[1], eth->h_dest[2],
-                   eth->h_dest[3], eth->h_dest[4], eth->h_dest[5]);
-            printf("  EtherType: 0x%04x", ntohs(eth->h_proto));
-
-            /* Parse IP if present */
-            if (ntohs(eth->h_proto) == 0x0800 && p->tot_len >= sizeof(struct ethhdr) + sizeof(struct iphdr)) {
-                printf(" (IPv4)\n");
-                struct iphdr *ip = (struct iphdr *)(tx_data + sizeof(struct ethhdr));
-                uint32_t saddr = ntohl(ip->saddr);
-                uint32_t daddr = ntohl(ip->daddr);
-                printf("  IP: %u.%u.%u.%u → %u.%u.%u.%u (protocol=%u)\n",
-                       (saddr >> 24) & 0xFF, (saddr >> 16) & 0xFF,
-                       (saddr >> 8) & 0xFF, saddr & 0xFF,
-                       (daddr >> 24) & 0xFF, (daddr >> 16) & 0xFF,
-                       (daddr >> 8) & 0xFF, daddr & 0xFF,
-                       ip->protocol);
-
-                /* Parse TCP if present */
-                if (ip->protocol == 6) {
-                    size_t ip_hdr_len = (ip->ihl) * 4;
-                    if (p->tot_len >= sizeof(struct ethhdr) + ip_hdr_len + sizeof(struct tcphdr)) {
-                        struct tcphdr *tcp = (struct tcphdr *)(tx_data + sizeof(struct ethhdr) + ip_hdr_len);
-                        printf("  TCP: port %u → %u (flags: ", ntohs(tcp->source), ntohs(tcp->dest));
-                        if (tcp->syn) printf("SYN ");
-                        if (tcp->ack) printf("ACK ");
-                        if (tcp->fin) printf("FIN ");
-                        if (tcp->rst) printf("RST ");
-                        if (tcp->psh) printf("PSH ");
-                        printf(")\n");
-
-                        size_t tcp_hdr_len = (tcp->doff) * 4;
-                        size_t payload_offset = sizeof(struct ethhdr) + ip_hdr_len + tcp_hdr_len;
-                        if (p->tot_len > payload_offset) {
-                            size_t payload_len = p->tot_len - payload_offset;
-                            printf("  TCP Payload (%zu bytes):\n", payload_len);
-                            print_ascii_payload(tx_data + payload_offset, payload_len);
-                        }
-                    }
-                }
-            } else if (ntohs(eth->h_proto) == 0x0806) {
-                printf(" (ARP)\n");
-            } else {
-                printf("\n");
-            }
-        }
-        printf("══════════════════════════════════════════════════════════\n\n");
     }
 
     /* Setup virtio_net_hdr (already zero-initialized, no offloads needed) */
@@ -681,67 +532,9 @@ static void process_rx_packets(void)
 
         packets_received++;
 
-        /* Log packet arrival with detailed inspection */
-        printf("\n╔══════════════════════════════════════════════════════════╗\n");
-        printf("║  📥 INCOMING PACKET #%u                                   ║\n", packets_received);
-        printf("╚══════════════════════════════════════════════════════════╝\n");
-        printf("  Size: %u bytes (total %u with VirtIO header)\n", packet_len, len);
-
-        /* Hex dump of raw packet */
-        hex_dump_packet("  Raw packet", packet_data, packet_len, 128);
-
-        /* Parse Ethernet header */
-        if (packet_len >= sizeof(struct ethhdr)) {
-            struct ethhdr *eth = (struct ethhdr *)packet_data;
-            printf("  Ethernet: %02x:%02x:%02x:%02x:%02x:%02x → %02x:%02x:%02x:%02x:%02x:%02x\n",
-                   eth->h_source[0], eth->h_source[1], eth->h_source[2],
-                   eth->h_source[3], eth->h_source[4], eth->h_source[5],
-                   eth->h_dest[0], eth->h_dest[1], eth->h_dest[2],
-                   eth->h_dest[3], eth->h_dest[4], eth->h_dest[5]);
-            printf("  EtherType: 0x%04x", ntohs(eth->h_proto));
-
-            /* Parse IP if present */
-            if (ntohs(eth->h_proto) == 0x0800 && packet_len >= sizeof(struct ethhdr) + sizeof(struct iphdr)) {
-                printf(" (IPv4)\n");
-                struct iphdr *ip = (struct iphdr *)(packet_data + sizeof(struct ethhdr));
-                uint32_t saddr = ntohl(ip->saddr);
-                uint32_t daddr = ntohl(ip->daddr);
-                printf("  IP: %u.%u.%u.%u → %u.%u.%u.%u (protocol=%u)\n",
-                       (saddr >> 24) & 0xFF, (saddr >> 16) & 0xFF,
-                       (saddr >> 8) & 0xFF, saddr & 0xFF,
-                       (daddr >> 24) & 0xFF, (daddr >> 16) & 0xFF,
-                       (daddr >> 8) & 0xFF, daddr & 0xFF,
-                       ip->protocol);
-
-                /* Parse TCP if present */
-                if (ip->protocol == 6) {
-                    size_t ip_hdr_len = (ip->ihl) * 4;
-                    if (packet_len >= sizeof(struct ethhdr) + ip_hdr_len + sizeof(struct tcphdr)) {
-                        struct tcphdr *tcp = (struct tcphdr *)(packet_data + sizeof(struct ethhdr) + ip_hdr_len);
-                        printf("  TCP: port %u → %u (flags: ", ntohs(tcp->source), ntohs(tcp->dest));
-                        if (tcp->syn) printf("SYN ");
-                        if (tcp->ack) printf("ACK ");
-                        if (tcp->fin) printf("FIN ");
-                        if (tcp->rst) printf("RST ");
-                        if (tcp->psh) printf("PSH ");
-                        printf(")\n");
-
-                        size_t tcp_hdr_len = (tcp->doff) * 4;
-                        size_t payload_offset = sizeof(struct ethhdr) + ip_hdr_len + tcp_hdr_len;
-                        if (packet_len > payload_offset) {
-                            size_t payload_len = packet_len - payload_offset;
-                            printf("  TCP Payload (%zu bytes):\n", payload_len);
-                            print_ascii_payload(packet_data + payload_offset, payload_len);
-                        }
-                    }
-                }
-            } else if (ntohs(eth->h_proto) == 0x0806) {
-                printf(" (ARP)\n");
-            } else {
-                printf("\n");
-            }
-        }
-        printf("══════════════════════════════════════════════════════════\n\n");
+        /* Log packet arrival */
+        printf("%s: 📥 RX packet #%u, %u bytes (total %u with header)\n",
+               COMPONENT_NAME, packets_received, packet_len, len);
 
         /* Allocate pbuf and copy packet data (skipping header) */
         struct pbuf *p = pbuf_alloc(PBUF_RAW, packet_len, PBUF_POOL);
@@ -901,20 +694,377 @@ static int virtio_net_init(void)
     VREG_WRITE(VIRTIO_MMIO_STATUS, VIRTIO_STATUS_ACKNOWLEDGE);
 
     /* ═══════════════════════════════════════════════════════════
-     * VirtIO Device Initialization Summary
+     * MMIO WRITE VERIFICATION TEST
+     * Run early to test basic MMIO write capability
      * ═══════════════════════════════════════════════════════════ */
-
-    uint32_t device_features = VREG_READ(VIRTIO_MMIO_DEVICE_FEATURES);
-
     printf("\n");
     printf("╔══════════════════════════════════════════════════════════╗\n");
-    printf("║  VirtIO Network Device Initialization                   ║\n");
+    printf("║  MMIO WRITE VERIFICATION TEST                            ║\n");
     printf("╚══════════════════════════════════════════════════════════╝\n");
-    printf("%s: Device ID: 0x%x (VirtIO-Net)\n", COMPONENT_NAME, device_id);
-    printf("%s: DeviceFeatures: 0x%08x (CTRL_VQ %s)\n", COMPONENT_NAME,
-           device_features, (device_features & (1<<18)) ? "enabled" : "disabled");
-    printf("\n");
 
+    uint32_t test_passed = 1;
+    uint32_t tests_run = 0;
+    uint32_t tests_passed = 0;
+
+    /* ═══════════════════════════════════════════════════════════
+     * COMPREHENSIVE MMIO WRITE TEST
+     * Test multiple registers to determine if issue is VirtIO-specific
+     * or a general MMIO write problem
+     * ═══════════════════════════════════════════════════════════ */
+
+    /* Test 1: Status Register - Known writable, test incrementing */
+    printf("%s: Test 1: Status register (always writable)\n", COMPONENT_NAME);
+    tests_run++;
+
+    uint32_t status_initial = VREG_READ(VIRTIO_MMIO_STATUS);
+    printf("  Initial Status = 0x%x\n", status_initial);
+
+    /* Write DRIVER bit (should add to existing ACKNOWLEDGE) */
+    VREG_WRITE(VIRTIO_MMIO_STATUS, VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER);
+    uint32_t status_after = VREG_READ(VIRTIO_MMIO_STATUS);
+    printf("  Wrote 0x%x (ACKNOWLEDGE|DRIVER), readback = 0x%x ",
+           VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER, status_after);
+
+    if (status_after == (VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER)) {
+        printf("✅ PASS\n");
+        tests_passed++;
+    } else {
+        printf("❌ FAIL (expected 0x%x)\n", VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER);
+        test_passed = 0;
+    }
+
+    /* Test 2: QueueSel Register - Should be writable at this point */
+    printf("%s: Test 2: QueueSel register (should be writable)\n", COMPONENT_NAME);
+    tests_run++;
+
+    uint32_t qsel_initial = VREG_READ(VIRTIO_MMIO_QUEUE_SEL);
+    printf("  Initial QueueSel = %u\n", qsel_initial);
+
+    VREG_WRITE(VIRTIO_MMIO_QUEUE_SEL, 1);
+    uint32_t qsel_1 = VREG_READ(VIRTIO_MMIO_QUEUE_SEL);
+    printf("  Wrote QueueSel=1, readback = %u ", qsel_1);
+
+    if (qsel_1 == 1) {
+        printf("✅ PASS\n");
+        tests_passed++;
+    } else {
+        printf("❌ FAIL (stuck at %u)\n", qsel_1);
+        test_passed = 0;
+    }
+
+    /* Reset for safety */
+    VREG_WRITE(VIRTIO_MMIO_QUEUE_SEL, 0);
+
+    /* Test 3: DriverFeaturesSel - Selector register, always writable */
+    printf("%s: Test 3: DriverFeaturesSel register (selector)\n", COMPONENT_NAME);
+    tests_run++;
+
+    uint32_t feat_sel_initial = VREG_READ(VIRTIO_MMIO_DRIVER_FEATURES_SEL);
+    printf("  Initial DriverFeaturesSel = %u\n", feat_sel_initial);
+
+    VREG_WRITE(VIRTIO_MMIO_DRIVER_FEATURES_SEL, 1);
+    uint32_t feat_sel_1 = VREG_READ(VIRTIO_MMIO_DRIVER_FEATURES_SEL);
+    printf("  Wrote DriverFeaturesSel=1, readback = %u ", feat_sel_1);
+
+    if (feat_sel_1 == 1) {
+        printf("✅ PASS\n");
+        tests_passed++;
+    } else {
+        printf("❌ FAIL (stuck at %u)\n", feat_sel_1);
+        test_passed = 0;
+    }
+
+    /* Reset for safety */
+    VREG_WRITE(VIRTIO_MMIO_DRIVER_FEATURES_SEL, 0);
+
+    /* Test 4: DriverFeatures - Feature bits register */
+    printf("%s: Test 4: DriverFeatures register (feature bits)\n", COMPONENT_NAME);
+    tests_run++;
+
+    /* Write a specific feature pattern */
+    uint32_t test_features = 0xDEADBEEF;
+    VREG_WRITE(VIRTIO_MMIO_DRIVER_FEATURES, test_features);
+    uint32_t features_back = VREG_READ(VIRTIO_MMIO_DRIVER_FEATURES);
+    printf("  Wrote DriverFeatures=0x%x, readback = 0x%x ", test_features, features_back);
+
+    if (features_back == test_features) {
+        printf("✅ PASS\n");
+        tests_passed++;
+    } else {
+        printf("❌ FAIL (got 0x%x)\n", features_back);
+        test_passed = 0;
+    }
+
+    /* Test 5: InterruptACK - Write-to-clear register */
+    printf("%s: Test 5: InterruptACK register (write-to-clear)\n", COMPONENT_NAME);
+    tests_run++;
+
+    uint32_t irq_status = VREG_READ(VIRTIO_MMIO_INTERRUPT_STATUS);
+    printf("  Current IRQ status = 0x%x\n", irq_status);
+
+    /* Try to write all bits */
+    VREG_WRITE(VIRTIO_MMIO_INTERRUPT_ACK, 0xFF);
+    uint32_t irq_after = VREG_READ(VIRTIO_MMIO_INTERRUPT_STATUS);
+    printf("  Wrote InterruptACK=0xFF, IRQ status after = 0x%x ", irq_after);
+
+    /* For write-to-clear, if initial was 0, it should stay 0 */
+    /* If initial was non-zero, writes should clear it */
+    if (irq_status == 0 && irq_after == 0) {
+        printf("✅ PASS (no IRQ to clear)\n");
+        tests_passed++;
+    } else if (irq_status != 0 && irq_after == 0) {
+        printf("✅ PASS (cleared IRQ)\n");
+        tests_passed++;
+    } else {
+        printf("⚠️  WARN (unexpected behavior)\n");
+        /* Don't fail on this one, it's timing-dependent */
+    }
+
+    /* Test 6: Raw memory write - Test a non-register offset */
+    printf("%s: Test 6: Raw MMIO memory write test\n", COMPONENT_NAME);
+    tests_run++;
+
+    /* Write to last byte of MMIO region (usually unused) */
+    volatile uint32_t *test_addr = (volatile uint32_t *)((uintptr_t)virtio_regs_base + 0xFC);
+    uint32_t original_val = *test_addr;
+    printf("  Test address = %p, original value = 0x%x\n", test_addr, original_val);
+
+    *test_addr = 0x12345678;
+    uint32_t written_val = *test_addr;
+    printf("  Wrote 0x12345678, readback = 0x%x ", written_val);
+
+    if (written_val == 0x12345678) {
+        printf("✅ PASS (raw write works)\n");
+        tests_passed++;
+    } else {
+        printf("❌ FAIL (got 0x%x)\n", written_val);
+        test_passed = 0;
+    }
+
+    /* Restore original value */
+    *test_addr = original_val;
+
+    /* Test 7: QUEUE_NOTIFY register (offset 0x050) */
+    printf("%s: Test 7: QueueNotify register (offset 0x050)\n", COMPONENT_NAME);
+    tests_run++;
+
+    /* Write arbitrary value to QUEUE_NOTIFY */
+    VREG_WRITE(VIRTIO_MMIO_QUEUE_NOTIFY, 0xABCD);
+    uint32_t notify_back = VREG_READ(VIRTIO_MMIO_QUEUE_NOTIFY);
+    printf("  Wrote QueueNotify=0xABCD, readback = 0x%x ", notify_back);
+
+    /* Note: QueueNotify is write-only, reads may return 0 or undefined */
+    printf("⚠️  INFO (write-only register, read=%x)\n", notify_back);
+
+    /* Test 8: QUEUE_NUM register (offset 0x038) */
+    printf("%s: Test 8: QueueNum register (offset 0x038)\n", COMPONENT_NAME);
+    tests_run++;
+
+    uint32_t qnum_orig = VREG_READ(VIRTIO_MMIO_QUEUE_NUM);
+    printf("  Initial QueueNum = %u\n", qnum_orig);
+
+    VREG_WRITE(VIRTIO_MMIO_QUEUE_NUM, 256);
+    uint32_t qnum_after = VREG_READ(VIRTIO_MMIO_QUEUE_NUM);
+    printf("  Wrote QueueNum=256, readback = %u ", qnum_after);
+
+    if (qnum_after == 256) {
+        printf("✅ PASS\n");
+        tests_passed++;
+    } else {
+        printf("❌ FAIL (got %u)\n", qnum_after);
+        test_passed = 0;
+    }
+
+    /* Restore */
+    VREG_WRITE(VIRTIO_MMIO_QUEUE_NUM, qnum_orig);
+
+    /* Test 9: QUEUE_READY register (offset 0x044) */
+    printf("%s: Test 9: QueueReady register (offset 0x044)\n", COMPONENT_NAME);
+    tests_run++;
+
+    uint32_t qready_orig = VREG_READ(VIRTIO_MMIO_QUEUE_READY);
+    printf("  Initial QueueReady = %u\n", qready_orig);
+
+    VREG_WRITE(VIRTIO_MMIO_QUEUE_READY, 1);
+    uint32_t qready_after = VREG_READ(VIRTIO_MMIO_QUEUE_READY);
+    printf("  Wrote QueueReady=1, readback = %u ", qready_after);
+
+    if (qready_after == 1) {
+        printf("✅ PASS\n");
+        tests_passed++;
+    } else {
+        printf("❌ FAIL (got %u)\n", qready_after);
+        test_passed = 0;
+    }
+
+    /* Restore */
+    VREG_WRITE(VIRTIO_MMIO_QUEUE_READY, qready_orig);
+
+    /* Test 10: QueueSel Verification using QueueReady state */
+    printf("%s: Test 10: QueueSel verification (using QueueReady as indicator)\n", COMPONENT_NAME);
+    printf("  Testing if QueueSel actually switches between queues...\n");
+    tests_run++;
+
+    /* Step 1: Select queue 0, set QueueReady=1 */
+    VREG_WRITE(VIRTIO_MMIO_QUEUE_SEL, 0);
+    uint32_t qsel_verify = VREG_READ(VIRTIO_MMIO_QUEUE_SEL);
+    printf("  1. Wrote QueueSel=0, readback=%u\n", qsel_verify);
+
+    VREG_WRITE(VIRTIO_MMIO_QUEUE_READY, 1);
+    uint32_t q0_ready = VREG_READ(VIRTIO_MMIO_QUEUE_READY);
+    printf("  2. Set Queue0 Ready=1, readback=%u\n", q0_ready);
+
+    /* Step 2: Select queue 1, QueueReady should be 0 (different queue) */
+    VREG_WRITE(VIRTIO_MMIO_QUEUE_SEL, 1);
+    qsel_verify = VREG_READ(VIRTIO_MMIO_QUEUE_SEL);
+    printf("  3. Wrote QueueSel=1, readback=%u\n", qsel_verify);
+
+    uint32_t q1_ready_before = VREG_READ(VIRTIO_MMIO_QUEUE_READY);
+    printf("  4. Read Queue1 Ready=%u (should be 0 if QueueSel works)\n", q1_ready_before);
+
+    /* Step 3: Set queue 1 ready */
+    VREG_WRITE(VIRTIO_MMIO_QUEUE_READY, 1);
+    uint32_t q1_ready_after = VREG_READ(VIRTIO_MMIO_QUEUE_READY);
+    printf("  5. Set Queue1 Ready=1, readback=%u\n", q1_ready_after);
+
+    /* Step 4: Switch back to queue 0, should still be ready */
+    VREG_WRITE(VIRTIO_MMIO_QUEUE_SEL, 0);
+    qsel_verify = VREG_READ(VIRTIO_MMIO_QUEUE_SEL);
+    printf("  6. Wrote QueueSel=0 again, readback=%u\n", qsel_verify);
+
+    uint32_t q0_ready_again = VREG_READ(VIRTIO_MMIO_QUEUE_READY);
+    printf("  7. Read Queue0 Ready=%u (should still be 1)\n", q0_ready_again);
+
+    /* Additional verification: Check QueueNumMax for each queue */
+    printf("\n  DEEPER CHECK: Testing QueueNumMax for multiple queues...\n");
+
+    VREG_WRITE(VIRTIO_MMIO_QUEUE_SEL, 0);
+    uint32_t q0_nummax = VREG_READ(VIRTIO_MMIO_QUEUE_NUM_MAX);
+    printf("  Queue 0: QueueNumMax = %u\n", q0_nummax);
+
+    VREG_WRITE(VIRTIO_MMIO_QUEUE_SEL, 1);
+    uint32_t q1_nummax = VREG_READ(VIRTIO_MMIO_QUEUE_NUM_MAX);
+    printf("  Queue 1: QueueNumMax = %u\n", q1_nummax);
+
+    VREG_WRITE(VIRTIO_MMIO_QUEUE_SEL, 2);
+    uint32_t q2_nummax = VREG_READ(VIRTIO_MMIO_QUEUE_NUM_MAX);
+    printf("  Queue 2: QueueNumMax = %u (should be 0 - queue doesn't exist)\n", q2_nummax);
+
+    VREG_WRITE(VIRTIO_MMIO_QUEUE_SEL, 3);
+    uint32_t q3_nummax = VREG_READ(VIRTIO_MMIO_QUEUE_NUM_MAX);
+    printf("  Queue 3: QueueNumMax = %u (should be 0 - queue doesn't exist)\n", q3_nummax);
+
+    /* Analysis */
+    printf("\n  ANALYSIS:\n");
+    bool queueready_test_pass = (q1_ready_before == 0 && q1_ready_after == 1 && q0_ready_again == 1);
+    bool queuenummax_test_pass = (q0_nummax > 0 && q1_nummax > 0 && q2_nummax == 0);
+
+    if (queueready_test_pass && queuenummax_test_pass) {
+        printf("  ✅ PASS: QueueSel FULLY WORKS!\n");
+        printf("     ✓ QueueReady: Queue 0 and Queue 1 have independent state\n");
+        printf("     ✓ QueueNumMax: Queues 0-1 exist (%u/%u), Queue 2+ don't exist (0)\n",
+               q0_nummax, q1_nummax);
+        printf("     ✓ QueueSel successfully switches context between queues\n");
+        tests_passed++;
+    } else if (q1_ready_before == 1) {
+        printf("  ❌ FAIL: QueueSel BROKEN (stuck at queue 0)\n");
+        printf("     - Reading Queue1 returned Queue0's state (both show ready=1)\n");
+        printf("     - QueueSel writes have no effect\n");
+    } else if (!queuenummax_test_pass && q0_nummax == q1_nummax && q1_nummax == q2_nummax) {
+        printf("  ⚠️  SUSPICIOUS: All queues return same QueueNumMax=%u\n", q0_nummax);
+        printf("     - This suggests QueueSel might not be switching QEMU internal state\n");
+        printf("     - We might be stuck reading queue 0 properties for all indices\n");
+        if (queueready_test_pass) {
+            printf("     - BUT QueueReady test passed... conflicting evidence!\n");
+            tests_passed++;  // Give partial credit
+        }
+    } else {
+        printf("  ⚠️  UNCLEAR: Mixed results\n");
+        printf("     - QueueReady test: %s\n", queueready_test_pass ? "PASS" : "FAIL");
+        printf("     - QueueNumMax test: %s\n", queuenummax_test_pass ? "PASS" : "FAIL");
+        printf("     - q0_nummax=%u, q1_nummax=%u, q2_nummax=%u, q3_nummax=%u\n",
+               q0_nummax, q1_nummax, q2_nummax, q3_nummax);
+    }
+
+    /* Restore: Clear QueueReady for both queues */
+    VREG_WRITE(VIRTIO_MMIO_QUEUE_SEL, 0);
+    VREG_WRITE(VIRTIO_MMIO_QUEUE_READY, 0);
+    VREG_WRITE(VIRTIO_MMIO_QUEUE_SEL, 1);
+    VREG_WRITE(VIRTIO_MMIO_QUEUE_READY, 0);
+    VREG_WRITE(VIRTIO_MMIO_QUEUE_SEL, 0);  /* Back to queue 0 */
+
+    /* Test 11: Try Status register AGAIN to confirm it consistently works */
+    printf("%s: Test 11: Status register RETEST (offset 0x070)\n", COMPONENT_NAME);
+    tests_run++;
+
+    uint32_t status_retest = VREG_READ(VIRTIO_MMIO_STATUS);
+    printf("  Current Status = 0x%x\n", status_retest);
+
+    /* Toggle FEATURES_OK bit */
+    VREG_WRITE(VIRTIO_MMIO_STATUS, status_retest | VIRTIO_STATUS_FEATURES_OK);
+    uint32_t status_toggled = VREG_READ(VIRTIO_MMIO_STATUS);
+    printf("  Wrote Status with FEATURES_OK, readback = 0x%x ", status_toggled);
+
+    if (status_toggled == (status_retest | VIRTIO_STATUS_FEATURES_OK)) {
+        printf("✅ PASS (Status STILL works!)\n");
+        tests_passed++;
+    } else {
+        printf("❌ FAIL (expected 0x%x)\n", status_retest | VIRTIO_STATUS_FEATURES_OK);
+        test_passed = 0;
+    }
+
+    /* Test 11: Direct write to different MMIO offsets to map writable regions */
+    printf("%s: Test 11: Address range scan\n", COMPONENT_NAME);
+    printf("  Testing which MMIO offsets accept writes...\n");
+
+    struct { uint32_t offset; const char *name; } test_offsets[] = {
+        {0x000, "MAGIC (0x000)"},
+        {0x020, "DRIVER_FEATURES (0x020)"},
+        {0x030, "QUEUE_SEL (0x030)"},
+        {0x038, "QUEUE_NUM (0x038)"},
+        {0x044, "QUEUE_READY (0x044)"},
+        {0x050, "QUEUE_NOTIFY (0x050)"},
+        {0x064, "INTERRUPT_ACK (0x064)"},
+        {0x070, "STATUS (0x070)"},
+        {0x080, "QUEUE_DESC_LOW (0x080)"},
+        {0x084, "QUEUE_DESC_HIGH (0x084)"},
+        {0x090, "QUEUE_AVAIL_LOW (0x090)"},
+        {0x094, "QUEUE_AVAIL_HIGH (0x094)"},
+        {0x0a0, "QUEUE_USED_LOW (0x0a0)"},
+        {0x0a4, "QUEUE_USED_HIGH (0x0a4)"},
+    };
+
+    for (int i = 0; i < sizeof(test_offsets) / sizeof(test_offsets[0]); i++) {
+        volatile uint32_t *reg = (volatile uint32_t *)((uintptr_t)virtio_regs_base + (test_offsets[i].offset / 4));
+        uint32_t orig = *reg;
+        *reg = 0x11111111;
+        uint32_t readback = *reg;
+        printf("    %-25s: wrote 0x11111111, read 0x%08x %s\n",
+               test_offsets[i].name,
+               readback,
+               (readback == 0x11111111) ? "✅" : (readback != orig) ? "⚠️" : "❌");
+        *reg = orig;  /* Restore */
+    }
+
+    /* Summary */
+    printf("\n");
+    printf("╔══════════════════════════════════════════════════════════╗\n");
+    printf("║  TEST SUMMARY: %u/%u tests passed                         ║\n", tests_passed, tests_run);
+    printf("╚══════════════════════════════════════════════════════════╝\n");
+
+    /* Overall result */
+    printf("\n");
+    if (test_passed) {
+        printf("╔══════════════════════════════════════════════════════════╗\n");
+        printf("║  ✅ ALL MMIO WRITE TESTS PASSED                          ║\n");
+        printf("╚══════════════════════════════════════════════════════════╝\n");
+    } else {
+        printf("╔══════════════════════════════════════════════════════════╗\n");
+        printf("║  ❌ MMIO WRITE TESTS FAILED!                             ║\n");
+        printf("║  Check page table permissions for MMIO region            ║\n");
+        printf("╚══════════════════════════════════════════════════════════╝\n");
+    }
+    printf("\n");
 
     /* Set driver bit */
     VREG_WRITE(VIRTIO_MMIO_STATUS, VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER);

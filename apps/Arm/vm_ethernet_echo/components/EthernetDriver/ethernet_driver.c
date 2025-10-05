@@ -37,6 +37,9 @@
 
 #define COMPONENT_NAME "EthernetDriver"
 
+/* Echo component connection initialization (defined in src/echo_connections.c) */
+extern void init_echo_connections(void);
+
 /* VirtIO MMIO Register Offsets */
 #define VIRTIO_MMIO_MAGIC_VALUE         0x000
 #define VIRTIO_MMIO_VERSION             0x004
@@ -1557,24 +1560,31 @@ void post_init(void)
 
     printf("Test complete. System continuing...\n\n");
 
+    /* Initialize echo component connections - CRITICAL for EchoComponent to start! */
+    printf("\n");
+    printf("╔══════════════════════════════════════════════════════════╗\n");
+    printf("║  INITIALIZING ECHO COMPONENT CONNECTIONS                ║\n");
+    printf("╚══════════════════════════════════════════════════════════╝\n");
+    init_echo_connections();
+
+    /* post_init() MUST return to allow other components to start! */
+    printf("%s: post_init() complete - returning to allow EchoComponent to start\n", COMPONENT_NAME);
+}
+
+/*
+ * Component main loop (handle lwIP timers and RX packets)
+ *
+ * CRITICAL: This is called AFTER all components have initialized.
+ * Moving the infinite event loop HERE (from post_init) allows EchoComponent's run() to execute.
+ */
+int run(void)
+{
     /* Main event loop - process lwIP timers and RX packets */
     while (1) {
         sys_check_timeouts();
         process_rx_packets();
         seL4_Yield();
     }
-}
-
-/*
- * Component main loop (handle lwIP timers)
- */
-int run(void)
-{
-    /* Process lwIP timers */
-    sys_check_timeouts();
-
-    /* Small delay to avoid spinning */
-    seL4_Yield();
 
     return 0;
 }

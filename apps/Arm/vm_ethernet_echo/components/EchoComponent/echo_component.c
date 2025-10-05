@@ -19,6 +19,13 @@
 #define COMPONENT_NAME "EchoComponent"
 
 /*
+ * REMOVED pre_init() and post_init() hooks to match working components
+ * (vm_cross_connector and test_two_components don't have these)
+ *
+ * These hooks may interfere with component startup timing.
+ */
+
+/*
  * Main component loop
  *
  * Waits for TCP payload from EthernetDriver, processes it, and sends response.
@@ -32,6 +39,7 @@ int run(void)
     printf("╚══════════════════════════════════════════════════════════╝\n");
     printf("%s: Starting echo service (Stage 1)\n", COMPONENT_NAME);
     printf("%s: Waiting for network packets via dataport...\n", COMPONENT_NAME);
+    fflush(stdout);  /* Force output before blocking on wait */
 
     unsigned int packet_count = 0;
 

@@ -40,6 +40,14 @@
 /* Echo component connection initialization (defined in src/echo_connections.c) */
 extern void init_echo_connections(void);
 
+/*
+ * DEBUG CONFIGURATION
+ * Set to 1 to enable, 0 to disable
+ */
+#define DEBUG_VERBOSE 1           /* Enable verbose debug output */
+#define ENABLE_GDB_WAIT 0         /* Enable 60-second GDB wait during init */
+#define ENABLE_PAINT_TEST 0       /* Enable virtqueue memory paint test */
+
 /* VirtIO MMIO Register Offsets */
 #define VIRTIO_MMIO_MAGIC_VALUE         0x000
 #define VIRTIO_MMIO_VERSION             0x004
@@ -250,6 +258,9 @@ static uint8_t mac_addr[6];
 /* lwIP network interface */
 static struct netif netif_data;
 
+/* TCP server deferred initialization flag */
+static bool tcp_server_initialized = false;
+
 /* Packet buffers - allocated from DMA memory for VirtIO device access */
 static uint8_t *packet_buffers[MAX_PACKETS];  /* Virtual addresses */
 static uintptr_t packet_buffers_paddr[MAX_PACKETS];  /* Physical addresses for VirtIO DMA */
@@ -455,8 +466,10 @@ static err_t netif_output(struct netif *netif, struct pbuf *p)
 
     /* Detailed TX logging for first 10 packets */
     if (tx_count <= 10) {
+        uint32_t timestamp_ms = sys_now();
         printf("\n╔══════════════════════════════════════════════════════════╗\n");
-        printf("║  📤 OUTGOING PACKET #%u                                   ║\n", tx_count);
+        printf("║  📤 OUTGOING PACKET #%u [T=%u.%03us]                      ║\n",
+               tx_count, timestamp_ms / 1000, timestamp_ms % 1000);
         printf("╚══════════════════════════════════════════════════════════╝\n");
         printf("  Size: %u bytes\n", p->tot_len);
     }
@@ -674,6 +687,16 @@ static void process_rx_packets(void)
         uint16_t desc_idx = used_elem->id;
         uint32_t len = used_elem->len;
 
+        /* CRITICAL DEBUG: Print indices to detect infinite loop */
+        static uint32_t loop_count = 0;
+        loop_count++;
+        if (loop_count <= 10 || (loop_count % 100) == 0) {
+            printf("%s: [LOOP #%u] last_used_idx=%u, vq->used->idx=%u, used_ring_idx=%u, desc_idx=%u, len=%u\n",
+                   COMPONENT_NAME, loop_count, last_used_idx, vq->used->idx, used_ring_idx, desc_idx, len);
+            printf("%s:   vq->used addr=%p, vq->used->idx value at %p\n",
+                   COMPONENT_NAME, (void*)vq->used, (void*)&vq->used->idx);
+        }
+
         /* Get packet buffer (use buffer index, not physical address from descriptor) */
         int buf_idx = (desc_idx < MAX_PACKETS) ? desc_idx : 0;
         uint8_t *buffer = packet_buffers[buf_idx];
@@ -684,9 +707,16 @@ static void process_rx_packets(void)
 
         packets_received++;
 
+        /* NOTE: TCP server initialization moved to post_init()
+         * The tcp_server_initialized flag is set there.
+         * This deferred initialization code is no longer needed.
+         */
+
         /* Log packet arrival with detailed inspection */
+        uint32_t timestamp_ms = sys_now();
         printf("\n╔══════════════════════════════════════════════════════════╗\n");
-        printf("║  📥 INCOMING PACKET #%u                                   ║\n", packets_received);
+        printf("║  📥 INCOMING PACKET #%u [T=%u.%03us]                      ║\n",
+               packets_received, timestamp_ms / 1000, timestamp_ms % 1000);
         printf("╚══════════════════════════════════════════════════════════╝\n");
         printf("  Size: %u bytes (total %u with VirtIO header)\n", packet_len, len);
 
@@ -760,7 +790,13 @@ static void process_rx_packets(void)
         /* Mark buffer as free (buf_idx already defined above) */
         rx_buffer_used[buf_idx] = false;
 
+        /* CRITICAL: Increment and verify index actually changes */
+        uint16_t old_last_used = last_used_idx;
         last_used_idx++;
+        if (loop_count <= 10 || (loop_count % 100) == 0) {
+            printf("%s: [LOOP #%u] Incremented last_used_idx from %u to %u (vq->used->idx=%u)\n",
+                   COMPONENT_NAME, loop_count, old_last_used, last_used_idx, vq->used->idx);
+        }
     }
 
     refill_rx_queue();
@@ -832,25 +868,81 @@ static void setup_tcp_echo_server(void)
 {
     struct tcp_pcb *pcb;
 
+#if DEBUG_VERBOSE
+    printf("\n%s: ╔════════════════════════════════════════════════════════════╗\n", COMPONENT_NAME);
+    printf("%s: ║  [DEBUG] Entering setup_tcp_echo_server()                 ║\n", COMPONENT_NAME);
+    printf("%s: ╚════════════════════════════════════════════════════════════╝\n", COMPONENT_NAME);
+    printf("%s: [DEBUG] About to call tcp_new_ip_type(IPADDR_TYPE_V4)...\n", COMPONENT_NAME);
+    fflush(stdout);
+#endif
+
     pcb = tcp_new_ip_type(IPADDR_TYPE_V4);
+
+#if DEBUG_VERBOSE
+    printf("%s: [DEBUG] tcp_new_ip_type() returned: pcb=%p\n", COMPONENT_NAME, (void*)pcb);
+    fflush(stdout);
+#endif
+
     if (pcb == NULL) {
-        printf("%s: Failed to create TCP PCB\n", COMPONENT_NAME);
+        printf("%s: ❌ Failed to create TCP PCB\n", COMPONENT_NAME);
+#if DEBUG_VERBOSE
+        printf("%s: [DEBUG] TCP PCB creation returned NULL - malloc likely failed\n", COMPONENT_NAME);
+        printf("%s: [DEBUG] This suggests lwIP memory allocator is not ready\n", COMPONENT_NAME);
+        fflush(stdout);
+#endif
         return;
     }
+
+#if DEBUG_VERBOSE
+    printf("%s: [DEBUG] ✓ TCP PCB created successfully at %p\n", COMPONENT_NAME, (void*)pcb);
+    printf("%s: [DEBUG] About to call tcp_bind(pcb, IP_ANY_TYPE, %d)...\n", COMPONENT_NAME, TCP_ECHO_PORT);
+    fflush(stdout);
+#endif
 
     err_t err = tcp_bind(pcb, IP_ANY_TYPE, TCP_ECHO_PORT);
+
+#if DEBUG_VERBOSE
+    printf("%s: [DEBUG] tcp_bind() returned: err=%d (%s)\n", COMPONENT_NAME,
+           err, err == ERR_OK ? "ERR_OK" : "ERROR");
+    fflush(stdout);
+#endif
+
     if (err != ERR_OK) {
-        printf("%s: Failed to bind TCP port %d\n", COMPONENT_NAME, TCP_ECHO_PORT);
+        printf("%s: ❌ Failed to bind TCP port %d (err=%d)\n", COMPONENT_NAME, TCP_ECHO_PORT, err);
         return;
     }
+
+#if DEBUG_VERBOSE
+    printf("%s: [DEBUG] ✓ Successfully bound to port %d\n", COMPONENT_NAME, TCP_ECHO_PORT);
+    printf("%s: [DEBUG] About to call tcp_listen_with_backlog(pcb, %d)...\n", COMPONENT_NAME, MAX_TCP_CONNECTIONS);
+    fflush(stdout);
+#endif
 
     pcb = tcp_listen_with_backlog(pcb, MAX_TCP_CONNECTIONS);
+
+#if DEBUG_VERBOSE
+    printf("%s: [DEBUG] tcp_listen_with_backlog() returned: pcb=%p\n", COMPONENT_NAME, (void*)pcb);
+    fflush(stdout);
+#endif
+
     if (pcb == NULL) {
-        printf("%s: Failed to listen on TCP port %d\n", COMPONENT_NAME, TCP_ECHO_PORT);
+        printf("%s: ❌ Failed to listen on TCP port %d\n", COMPONENT_NAME, TCP_ECHO_PORT);
         return;
     }
 
+#if DEBUG_VERBOSE
+    printf("%s: [DEBUG] ✓ Now listening on port %d\n", COMPONENT_NAME, TCP_ECHO_PORT);
+    printf("%s: [DEBUG] About to call tcp_accept(pcb, tcp_echo_accept)...\n", COMPONENT_NAME);
+    fflush(stdout);
+#endif
+
     tcp_accept(pcb, tcp_echo_accept);
+
+#if DEBUG_VERBOSE
+    printf("%s: [DEBUG] ✓ Accept callback registered\n", COMPONENT_NAME);
+    printf("%s: [DEBUG] Exiting setup_tcp_echo_server() - SUCCESS\n", COMPONENT_NAME);
+    fflush(stdout);
+#endif
 
     printf("%s: TCP echo server created (will bind after DHCP)\n", COMPONENT_NAME);
 }
@@ -1177,6 +1269,7 @@ void post_init(void)
     /* ═══════════════════════════════════════════════════════════
      * PAINT TEST: Write to virtqueue memory from GDB
      * ═══════════════════════════════════════════════════════════ */
+#if ENABLE_PAINT_TEST
     printf("\n");
     printf("╔══════════════════════════════════════════════════════════╗\n");
     printf("║  PAINT TEST: Virtqueue RX Used Ring Memory              ║\n");
@@ -1296,6 +1389,9 @@ void post_init(void)
         printf("  → Need to fix permissions for both Component→QEMU AND QEMU→Component\n");
     }
     printf("═══════════════════════════════════════════════════════════\n\n");
+#else
+    printf("%s: Paint test disabled (ENABLE_PAINT_TEST=0)\n\n", COMPONENT_NAME);
+#endif
 
     /* Allocate packet buffers from DMA memory (matching sDDF approach) */
     printf("%s: Allocating %d DMA packet buffers (%d bytes each)...\n",
@@ -1352,12 +1448,15 @@ void post_init(void)
     /* Skip DHCP - use static IP */
     printf("%s: Network interface UP with static IP\n", COMPONENT_NAME);
 
-    /* Setup TCP echo server */
+    /* TEMPORARY: Re-enable immediate TCP server creation to test verbose debug
+     * This WILL cause malloc fault at address 0x10, but allows us to capture
+     * detailed debug output to understand the failure.
+     */
+    printf("%s: ⚠️  TESTING: Creating TCP server immediately (will likely fault)\n", COMPONENT_NAME);
     setup_tcp_echo_server();
-
+    tcp_server_initialized = true;  /* Set flag to prevent duplicate initialization */
     printf("%s: ✓ Initialization complete\n", COMPONENT_NAME);
-    printf("%s: TCP Echo Server ready on 10.0.2.15:1234\n", COMPONENT_NAME);
-    printf("%s: Test with: telnet localhost 8888 (or nc localhost 8888)\n\n", COMPONENT_NAME);
+    printf("%s: Network ready\n\n", COMPONENT_NAME);
 
     /* QueueSel Runtime Verification Test */
     printf("\n╔══════════════════════════════════════════════════════════╗\n");
@@ -1580,6 +1679,7 @@ void post_init(void)
 int run(void)
 {
     /* Main event loop - process lwIP timers and RX packets */
+    /* Note: TCP server is now initialized in RX path after first packet */
     while (1) {
         sys_check_timeouts();
         process_rx_packets();

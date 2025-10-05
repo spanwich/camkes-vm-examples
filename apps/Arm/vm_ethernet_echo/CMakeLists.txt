@@ -42,6 +42,7 @@ DeclareCAmkESComponent(
     EthernetDriver
     SOURCES
         components/EthernetDriver/ethernet_driver.c
+        src/echo_connections.c
     INCLUDES
         components/EthernetDriver
         ${LWIP_PATH}/src/include

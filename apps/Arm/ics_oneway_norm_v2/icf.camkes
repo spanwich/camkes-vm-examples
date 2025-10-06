@@ -1,0 +1,186 @@
+/*
+ * ICS One-Way Pipeline with Normalizer - V2 Network Bridge Version
+ * Component Architecture for seL4/CAmkES
+ *
+ * Topology: [NETWORK NIC DRV] -> [EXT FRONTEND] -> [PARSER/NORMALIZER] -> [POLICY+EMITTER] -> [INT NIC DRV]
+ * V2: NetworkNicDrv receives messages from VM via VirtQueue instead of generating synthetic traffic
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <configurations/vm.h>
+
+import <std_connector.camkes>;
+import <global-connectors.camkes>;
+import <seL4VMDTBPassthrough.idl4>;
+import <FileServerInterface.camkes>;
+import <FileServer/FileServer.camkes>;
+import <SerialServer/SerialServer.camkes>;
+import <TimeServer/TimeServer.camkes>;
+import <vm-connectors.camkes>;
+import <devices.camkes>;
+
+/* VM Component for Bridge Script */
+component VM {
+    VM_INIT_DEF()
+    attribute string vswitch_mac_address = "";
+    /* Dataports for VM-to-seL4 communication (same pattern as vm_echo_connector) */
+    dataport Buf(4096) vm_to_sel4;
+    dataport Buf(4096) sel4_to_vm;
+    emits Ready vm_ready;
+    consumes Done vm_done;
+}
+
+/* Network NIC Driver Component - VM Message Receiver */
+component NetworkNicDrv {
+    control;
+
+    /* Dataport interfaces for VM communication (replaces VirtQueues) */
+    dataport Buf(4096) vm_input;
+    dataport Buf(4096) vm_output;
+    consumes Ready vm_ready;
+    emits Done vm_done;
+
+    /* Output to ExtFrontend (SAME interface as ExtNicDrv) */
+    dataport Buf(65536) out_dp;
+    emits Notification out_ntfy;
+}
+
+/* External Frontend Component - Frame Parser */
+component ExtFrontend {
+    control;
+
+    /* Input from ExtNicDrv */
+    dataport Buf(65536) in_dp;
+    consumes Notification in_ntfy;
+
+    /* Output to ParserNorm */
+    dataport Buf(65536) out_dp;
+    emits Notification out_ntfy;
+}
+
+/* Parser/Normalizer Component - Validation and Bounds Checking */
+component ParserNorm {
+    control;
+
+    /* Input from ExtFrontend */
+    dataport Buf(65536) in_dp;
+    consumes Notification in_ntfy;
+
+    /* Output to PolicyEmit */
+    dataport Buf(65536) out_dp;
+    emits Notification out_ntfy;
+}
+
+/* Policy and Emitter Component - Allow/Deny Logic */
+component PolicyEmit {
+    control;
+
+    /* Input from ParserNorm */
+    dataport Buf(65536) in_dp;
+    consumes Notification in_ntfy;
+
+    /* Output to IntNicDrv */
+    dataport Buf(65536) out_dp;
+    emits Notification out_ntfy;
+}
+
+/* Internal NIC Driver Component - Message Sink and Counter */
+component IntNicDrv {
+    control;
+
+    /* Input from PolicyEmit (final stage) */
+    dataport Buf(65536) in_dp;
+    consumes Notification in_ntfy;
+}
+
+assembly {
+    composition {
+        /* VM infrastructure components */
+        VM_GENERAL_COMPOSITION_DEF()
+        VM_COMPOSITION_DEF(0)
+
+        /* ICS pipeline components */
+        component NetworkNicDrv network_nic;
+        component ExtFrontend ext_frontend;
+        component ParserNorm parser_norm;
+        component PolicyEmit policy_emit;
+        component IntNicDrv int_nic;
+
+        /* Dataport connections for VM <-> NetworkNicDrv communication */
+        connection seL4Notification vm_ready_conn(from vm0.vm_ready, to network_nic.vm_ready);
+        connection seL4GlobalAsynch vm_done_conn(from network_nic.vm_done, to vm0.vm_done);
+        connection seL4SharedDataWithCaps vm_input_conn(from network_nic.vm_input, to vm0.vm_to_sel4);
+        connection seL4SharedDataWithCaps vm_output_conn(from network_nic.vm_output, to vm0.sel4_to_vm);
+
+        /* VM DTB passthrough */
+        connection seL4VMDTBPassthrough vm_dtb(from vm0.dtb_self, to vm0.dtb);
+
+        /* One-way dataport connections (NETWORK -> FE -> PAR -> POL -> INT) */
+        connection seL4SharedData net_fe_dp(from network_nic.out_dp, to ext_frontend.in_dp);
+        connection seL4SharedData fe_par_dp(from ext_frontend.out_dp, to parser_norm.in_dp);
+        connection seL4SharedData par_pol_dp(from parser_norm.out_dp, to policy_emit.in_dp);
+        connection seL4SharedData pol_int_dp(from policy_emit.out_dp, to int_nic.in_dp);
+
+        /* One-way notification connections (same direction as dataports) */
+        connection seL4Notification net_fe_ntfy(from network_nic.out_ntfy, to ext_frontend.in_ntfy);
+        connection seL4Notification fe_par_ntfy(from ext_frontend.out_ntfy, to parser_norm.in_ntfy);
+        connection seL4Notification par_pol_ntfy(from parser_norm.out_ntfy, to policy_emit.in_ntfy);
+        connection seL4Notification pol_int_ntfy(from policy_emit.out_ntfy, to int_nic.in_ntfy);
+    }
+
+    configuration {
+        /* VM infrastructure configuration */
+        VM_GENERAL_CONFIGURATION_DEF()
+        VM_CONFIGURATION_DEF(0)
+
+        /* VM basic configuration - Multi-size pools for VirtQueue components */
+        vm0.num_extra_frame_caps = 0;
+        vm0.extra_frame_map_address = 0;
+        vm0.cnode_size_bits = 23;
+
+        /* Memory pools - REDUCED to match vm_freertos working config */
+        vm0.simple_untyped24_pool = 12;  /* 12 × 16MB = 192MB (same as vm_freertos) */
+
+        /* VM configuration now comes from devices.camkes */
+        /* linux_address_config, linux_image_config, dtb, untyped_mmios all in devices.camkes */
+
+        /* VM dataport configuration (same pattern as vm_echo_connector) */
+        vm0.vm_to_sel4_id = 0;
+        vm0.vm_to_sel4_size = 4096;
+        vm0.sel4_to_vm_id = 0;
+        vm0.sel4_to_vm_size = 4096;
+        vm0.vswitch_mac_address = "02:00:00:00:AA:01";
+
+        /* Component priorities (higher number = higher priority) */
+        /* IntNicDrv has highest priority to drain messages quickly */
+        int_nic.priority = 250;
+        policy_emit.priority = 200;
+        parser_norm.priority = 150;
+        ext_frontend.priority = 100;
+        network_nic.priority = 75;  /* Higher than old ext_nic for network responsiveness */
+
+        /* Timeslice configuration (1ms = 1000 microseconds) */
+        int_nic.period = 10000;
+        int_nic.budget = 1000;
+
+        policy_emit.period = 10000;
+        policy_emit.budget = 2000;
+
+        parser_norm.period = 10000;
+        parser_norm.budget = 2000;
+
+        ext_frontend.period = 10000;
+        ext_frontend.budget = 1000;
+
+        network_nic.period = 10000;
+        network_nic.budget = 1500;  /* More budget for network processing */
+
+        /* Ensure no reverse capabilities exist - strict one-way policy */
+        network_nic._priority = 75;
+        ext_frontend._priority = 100;
+        parser_norm._priority = 150;
+        policy_emit._priority = 200;
+        int_nic._priority = 250;
+    }
+}

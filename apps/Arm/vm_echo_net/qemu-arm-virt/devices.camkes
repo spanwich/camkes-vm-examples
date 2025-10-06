@@ -36,8 +36,11 @@ assembly {
                     ]);
 
         vm0.untyped_mmios = [
-                    "0x8040000:12", // Interrupt Controller Virtual CPU interface (Virtual Machine view)
-                    "0x40000000:29", // Linux kernel memory regions
+                    "0x8040000:12",     // Interrupt Controller Virtual CPU interface (Virtual Machine view)
+                    "0xa000000:12",     // VirtIO MMIO devices (0xa000000-0xa001000)
+                    "0x10040000:17",    // QEMU PCI MMIO
+                    "0x3eff0000:16",    // QEMU PCI IO ports
+                    "0x40000000:29",    // Linux kernel memory regions
                     ];
 	}
 }

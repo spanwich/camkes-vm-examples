@@ -1,0 +1,48 @@
+/*
+ * Copyright 2024, PhD Research Project
+ * ics_oneway_norm_v3 - FreeRTOS VM Configuration (Minimal Memory)
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <configurations/vm.h>
+
+/* FreeRTOS VM needs much less memory than Linux */
+#define VM_RAM_BASE 0x40000000       // 1GB base
+#define VM_RAM_SIZE 0x02000000       // Only 32MB for FreeRTOS (vs 512MB for Linux!)
+#define VM_RAM_OFFSET 0x00000000
+#define VM_DTB_ADDR 0x41F00000       // Within 32MB range
+#define VM_INITRD_ADDR 0x41D00000    // Within 32MB range
+#define VM_INITRD_MAX_SIZE 0x100000  // 1MB (FreeRTOS binary is tiny)
+
+assembly {
+    composition {}
+    configuration {
+        vm0.linux_address_config = {
+            "linux_ram_base" : VAR_STRINGIZE(VM_RAM_BASE),
+            "linux_ram_paddr_base" : VAR_STRINGIZE(VM_RAM_BASE),
+            "linux_ram_size" : VAR_STRINGIZE(VM_RAM_SIZE),
+            "linux_ram_offset" : VAR_STRINGIZE(VM_RAM_OFFSET),
+            "dtb_addr" : VAR_STRINGIZE(VM_DTB_ADDR),
+            "initrd_max_size" : VAR_STRINGIZE(VM_INITRD_MAX_SIZE),
+            "initrd_addr" : VAR_STRINGIZE(VM_INITRD_ADDR)
+        };
+
+        vm0.linux_image_config = {
+            "linux_bootcmdline" : "",
+            "linux_stdout" : "/pl011@9000000",
+        };
+
+        vm0.num_vcpus = 1;
+
+        vm0.dtb = dtb([
+            {"path": "/pl011@9000000"},
+        ]);
+
+        /* MUCH smaller memory allocation for FreeRTOS */
+        vm0.untyped_mmios = [
+            "0x8040000:12",  // Interrupt Controller (4KB)
+            "0x40000000:25", // FreeRTOS RAM (32MB) - 10x smaller than Linux!
+        ];
+    }
+}

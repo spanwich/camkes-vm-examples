@@ -1,0 +1,140 @@
+/*
+ * ICS One-Way Pipeline with FreeRTOS VM - V3 (Minimal Memory PoC)
+ * Component Architecture for seL4/CAmkES
+ *
+ * Topology: [FREERTOS VM] + [ICS PIPELINE COMPONENTS]
+ *
+ * FreeRTOS VM Advantages:
+ * - ~50KB kernel vs 10MB Linux
+ * - Only 32MB RAM needed vs 512MB
+ * - Can fit within available seL4 memory!
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <configurations/vm.h>
+
+import <std_connector.camkes>;
+import <global-connectors.camkes>;
+import <seL4VMDTBPassthrough.idl4>;
+import <FileServerInterface.camkes>;
+import <FileServer/FileServer.camkes>;
+import <SerialServer/SerialServer.camkes>;
+import <TimeServer/TimeServer.camkes>;
+import <vm-connectors.camkes>;
+import <devices_freertos.camkes>;  /* Use FreeRTOS memory config */
+
+/* FreeRTOS VM Component - Minimal Memory Footprint */
+component VM {
+    VM_INIT_DEF()
+}
+
+/* Test Traffic Generator for ICS pipeline */
+component TestTrafficGen {
+    control;
+    dataport Buf(65536) out_dp;
+    emits Notification out_ntfy;
+}
+
+/* External Frontend Component */
+component ExtFrontend {
+    control;
+    dataport Buf(65536) in_dp;
+    consumes Notification in_ntfy;
+    dataport Buf(65536) out_dp;
+    emits Notification out_ntfy;
+}
+
+/* Parser/Normalizer Component */
+component ParserNorm {
+    control;
+    dataport Buf(65536) in_dp;
+    consumes Notification in_ntfy;
+    dataport Buf(65536) out_dp;
+    emits Notification out_ntfy;
+}
+
+/* Policy and Emitter Component */
+component PolicyEmit {
+    control;
+    dataport Buf(65536) in_dp;
+    consumes Notification in_ntfy;
+    dataport Buf(65536) out_dp;
+    emits Notification out_ntfy;
+}
+
+/* Internal NIC Driver Component */
+component IntNicDrv {
+    control;
+    dataport Buf(65536) in_dp;
+    consumes Notification in_ntfy;
+}
+
+assembly {
+    composition {
+        /* FreeRTOS VM composition */
+        VM_GENERAL_COMPOSITION_DEF()
+        VM_COMPOSITION_DEF(0)
+        connection seL4VMDTBPassthrough vm_dtb(from vm0.dtb_self, to vm0.dtb);
+
+        /* ICS pipeline components */
+        component TestTrafficGen traffic_gen;
+        component ExtFrontend ext_frontend;
+        component ParserNorm parser_norm;
+        component PolicyEmit policy_emit;
+        component IntNicDrv int_nic;
+
+        /* ICS pipeline connections */
+        connection seL4SharedData gen_fe_dp(from traffic_gen.out_dp, to ext_frontend.in_dp);
+        connection seL4SharedData fe_par_dp(from ext_frontend.out_dp, to parser_norm.in_dp);
+        connection seL4SharedData par_pol_dp(from parser_norm.out_dp, to policy_emit.in_dp);
+        connection seL4SharedData pol_int_dp(from policy_emit.out_dp, to int_nic.in_dp);
+
+        connection seL4Notification gen_fe_ntfy(from traffic_gen.out_ntfy, to ext_frontend.in_ntfy);
+        connection seL4Notification fe_par_ntfy(from ext_frontend.out_ntfy, to parser_norm.in_ntfy);
+        connection seL4Notification par_pol_ntfy(from parser_norm.out_ntfy, to policy_emit.in_ntfy);
+        connection seL4Notification pol_int_ntfy(from policy_emit.out_ntfy, to int_nic.in_ntfy);
+    }
+
+    configuration {
+        /* FreeRTOS VM configuration - MUCH SMALLER MEMORY POOLS */
+        VM_GENERAL_CONFIGURATION_DEF()
+        VM_CONFIGURATION_DEF(0)
+
+        vm0.num_extra_frame_caps = 0;
+        vm0.extra_frame_map_address = 0;
+        vm0.cnode_size_bits = 18;  /* Reduced from 23 */
+
+        /* CRITICAL: Reduced memory pools for FreeRTOS */
+        vm0.simple_untyped20_pool = 2;   /* 2 × 1MB  = 2MB (was 12 for Linux) */
+        vm0.simple_untyped22_pool = 2;   /* 2 × 4MB  = 8MB (was 16 for Linux) */
+        vm0.simple_untyped24_pool = 2;   /* 2 × 16MB = 32MB (was 12 for Linux) */
+        /* NO 64MB pools needed! */
+
+        /* ICS Component priorities */
+        int_nic.priority = 250;
+        policy_emit.priority = 200;
+        parser_norm.priority = 150;
+        ext_frontend.priority = 100;
+        traffic_gen.priority = 50;
+
+        /* Timeslice configuration */
+        int_nic.period = 10000;
+        int_nic.budget = 1000;
+        policy_emit.period = 10000;
+        policy_emit.budget = 2000;
+        parser_norm.period = 10000;
+        parser_norm.budget = 2000;
+        ext_frontend.period = 10000;
+        ext_frontend.budget = 1000;
+        traffic_gen.period = 10000;
+        traffic_gen.budget = 1000;
+
+        /* One-way priorities */
+        traffic_gen._priority = 50;
+        ext_frontend._priority = 100;
+        parser_norm._priority = 150;
+        policy_emit._priority = 200;
+        int_nic._priority = 250;
+    }
+}

@@ -1,15 +1,50 @@
 /*
  * Copyright 2023, PhD Research Project
+ * ics_oneway_norm_v2 QEMU ARM Virt Platform Configuration with Linux VM
  *
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-/*
- * Platform-specific device configuration for qemu-arm-virt
- * This is a minimal configuration for non-VM CAmkES applications
- */
+#include <configurations/vm.h>
+
+#define VM_INITRD_MAX_SIZE 0x1900000 // 25 MB
+#define VM_RAM_BASE 0x40000000       // Standard ARM32 VM RAM base
+#define VM_RAM_SIZE 0x20000000       // 512MB for VM (same as vm_minimal)
+#define VM_RAM_OFFSET 0x00000000
+#define VM_DTB_ADDR 0x4F000000       // DTB address
+#define VM_INITRD_ADDR 0x4D700000    // Init RAM disk address
 
 assembly {
     composition {}
-    configuration {}
+    configuration {
+        vm0.vm_address_config = {
+            "ram_base" : VAR_STRINGIZE(VM_RAM_BASE),
+            "ram_paddr_base" : VAR_STRINGIZE(VM_RAM_BASE),
+            "ram_size" : VAR_STRINGIZE(VM_RAM_SIZE),
+            "dtb_addr" : VAR_STRINGIZE(VM_DTB_ADDR),
+            "initrd_addr" : VAR_STRINGIZE(VM_INITRD_ADDR),
+            "kernel_entry_addr" : VAR_STRINGIZE(VM_RAM_BASE)
+        };
+
+        vm0.vm_image_config = {
+            "kernel_bootcmdline" : "console=ttyAMA0",
+            "kernel_stdout" : "/pl011@9000000",
+            "provide_initrd" : true,
+            "generate_dtb" : true,
+            "provide_dtb" : false,
+            "map_one_to_one" : true,
+            "clean_cache" : false,
+        };
+
+        vm0.num_vcpus = 1;
+
+        vm0.dtb = dtb([
+            {"path": "/pl011@9000000"},
+        ]);
+
+        vm0.untyped_mmios = [
+            "0x8040000:12",  // Interrupt Controller Virtual CPU interface
+            "0x40000000:29", // Linux kernel memory (512MB) - INCREASED from :28 (256MB)
+        ];
+    }
 }

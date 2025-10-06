@@ -55,6 +55,20 @@ AddFileToOverlayDir(
     overlay
 )
 
+AddFileToOverlayDir(
+    "test_virtio_magic.sh"
+    ${CMAKE_CURRENT_SOURCE_DIR}/overlay_files/test_virtio_magic.sh
+    "root"
+    overlay
+)
+
+AddFileToOverlayDir(
+    "S99test_virtio"
+    ${CMAKE_CURRENT_SOURCE_DIR}/overlay_files/init_scripts/S99test_virtio
+    "etc/init.d"
+    overlay
+)
+
 AddOverlayDirToRootfs(
     overlay
     ${rootfs_file}

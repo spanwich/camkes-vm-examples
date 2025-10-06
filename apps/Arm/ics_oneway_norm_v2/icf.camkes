@@ -139,38 +139,11 @@ assembly {
         vm0.extra_frame_map_address = 0;
         vm0.cnode_size_bits = 23;
 
+        /* Memory pools - REDUCED to match vm_freertos working config */
+        vm0.simple_untyped24_pool = 12;  /* 12 × 16MB = 192MB (same as vm_freertos) */
 
-        /* VM Linux address configuration */
-        vm0.linux_address_config = {
-            "linux_ram_base" : "0x40000000",
-            "linux_ram_paddr_base" : "0x40000000",
-            "linux_ram_size" : "0x20000000",
-            "linux_ram_offset" : "0x00000000",
-            "dtb_addr" : "0x4F000000",
-            "initrd_max_size" : "0x1900000",
-            "initrd_addr" : "0x4D700000"
-        };
-
-        /* VM Linux image configuration */
-        vm0.linux_image_config = {
-            "linux_bootcmdline" : "",
-            "linux_stdout" : "/pl011@9000000",
-        };
-        vm0.num_vcpus = 2;
-
-        /* VM DTB configuration */
-        vm0.dtb_name = "linux-dtb";
-        vm0.dtb_base_name = "";
-        vm0.provide_dtb = true;
-        vm0.generate_dtb = false;
-        vm0.dtb = dtb([
-            {"path": "/pl011@9000000"},
-        ]);
-
-        vm0.untyped_mmios = [
-            "0x8040000:12", // Interrupt Controller Virtual CPU interface (Virtual Machine view)
-            "0x40000000:29", // Linux kernel memory regions (512MB)
-        ];
+        /* VM configuration now comes from devices.camkes */
+        /* linux_address_config, linux_image_config, dtb, untyped_mmios all in devices.camkes */
 
         /* VM dataport configuration (same pattern as vm_echo_connector) */
         vm0.vm_to_sel4_id = 0;
@@ -202,13 +175,6 @@ assembly {
 
         network_nic.period = 10000;
         network_nic.budget = 1500;  /* More budget for network processing */
-
-        /* Pipeline component memory configuration - small pools for basic operation */
-        network_nic.simple_untyped12_pool = 8;   /* 8 × 4KB = 32KB for component overhead */
-        ext_frontend.simple_untyped12_pool = 8;  /* 8 × 4KB = 32KB for dataport management */
-        parser_norm.simple_untyped12_pool = 8;   /* 8 × 4KB = 32KB for parsing buffers */
-        policy_emit.simple_untyped12_pool = 8;   /* 8 × 4KB = 32KB for policy structures */
-        int_nic.simple_untyped12_pool = 8;       /* 8 × 4KB = 32KB for counting/logging */
 
         /* Ensure no reverse capabilities exist - strict one-way policy */
         network_nic._priority = 75;

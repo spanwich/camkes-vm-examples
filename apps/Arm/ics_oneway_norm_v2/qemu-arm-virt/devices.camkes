@@ -1,0 +1,15 @@
+/*
+ * Copyright 2023, PhD Research Project
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+/*
+ * Platform-specific device configuration for qemu-arm-virt
+ * This is a minimal configuration for non-VM CAmkES applications
+ */
+
+assembly {
+    composition {}
+    configuration {}
+}

@@ -1,0 +1,18 @@
+# ICS One-Way Normalizer V2 - Dual NIC Configuration
+#
+# eth0: External-facing interface (receives traffic from outside)
+# eth1: Internal-facing interface (sends processed traffic to internal network)
+
+auto lo
+iface lo inet loopback
+
+auto eth0
+iface eth0 inet static
+    address 192.168.1.10
+    netmask 255.255.255.0
+    gateway 192.168.1.1
+
+auto eth1
+iface eth1 inet static
+    address 192.168.10.10
+    netmask 255.255.255.0

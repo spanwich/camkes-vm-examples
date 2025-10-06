@@ -1,0 +1,120 @@
+/*
+ * ICS One-Way Pipeline with Normalizer - Simplified Version
+ * Component Architecture for seL4/CAmkES
+ *
+ * Topology: [EXT NIC DRV] -> [EXT FRONTEND] -> [PARSER/NORMALIZER] -> [POLICY+EMITTER] -> [INT NIC DRV]
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+import <std_connector.camkes>;
+
+/* Network Driver Component - sDDF-Inspired Direct Hardware Access */
+import "components/NetworkDriverDrv/NetworkDriverDrv.camkes";
+
+/* External Frontend Component - Frame Parser */
+component ExtFrontend {
+    control;
+
+    /* Input from ExtNicDrv */
+    dataport Buf(65536) in_dp;
+    consumes Notification in_ntfy;
+
+    /* Output to ParserNorm */
+    dataport Buf(65536) out_dp;
+    emits Notification out_ntfy;
+}
+
+/* Parser/Normalizer Component - Validation and Bounds Checking */
+component ParserNorm {
+    control;
+
+    /* Input from ExtFrontend */
+    dataport Buf(65536) in_dp;
+    consumes Notification in_ntfy;
+
+    /* Output to PolicyEmit */
+    dataport Buf(65536) out_dp;
+    emits Notification out_ntfy;
+}
+
+/* Policy and Emitter Component - Allow/Deny Logic */
+component PolicyEmit {
+    control;
+
+    /* Input from ParserNorm */
+    dataport Buf(65536) in_dp;
+    consumes Notification in_ntfy;
+
+    /* Output to IntNicDrv */
+    dataport Buf(65536) out_dp;
+    emits Notification out_ntfy;
+}
+
+/* Internal NIC Driver Component - Message Sink and Counter */
+component IntNicDrv {
+    control;
+
+    /* Input from PolicyEmit (final stage) */
+    dataport Buf(65536) in_dp;
+    consumes Notification in_ntfy;
+}
+
+assembly {
+    composition {
+        /* Instantiate our ICS pipeline components */
+        component NetworkDriverDrv ext_nic;
+        component ExtFrontend ext_frontend;
+        component ParserNorm parser_norm;
+        component PolicyEmit policy_emit;
+        component IntNicDrv int_nic;
+
+        /* One-way dataport connections (EXT -> FE -> PAR -> POL -> INT) */
+        connection seL4SharedData ext_fe_dp(from ext_nic.out_dp, to ext_frontend.in_dp);
+        connection seL4SharedData fe_par_dp(from ext_frontend.out_dp, to parser_norm.in_dp);
+        connection seL4SharedData par_pol_dp(from parser_norm.out_dp, to policy_emit.in_dp);
+        connection seL4SharedData pol_int_dp(from policy_emit.out_dp, to int_nic.in_dp);
+
+        /* One-way notification connections (same direction as dataports) */
+        connection seL4Notification ext_fe_ntfy(from ext_nic.out_ntfy, to ext_frontend.in_ntfy);
+        connection seL4Notification fe_par_ntfy(from ext_frontend.out_ntfy, to parser_norm.in_ntfy);
+        connection seL4Notification par_pol_ntfy(from parser_norm.out_ntfy, to policy_emit.in_ntfy);
+        connection seL4Notification pol_int_ntfy(from policy_emit.out_ntfy, to int_nic.in_ntfy);
+    }
+
+    configuration {
+        /* Component priorities (higher number = higher priority) */
+        /* IntNicDrv has highest priority to drain messages quickly */
+        int_nic.priority = 250;
+        policy_emit.priority = 200;
+        parser_norm.priority = 150;
+        ext_frontend.priority = 100;
+        ext_nic.priority = 50;
+
+        /* Timeslice configuration (1ms = 1000 microseconds) */
+        int_nic.period = 10000;
+        int_nic.budget = 1000;
+
+        policy_emit.period = 10000;
+        policy_emit.budget = 2000;
+
+        parser_norm.period = 10000;
+        parser_norm.budget = 2000;
+
+        ext_frontend.period = 10000;
+        ext_frontend.budget = 1000;
+
+        ext_nic.period = 10000;
+        ext_nic.budget = 1000;
+
+        /* Memory configuration for NetworkDriverDrv */
+        ext_nic.simple_untyped20_pool = 8; /* Memory for sDDF-inspired operations */
+
+        /* Ensure no reverse capabilities exist - strict one-way policy */
+        ext_nic._priority = 50;
+        ext_frontend._priority = 100;
+        parser_norm._priority = 150;
+        policy_emit._priority = 200;
+        int_nic._priority = 250;
+    }
+}

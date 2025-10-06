@@ -1,0 +1,27 @@
+#!/bin/sh
+#
+# ICS One-Way Normalizer V2 - Bridge Startup Script
+# Starts the network bridge that forwards traffic through seL4 processing
+#
+
+echo "=== ICS One-Way Normalizer V2 Bridge Starting ==="
+
+# Wait for network interfaces to be ready
+sleep 2
+
+# Check if bridge script exists
+if [ -f "/root/vm-bridge-script.sh" ]; then
+    echo "Starting ICS bridge script..."
+    chmod +x /root/vm-bridge-script.sh
+    /root/vm-bridge-script.sh &
+    echo "ICS bridge started in background"
+else
+    echo "Warning: vm-bridge-script.sh not found"
+fi
+
+# Display network configuration
+echo "Network configuration:"
+ip addr show eth0 | grep inet
+ip addr show eth1 | grep inet
+
+echo "ICS V2 bridge startup complete"

@@ -1,0 +1,160 @@
+/*
+ * ICS One-Way Pipeline with Linux VM - V3 (Proof of Concept)
+ * Component Architecture for seL4/CAmkES
+ *
+ * Topology: [LINUX VM with VirtIO-Net] + [ICS PIPELINE COMPONENTS]
+ *
+ * V3 PoC Phase 1:
+ * - Linux VM receives VirtIO network packets from QEMU
+ * - ICS pipeline components run alongside VM (no cross-VM connection yet)
+ * - Validates VM + components can coexist
+ * - Tests external network injection via netcat
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <configurations/vm.h>
+
+import <std_connector.camkes>;
+import <global-connectors.camkes>;
+import <seL4VMDTBPassthrough.idl4>;
+import <FileServerInterface.camkes>;
+import <FileServer/FileServer.camkes>;
+import <SerialServer/SerialServer.camkes>;
+import <TimeServer/TimeServer.camkes>;
+import <vm-connectors.camkes>;
+import <devices.camkes>;
+
+/* Linux VM Component - VirtIO Network Receiver */
+component VM {
+    VM_INIT_DEF()
+}
+
+/* External Frontend Component - Frame Parser */
+component ExtFrontend {
+    control;
+
+    /* Input from NetworkDriverDrv (will be connected later) */
+    dataport Buf(65536) in_dp;
+    consumes Notification in_ntfy;
+
+    /* Output to ParserNorm */
+    dataport Buf(65536) out_dp;
+    emits Notification out_ntfy;
+}
+
+/* Parser/Normalizer Component - Validation and Bounds Checking */
+component ParserNorm {
+    control;
+
+    /* Input from ExtFrontend */
+    dataport Buf(65536) in_dp;
+    consumes Notification in_ntfy;
+
+    /* Output to PolicyEmit */
+    dataport Buf(65536) out_dp;
+    emits Notification out_ntfy;
+}
+
+/* Policy and Emitter Component - Allow/Deny Logic */
+component PolicyEmit {
+    control;
+
+    /* Input from ParserNorm */
+    dataport Buf(65536) in_dp;
+    consumes Notification in_ntfy;
+
+    /* Output to IntNicDrv */
+    dataport Buf(65536) out_dp;
+    emits Notification out_ntfy;
+}
+
+/* Internal NIC Driver Component - Message Sink and Counter */
+component IntNicDrv {
+    control;
+
+    /* Input from PolicyEmit (final stage) */
+    dataport Buf(65536) in_dp;
+    consumes Notification in_ntfy;
+}
+
+/* Dummy component to generate test traffic for ICS pipeline */
+component TestTrafficGen {
+    control;
+
+    /* Output to ExtFrontend */
+    dataport Buf(65536) out_dp;
+    emits Notification out_ntfy;
+}
+
+assembly {
+    composition {
+        /* Linux VM composition (from vm_virtio_net pattern) */
+        VM_GENERAL_COMPOSITION_DEF()
+        VM_COMPOSITION_DEF(0)
+        connection seL4VMDTBPassthrough vm_dtb(from vm0.dtb_self, to vm0.dtb);
+
+        /* ICS pipeline components */
+        component TestTrafficGen traffic_gen;
+        component ExtFrontend ext_frontend;
+        component ParserNorm parser_norm;
+        component PolicyEmit policy_emit;
+        component IntNicDrv int_nic;
+
+        /* ICS pipeline connections (unchanged) */
+        connection seL4SharedData gen_fe_dp(from traffic_gen.out_dp, to ext_frontend.in_dp);
+        connection seL4SharedData fe_par_dp(from ext_frontend.out_dp, to parser_norm.in_dp);
+        connection seL4SharedData par_pol_dp(from parser_norm.out_dp, to policy_emit.in_dp);
+        connection seL4SharedData pol_int_dp(from policy_emit.out_dp, to int_nic.in_dp);
+
+        connection seL4Notification gen_fe_ntfy(from traffic_gen.out_ntfy, to ext_frontend.in_ntfy);
+        connection seL4Notification fe_par_ntfy(from ext_frontend.out_ntfy, to parser_norm.in_ntfy);
+        connection seL4Notification par_pol_ntfy(from parser_norm.out_ntfy, to policy_emit.in_ntfy);
+        connection seL4Notification pol_int_ntfy(from policy_emit.out_ntfy, to int_nic.in_ntfy);
+    }
+
+    configuration {
+        /* Linux VM configuration (from vm_virtio_net) */
+        VM_GENERAL_CONFIGURATION_DEF()
+        VM_CONFIGURATION_DEF(0)
+
+        vm0.num_extra_frame_caps = 0;
+        vm0.extra_frame_map_address = 0;
+        vm0.cnode_size_bits = 23;
+        vm0.simple_untyped24_pool = 12;
+
+        /* Additional memory for VirtIO buffers */
+        vm0.simple_untyped26_pool = 4;   /* 4 × 64MB = 256MB total */
+        vm0.simple_untyped22_pool = 16;  /* 16 × 4MB = 64MB for VirtIO */
+
+        /* ICS Component priorities (higher number = higher priority) */
+        int_nic.priority = 250;
+        policy_emit.priority = 200;
+        parser_norm.priority = 150;
+        ext_frontend.priority = 100;
+        traffic_gen.priority = 50;
+
+        /* Timeslice configuration (1ms = 1000 microseconds) */
+        int_nic.period = 10000;
+        int_nic.budget = 1000;
+
+        policy_emit.period = 10000;
+        policy_emit.budget = 2000;
+
+        parser_norm.period = 10000;
+        parser_norm.budget = 2000;
+
+        ext_frontend.period = 10000;
+        ext_frontend.budget = 1000;
+
+        traffic_gen.period = 10000;
+        traffic_gen.budget = 1000;
+
+        /* Ensure no reverse capabilities exist - strict one-way policy */
+        traffic_gen._priority = 50;
+        ext_frontend._priority = 100;
+        parser_norm._priority = 150;
+        policy_emit._priority = 200;
+        int_nic._priority = 250;
+    }
+}

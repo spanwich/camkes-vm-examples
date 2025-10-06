@@ -1,0 +1,29 @@
+/*
+ * External NIC Driver Component Interface
+ *
+ * Stub traffic generator that produces synthetic ICS protocol frames
+ * Feeds messages into the one-way pipeline at regular intervals
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+import <std_connector.camkes>;
+import <TimeServer/TimeServer.camkes>;
+import <SerialServer/SerialServer.camkes>;
+
+component ExtNicDrv {
+    control;
+
+    /* Output dataport to ExtFrontend */
+    dataport Buf out_dp;
+
+    /* Output notification to signal ExtFrontend */
+    emits Notification out_ntfy;
+
+    /* Timer for periodic traffic generation */
+    uses Timer timer;
+    consumes Notification timer;
+
+    /* Serial output for debugging */
+    uses SerialServer serial_getchar;
+}

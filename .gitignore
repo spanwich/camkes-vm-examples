@@ -20,7 +20,7 @@ test_*/
 *.pickle.*
 *.log
 *.deps
-*.cmake
+# *.cmake - we need settings.cmake
 CMakeCache.txt
 CMakeFiles/
 .ninja_*

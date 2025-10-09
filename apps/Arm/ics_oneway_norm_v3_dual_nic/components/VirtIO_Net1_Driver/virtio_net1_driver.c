@@ -48,6 +48,7 @@
  * Set to 1 to enable, 0 to disable
  */
 #define DEBUG_VERBOSE 0           /* Enable verbose debug output */
+#define DEBUG_PACKET_LOG 0        /* Enable detailed packet logging (VERY VERBOSE) */
 #define ENABLE_GDB_WAIT 0         /* Enable 60-second GDB wait during init */
 #define ENABLE_PAINT_TEST 0       /* Enable virtqueue memory paint test */
 
@@ -719,7 +720,8 @@ static void process_rx_packets(void)
          * This deferred initialization code is no longer needed.
          */
 
-        /* Log packet arrival with detailed inspection */
+        #if DEBUG_PACKET_LOG
+        /* Log packet arrival with detailed inspection (VERY VERBOSE - only for debugging) */
         uint32_t timestamp_ms = sys_now();
         printf("\n╔══════════════════════════════════════════════════════════╗\n");
         printf("║  📥 INCOMING PACKET #%u [T=%u.%03us]                      ║\n",
@@ -782,6 +784,7 @@ static void process_rx_packets(void)
             }
         }
         printf("══════════════════════════════════════════════════════════\n\n");
+        #endif /* DEBUG_PACKET_LOG */
 
         /* Allocate pbuf and copy packet data (skipping header) */
         struct pbuf *p = pbuf_alloc(PBUF_RAW, packet_len, PBUF_POOL);

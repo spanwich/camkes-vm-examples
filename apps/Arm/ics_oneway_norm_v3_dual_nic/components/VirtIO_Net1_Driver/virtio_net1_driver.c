@@ -1005,7 +1005,7 @@ static int virtio_net_init(void)
     uint32_t version = VREG_READ(VIRTIO_MMIO_VERSION);
     uint32_t device_id = VREG_READ(VIRTIO_MMIO_DEVICE_ID);
 
-    printf("%s: VirtIO @ slot 6 (+0xc00): Magic=0x%x, Version=%u, DeviceID=%u\n",
+    printf("%s: VirtIO @ slot 30 (+0xc00): Magic=0x%x, Version=%u, DeviceID=%u\n",
            COMPONENT_NAME, magic, version, device_id);
 
     if (magic != 0x74726976) {

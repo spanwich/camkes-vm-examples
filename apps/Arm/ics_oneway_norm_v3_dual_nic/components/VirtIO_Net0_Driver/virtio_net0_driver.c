@@ -1001,39 +1001,42 @@ static int virtio_net_init(void)
     /* Scan all 32 VirtIO MMIO slots to find which ones have devices   */
     /* ═══════════════════════════════════════════════════════════════ */
     printf("\n╔═══════════════════════════════════════════════════════════════╗\n");
-    printf("║  SCANNING MAPPED VIRTIO MMIO SLOTS FOR ACTIVE DEVICES         ║\n");
+    printf("║  [DISABLED] SCANNING MAPPED VIRTIO MMIO SLOTS FOR ACTIVE DEVICES         ║\n");
     printf("║  Base: 0x0a000000, Each slot: 0x200 bytes apart               ║\n");
-    printf("║  Scanning slots 0-7 only (one 4KB page mapped)                ║\n");
+    printf("║  Scanning slots 24-31 only (one 4KB page mapped)                ║\n");
     printf("╚═══════════════════════════════════════════════════════════════╝\n\n");
 
     /* Only scan slots within the mapped 4KB page (8 slots of 0x200 bytes each) */
-    for (int slot = 0; slot < 8; slot++) {
-        /* Calculate offset for this slot */
-        uint32_t offset = slot * 0x200;
-        volatile uint32_t *slot_base = (volatile uint32_t *)((uintptr_t)virtio_mmio_regs + offset);
-
-        /* Read device identification registers */
-        uint32_t slot_magic = slot_base[VIRTIO_MMIO_MAGIC_VALUE / 4];
-        uint32_t slot_version = slot_base[VIRTIO_MMIO_VERSION / 4];
-        uint32_t slot_device_id = slot_base[VIRTIO_MMIO_DEVICE_ID / 4];
-        uint32_t slot_vendor_id = slot_base[VIRTIO_MMIO_VENDOR_ID / 4];
-
-        /* Only print slots with valid VirtIO magic */
-        if (slot_magic == 0x74726976) {
-            printf("Slot %2d @ 0x%08lx (offset +0x%03x): Magic=0x%08x Version=%u DeviceID=%u Vendor=0x%08x",
-                   slot, 0x0a000000 + offset, offset,
-                   slot_magic, slot_version, slot_device_id, slot_vendor_id);
-
-            /* Identify device type */
-            if (slot_device_id == 1) {
-                printf(" [NETWORK]\n");
-            } else if (slot_device_id == 0) {
-                printf(" [NO DEVICE]\n");
-            } else {
-                printf(" [UNKNOWN TYPE]\n");
-            }
-        }
-    }
+//     for (int slot = 24; slot < 32; slot++) {
+//         /* Calculate offset for this slot */
+//         uint32_t offset = slot * 0x200;
+//         volatile uint32_t *slot_base = (volatile uint32_t *)((uintptr_t)virtio_mmio_regs + offset);
+// 
+//         /* Read device identification registers with memory barriers (like VREG_READ) */
+//         DMB();  /* Ensure all prior memory operations complete before reading */
+//         /* Read device identification registers */
+//         uint32_t slot_magic = slot_base[VIRTIO_MMIO_MAGIC_VALUE / 4];
+//         uint32_t slot_version = slot_base[VIRTIO_MMIO_VERSION / 4];
+//         uint32_t slot_device_id = slot_base[VIRTIO_MMIO_DEVICE_ID / 4];
+//         DMB();  /* Ensure reads complete before using values */
+//         uint32_t slot_vendor_id = slot_base[VIRTIO_MMIO_VENDOR_ID / 4];
+// 
+//         /* Only print slots with valid VirtIO magic */
+//         if (slot_magic == 0x74726976) {
+//             printf("Slot %2d @ 0x%08lx (offset +0x%03x): Magic=0x%08x Version=%u DeviceID=%u Vendor=0x%08x",
+//                    slot, 0x0a000000 + offset, offset,
+//                    slot_magic, slot_version, slot_device_id, slot_vendor_id);
+// 
+//             /* Identify device type */
+//             if (slot_device_id == 1) {
+//                 printf(" [NETWORK]\n");
+//             } else if (slot_device_id == 0) {
+//                 printf(" [NO DEVICE]\n");
+//             } else {
+//                 printf(" [UNKNOWN TYPE]\n");
+//             }
+//         }
+//     }
 
     printf("\n");
 
@@ -1046,7 +1049,7 @@ static int virtio_net_init(void)
     uint32_t version = VREG_READ(VIRTIO_MMIO_VERSION);
     uint32_t device_id = VREG_READ(VIRTIO_MMIO_DEVICE_ID);
 
-    printf("%s: VirtIO @ slot 7 (+0xe00): Magic=0x%x, Version=%u, DeviceID=%u\n",
+    printf("%s: VirtIO @ slot 31 (+0xe00): Magic=0x%x, Version=%u, DeviceID=%u\n",
            COMPONENT_NAME, magic, version, device_id);
 
     if (magic != 0x74726976) {

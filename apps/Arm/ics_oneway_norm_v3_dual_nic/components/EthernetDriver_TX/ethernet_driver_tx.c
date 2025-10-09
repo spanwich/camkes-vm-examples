@@ -134,9 +134,19 @@ static uint32_t last_reconnect_attempt = 0;
 static uint64_t messages_transmitted = 0;
 static uint64_t bytes_transmitted = 0;
 
-/* VirtIO queue structures (minimal for TX only) */
-#define QUEUE_SIZE 64
+/* VirtIO queue structures */
+#define QUEUE_SIZE 256
 #define TX_QUEUE_IDX 1
+#define MAX_PACKETS 128
+#define PACKET_BUFFER_SIZE 2048
+
+/* VirtIO descriptor flags */
+#define VIRTQ_DESC_F_NEXT       1
+#define VIRTQ_DESC_F_WRITE      2
+#define VIRTQ_DESC_F_INDIRECT   4
+
+/* VirtIO net header size */
+#define VIRTIO_NET_HDR_SIZE 12
 
 typedef struct {
     uint64_t addr;
@@ -149,28 +159,46 @@ typedef struct {
     uint16_t flags;
     uint16_t idx;
     uint16_t ring[QUEUE_SIZE];
+    uint16_t used_event;
 } __attribute__((packed)) virtq_avail;
 
 typedef struct {
-    uint64_t addr;
+    uint32_t id;
     uint32_t len;
-    uint16_t flags;
 } __attribute__((packed)) virtq_used_elem;
 
 typedef struct {
     uint16_t flags;
     uint16_t idx;
     virtq_used_elem ring[QUEUE_SIZE];
+    uint16_t avail_event;
 } __attribute__((packed)) virtq_used;
 
-static virtq_desc *tx_desc;
-static virtq_avail *tx_avail;
-static virtq_used *tx_used;
-static uint8_t *tx_buffers;
-static uint16_t tx_last_used_idx = 0;
+struct virtq {
+    unsigned int num;
+    virtq_desc *desc;
+    virtq_avail *avail;
+    virtq_used *used;
+};
 
-#define TX_BUFFER_SIZE 2048
-#define NET_HDR_SIZE 12
+/* VirtIO net header */
+typedef struct {
+    uint8_t flags;
+    uint8_t gso_type;
+    uint16_t hdr_len;
+    uint16_t gso_size;
+    uint16_t csum_start;
+    uint16_t csum_offset;
+    uint16_t num_buffers;
+} __attribute__((packed)) virtio_net_hdr_t;
+
+static struct virtq tx_virtq;
+static uint8_t *packet_buffers[MAX_PACKETS];
+static uintptr_t packet_buffers_paddr[MAX_PACKETS];
+static virtio_net_hdr_t *tx_headers;
+static uintptr_t tx_headers_paddr;
+static uint16_t tx_last_used_idx = 0;
+static uint64_t packets_sent = 0;
 
 /*
  * TCP client callbacks
@@ -257,15 +285,66 @@ static void process_ics_message(void)
 }
 
 /*
- * Minimal lwIP netif output function for TX
+ * lwIP netif output function - transmit packet via VirtIO TX queue
  */
 static err_t netif_output(struct netif *netif, struct pbuf *p)
 {
-    /* Simplified TX path - just send via virtqueue */
-    printf("%s: TX packet (%u bytes)\n", COMPONENT_NAME, p->tot_len);
+    struct virtq *vq = &tx_virtq;
+    static uint16_t next_tx_desc = 0;
 
-    /* TODO: Implement actual VirtIO TX virtqueue management */
-    /* For now, this is a stub to make lwIP happy */
+    packets_sent++;
+
+    if (packets_sent <= 5) {
+        printf("%s: 📤 TX packet #%llu (%u bytes)\n", COMPONENT_NAME, packets_sent, p->tot_len);
+    }
+
+    /* Get TX descriptor pair (header + packet) - need 2 consecutive descriptors */
+    uint16_t hdr_desc_idx = next_tx_desc;
+    uint16_t pkt_desc_idx = (next_tx_desc + 1) % vq->num;
+    next_tx_desc = (next_tx_desc + 2) % vq->num;  /* Advance by 2 for chaining */
+
+    int tx_buf_idx = hdr_desc_idx % MAX_PACKETS;
+
+    /* Copy pbuf chain to TX buffer */
+    uint16_t copied = pbuf_copy_partial(p, packet_buffers[tx_buf_idx],
+                                        p->tot_len, 0);
+
+    if (copied != p->tot_len) {
+        printf("%s: ERROR: Failed to copy pbuf: %u/%u bytes\n",
+               COMPONENT_NAME, copied, p->tot_len);
+        return ERR_BUF;
+    }
+
+    /* Setup virtio_net_hdr (already zero-initialized, no offloads needed) */
+    uintptr_t hdr_paddr = tx_headers_paddr + (hdr_desc_idx * sizeof(virtio_net_hdr_t));
+
+    /* Descriptor 0: VirtIO net header */
+    vq->desc[hdr_desc_idx].addr = (uint64_t)hdr_paddr;
+    vq->desc[hdr_desc_idx].len = VIRTIO_NET_HDR_SIZE;
+    vq->desc[hdr_desc_idx].flags = VIRTQ_DESC_F_NEXT;  /* Chain to next descriptor */
+    vq->desc[hdr_desc_idx].next = pkt_desc_idx;
+
+    /* Descriptor 1: Packet data */
+    vq->desc[pkt_desc_idx].addr = (uint64_t)packet_buffers_paddr[tx_buf_idx];
+    vq->desc[pkt_desc_idx].len = p->tot_len;
+    vq->desc[pkt_desc_idx].flags = 0;  /* Last descriptor in chain */
+    vq->desc[pkt_desc_idx].next = 0;
+
+    /* Add to available ring (only add the FIRST descriptor of the chain) */
+    uint16_t avail_idx = vq->avail->idx % vq->num;
+    vq->avail->ring[avail_idx] = hdr_desc_idx;
+
+    /* Memory barrier before updating index */
+    __sync_synchronize();
+    vq->avail->idx++;
+
+    /* Notify device */
+    VREG_WRITE(VIRTIO_MMIO_QUEUE_NOTIFY, TX_QUEUE_IDX);
+
+    if (packets_sent <= 5) {
+        printf("%s: ✓ Packet queued (desc[%u]→desc[%u], avail_idx=%u)\n",
+               COMPONENT_NAME, hdr_desc_idx, pkt_desc_idx, vq->avail->idx);
+    }
 
     return ERR_OK;
 }
@@ -296,33 +375,105 @@ static err_t netif_tx_init(struct netif *netif)
 }
 
 /*
- * Initialize VirtIO device (TX only)
+ * Initialize VirtIO device with TX queue
  */
-static void init_virtio_device(void)
+static int init_virtio_device(void)
 {
     printf("%s: Initializing VirtIO TX device...\n", COMPONENT_NAME);
+
+    /* Verify VirtIO device */
+    uint32_t magic = VREG_READ(VIRTIO_MMIO_MAGIC_VALUE);
+    uint32_t version = VREG_READ(VIRTIO_MMIO_VERSION);
+    uint32_t device_id = VREG_READ(VIRTIO_MMIO_DEVICE_ID);
+
+    printf("%s: VirtIO device: Magic=0x%x, Version=%u, DeviceID=%u\n",
+           COMPONENT_NAME, magic, version, device_id);
+
+    if (magic != 0x74726976) {
+        printf("%s: ERROR: Invalid VirtIO magic value\n", COMPONENT_NAME);
+        return -1;
+    }
+
+    if (device_id != 1) {
+        printf("%s: ERROR: Not a network device (ID=%u)\n", COMPONENT_NAME, device_id);
+        return -1;
+    }
 
     /* Reset device */
     VREG_WRITE(VIRTIO_MMIO_STATUS, 0);
 
-    /* Set ACKNOWLEDGE and DRIVER status bits */
+    /* Set ACKNOWLEDGE status bit */
     VREG_WRITE(VIRTIO_MMIO_STATUS, VIRTIO_STATUS_ACKNOWLEDGE);
+
+    /* Set DRIVER status bit */
     VREG_WRITE(VIRTIO_MMIO_STATUS, VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER);
 
-    /* Negotiate features */
+    /* Negotiate features - minimal set for TX */
     VREG_WRITE(VIRTIO_MMIO_DRIVER_FEATURES_SEL, 0);
     VREG_WRITE(VIRTIO_MMIO_DRIVER_FEATURES, (uint32_t)VIRTIO_NET_F_MAC);
     VREG_WRITE(VIRTIO_MMIO_DRIVER_FEATURES_SEL, 1);
     VREG_WRITE(VIRTIO_MMIO_DRIVER_FEATURES, (uint32_t)(VIRTIO_F_VERSION_1 >> 32));
 
+    /* Set FEATURES_OK */
     VREG_WRITE(VIRTIO_MMIO_STATUS, VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK);
 
-    /* Allocate TX virtqueue (simplified) */
-    /* TODO: Full TX queue setup */
+    /* Allocate TX virtqueue ring structures using DMA */
+    size_t ring_size = sizeof(virtq_desc) * QUEUE_SIZE +
+                       sizeof(virtq_avail) + sizeof(uint16_t) * QUEUE_SIZE +
+                       sizeof(virtq_used) + sizeof(virtq_used_elem) * QUEUE_SIZE;
 
-    VREG_WRITE(VIRTIO_MMIO_STATUS, VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK | VIRTIO_STATUS_DRIVER_OK);
+    printf("%s: Allocating TX virtqueue ring (%zu bytes)...\n", COMPONENT_NAME, ring_size);
 
-    printf("%s: VirtIO TX device initialized\n", COMPONENT_NAME);
+    uint8_t *ring_base = camkes_dma_alloc(ring_size, 4096, false);  /* 4K aligned */
+    if (!ring_base) {
+        printf("%s: ERROR: Failed to allocate TX ring\n", COMPONENT_NAME);
+        return -1;
+    }
+    uintptr_t ring_base_paddr = camkes_dma_get_paddr(ring_base);
+    memset(ring_base, 0, ring_size);
+
+    printf("%s: TX ring allocated: vaddr=%p, paddr=0x%lx\n",
+           COMPONENT_NAME, (void*)ring_base, ring_base_paddr);
+
+    /* Setup TX queue (Queue 1) */
+    VREG_WRITE(VIRTIO_MMIO_QUEUE_SEL, TX_QUEUE_IDX);
+
+    uint32_t queue_num_max = VREG_READ(VIRTIO_MMIO_QUEUE_NUM_MAX);
+    if (queue_num_max == 0) {
+        printf("%s: ERROR: TX queue not available\n", COMPONENT_NAME);
+        return -1;
+    }
+
+    tx_virtq.num = (queue_num_max < QUEUE_SIZE) ? queue_num_max : QUEUE_SIZE;
+    printf("%s: TX queue size: %u (max %u)\n", COMPONENT_NAME, tx_virtq.num, queue_num_max);
+
+    /* Virtual addresses for driver access */
+    tx_virtq.desc = (virtq_desc *)ring_base;
+    tx_virtq.avail = (virtq_avail *)(ring_base + sizeof(virtq_desc) * QUEUE_SIZE);
+    tx_virtq.used = (virtq_used *)(ring_base + sizeof(virtq_desc) * QUEUE_SIZE +
+                                    sizeof(virtq_avail) + sizeof(uint16_t) * QUEUE_SIZE);
+
+    /* Physical addresses for device DMA access */
+    uintptr_t desc_paddr = ring_base_paddr;
+    uintptr_t avail_paddr = ring_base_paddr + sizeof(virtq_desc) * QUEUE_SIZE;
+    uintptr_t used_paddr = ring_base_paddr + sizeof(virtq_desc) * QUEUE_SIZE +
+                           sizeof(virtq_avail) + sizeof(uint16_t) * QUEUE_SIZE;
+
+    VREG_WRITE(VIRTIO_MMIO_QUEUE_NUM, tx_virtq.num);
+    VREG_WRITE(VIRTIO_MMIO_QUEUE_DESC_LOW, (uint32_t)desc_paddr);
+    VREG_WRITE(VIRTIO_MMIO_QUEUE_DESC_HIGH, (uint32_t)(desc_paddr >> 32));
+    VREG_WRITE(VIRTIO_MMIO_QUEUE_AVAIL_LOW, (uint32_t)avail_paddr);
+    VREG_WRITE(VIRTIO_MMIO_QUEUE_AVAIL_HIGH, (uint32_t)(avail_paddr >> 32));
+    VREG_WRITE(VIRTIO_MMIO_QUEUE_USED_LOW, (uint32_t)used_paddr);
+    VREG_WRITE(VIRTIO_MMIO_QUEUE_USED_HIGH, (uint32_t)(used_paddr >> 32));
+    VREG_WRITE(VIRTIO_MMIO_QUEUE_READY, 1);
+
+    /* Device ready - activate the device */
+    VREG_WRITE(VIRTIO_MMIO_STATUS, VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER |
+                                     VIRTIO_STATUS_FEATURES_OK | VIRTIO_STATUS_DRIVER_OK);
+
+    printf("%s: ✓ VirtIO TX device initialized and activated\n", COMPONENT_NAME);
+    return 0;
 }
 
 /*
@@ -373,13 +524,44 @@ void post_init(void)
     printf("%s: VirtIO MMIO registers mapped at %p\n", COMPONENT_NAME, (void *)virtio_regs_base);
 
     /* Initialize VirtIO device */
-    init_virtio_device();
+    if (init_virtio_device() != 0) {
+        printf("%s: ERROR: Failed to initialize VirtIO device\n", COMPONENT_NAME);
+        return;
+    }
+
+    /* Allocate packet buffers from DMA memory */
+    printf("%s: Allocating %d DMA packet buffers (%d bytes each)...\n",
+           COMPONENT_NAME, MAX_PACKETS, PACKET_BUFFER_SIZE);
+    for (int i = 0; i < MAX_PACKETS; i++) {
+        packet_buffers[i] = camkes_dma_alloc(PACKET_BUFFER_SIZE, 64, false);
+        if (!packet_buffers[i]) {
+            printf("%s: ERROR: Failed to allocate DMA buffer %d\n", COMPONENT_NAME, i);
+            return;
+        }
+        packet_buffers_paddr[i] = camkes_dma_get_paddr(packet_buffers[i]);
+    }
+    printf("%s: ✓ Allocated DMA packet buffers (vaddr=%p, paddr=0x%lx)\n",
+           COMPONENT_NAME, packet_buffers[0], packet_buffers_paddr[0]);
+
+    /* Allocate TX headers array (one header per possible TX descriptor) */
+    size_t tx_headers_size = MAX_PACKETS * sizeof(virtio_net_hdr_t);
+    tx_headers = camkes_dma_alloc(tx_headers_size, 16, false);  /* 16-byte aligned */
+    if (!tx_headers) {
+        printf("%s: ERROR: Failed to allocate TX headers DMA memory\n", COMPONENT_NAME);
+        return;
+    }
+    tx_headers_paddr = camkes_dma_get_paddr(tx_headers);
+
+    /* Initialize all TX headers (zero-fill = no offloads) */
+    memset(tx_headers, 0, tx_headers_size);
+    printf("%s: ✓ Allocated TX headers array (vaddr=%p, paddr=0x%lx)\n",
+           COMPONENT_NAME, tx_headers, tx_headers_paddr);
 
     /* Initialize lwIP */
     init_lwip();
 
     printf("%s: Initialization complete\n", COMPONENT_NAME);
-    printf("%s: Ready to receive ICS messages from IntNicDrv\n", COMPONENT_NAME);
+    printf("%s: Ready to receive ICS messages from IntNicDrv\n\n", COMPONENT_NAME);
 }
 
 /*

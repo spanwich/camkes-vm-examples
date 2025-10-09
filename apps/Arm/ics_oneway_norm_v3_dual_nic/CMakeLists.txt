@@ -22,8 +22,8 @@ AddCamkesCPPFlag(cpp_flags CONFIG_VARS VmEmmc2NoDMA)
 DefineCAmkESVMFileServer()
 
 CAmkESAddImportPath(${KernelARMPlatform})
-CAmkESAddImportPath(components/EthernetDriver_RX)
-CAmkESAddImportPath(components/EthernetDriver_TX)
+CAmkESAddImportPath(components/VirtIO_Net0_Driver)
+CAmkESAddImportPath(components/VirtIO_Net1_Driver)
 
 # Enable lwIP
 set(LibLwip ON CACHE BOOL "Enable lwIP" FORCE)
@@ -35,31 +35,16 @@ if("${LWIP_PATH}" STREQUAL "LWIP_PATH-NOTFOUND")
 endif()
 
 include(${CMAKE_CURRENT_LIST_DIR}/../../../../util_libs/liblwip/lwip_helpers.cmake)
-# Only call AddLWIPConfiguration once - both RX and TX will use the same lwIP config
-AddLWIPConfiguration(${CMAKE_CURRENT_LIST_DIR}/components/EthernetDriver_RX)
+# Only call AddLWIPConfiguration once - both drivers will use the same lwIP config
+AddLWIPConfiguration(${CMAKE_CURRENT_LIST_DIR}/components/VirtIO_Net0_Driver)
 
-# EthernetDriver_RX Component
+# VirtIO_Net0_Driver Component (External Network - port 6000)
 DeclareCAmkESComponent(
-    EthernetDriver_RX
+    VirtIO_Net0_Driver
     SOURCES
-        components/EthernetDriver_RX/ethernet_driver_rx.c
+        components/VirtIO_Net0_Driver/virtio_net0_driver.c
     INCLUDES
-        components/EthernetDriver_RX
-        ${LWIP_PATH}/src/include
-        ${CMAKE_CURRENT_LIST_DIR}/../../../../util_libs/liblwip/include
-    LIBS
-        sel4_autoconf
-        utils
-        lwip
-)
-
-# EthernetDriver_TX Component
-DeclareCAmkESComponent(
-    EthernetDriver_TX
-    SOURCES
-        components/EthernetDriver_TX/ethernet_driver_tx.c
-    INCLUDES
-        components/EthernetDriver_TX
+        components/VirtIO_Net0_Driver
         components/include
         ${LWIP_PATH}/src/include
         ${CMAKE_CURRENT_LIST_DIR}/../../../../util_libs/liblwip/include
@@ -69,48 +54,38 @@ DeclareCAmkESComponent(
         lwip
 )
 
-# ExtFrontend Component
+# VirtIO_Net1_Driver Component (Internal Network - port 7000)
 DeclareCAmkESComponent(
-    ExtFrontend
+    VirtIO_Net1_Driver
     SOURCES
-        components/ExtFrontend/ExtFrontend.c
-        components/lib/ringbuf.c
+        components/VirtIO_Net1_Driver/virtio_net1_driver.c
     INCLUDES
+        components/VirtIO_Net1_Driver
         components/include
-        components/lib
+        ${LWIP_PATH}/src/include
+        ${CMAKE_CURRENT_LIST_DIR}/../../../../util_libs/liblwip/include
+    LIBS
+        sel4_autoconf
+        utils
+        lwip
 )
 
-# ParserNorm Component
+# ICS_Inbound Component (External → Internal validation)
 DeclareCAmkESComponent(
-    ParserNorm
+    ICS_Inbound
     SOURCES
-        components/ParserNorm/ParserNorm.c
-        components/lib/ringbuf.c
+        components/ICS_Inbound/ICS_Inbound.c
     INCLUDES
         components/include
-        components/lib
 )
 
-# PolicyEmit Component
+# ICS_Outbound Component (Internal → External validation)
 DeclareCAmkESComponent(
-    PolicyEmit
+    ICS_Outbound
     SOURCES
-        components/PolicyEmit/PolicyEmit.c
-        components/lib/ringbuf.c
+        components/ICS_Outbound/ICS_Outbound.c
     INCLUDES
         components/include
-        components/lib
-)
-
-# IntNicDrv Component (now TX-enabled)
-DeclareCAmkESComponent(
-    IntNicDrv
-    SOURCES
-        components/IntNicDrv/IntNicDrv.c
-        components/lib/ringbuf.c
-    INCLUDES
-        components/include
-        components/lib
 )
 
 # Declare root server

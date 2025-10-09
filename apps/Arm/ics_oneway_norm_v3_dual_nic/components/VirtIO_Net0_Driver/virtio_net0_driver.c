@@ -2149,18 +2149,25 @@ void post_init(void)
 }
 
 /*
- * Component main loop (handle lwIP timers and RX packets)
+ * Component main loop (handle lwIP timers, RX packets, and CAmkES notifications)
  *
  * CRITICAL: This is called AFTER all components have initialized.
  * Moving the infinite event loop HERE (from post_init) allows EchoComponent's run() to execute.
  */
 int run(void)
 {
-    /* Main event loop - process lwIP timers and RX packets */
+    /* Main event loop - process lwIP timers, RX packets, and ICS notifications */
     /* Note: TCP server is now initialized in RX path after first packet */
     while (1) {
+        /* Check for OUTBOUND notifications from ICS_Outbound (non-blocking) */
+        if (outbound_ready_poll()) {
+            outbound_ready_handle();
+        }
+
+        /* Process lwIP timers and RX packets */
         sys_check_timeouts();
         process_rx_packets();
+
         seL4_Yield();
     }
 

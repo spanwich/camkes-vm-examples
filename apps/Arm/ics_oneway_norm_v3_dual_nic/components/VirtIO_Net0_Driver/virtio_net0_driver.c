@@ -1035,9 +1035,9 @@ static int virtio_net_init(void)
 
     printf("\n");
 
-    /* Access VirtIO device at SLOT 0 (offset 0x000 from page base 0xa000000) */
-    /* QEMU assigns FIRST -device virtio-net-device to slot 0 */
-    virtio_regs_base = (volatile uint32_t *)((uintptr_t)virtio_mmio_regs + 0x000);
+    /* Access VirtIO device at SLOT 31 (offset 0xe00 from page base 0xa003000) */
+    /* QEMU assigns FIRST -device virtio-net-device to slot 31 - matches vm_ethernet_echo */
+    virtio_regs_base = (volatile uint32_t *)((uintptr_t)virtio_mmio_regs + 0xe00);
 
     /* Verify we have the network device using pointer arithmetic */
     uint32_t magic = VREG_READ(VIRTIO_MMIO_MAGIC_VALUE);

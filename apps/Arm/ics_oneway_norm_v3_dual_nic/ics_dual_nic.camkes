@@ -190,23 +190,25 @@ assembly {
 
     configuration {
         /* ═══════════════════════════════════════════════════════════════════ */
-        /* Net0 Hardware Configuration (External, SLOT 0 @ 0xa000000)          */
-        /* QEMU assigns first -device virtio-net-device to slot 0              */
+        /* Net0 Hardware Configuration (External, SLOT 31 @ 0xa003e00)         */
+        /* QEMU allocates first -device virtio-net-device to slot 31           */
+        /* Matches vm_ethernet_echo working configuration                      */
         /* ═══════════════════════════════════════════════════════════════════ */
-        net0_hw.virtio_mmio_regs_paddr = 0xa000000;  /* Page containing slot 0-7 */
+        net0_hw.virtio_mmio_regs_paddr = 0xa000000;  /* Page containing slot 31 */
         net0_hw.virtio_mmio_regs_size = 0x1000;      /* 4KB page */
-        net0_hw.virtio_irq_irq_number = 48;          /* IRQ for slot 0 (SPI 16) */
+        net0_hw.virtio_irq_irq_number = 55;          /* IRQ for slot 31 (SPI 47) */
 
         /* CRITICAL: Set MMIO region as uncached device memory */
         net0_drv.virtio_mmio_regs_hardware_cached = false;
 
         /* ═══════════════════════════════════════════════════════════════════ */
-        /* Net1 Hardware Configuration (Internal, SLOT 1 @ 0xa000200)          */
-        /* QEMU assigns second -device virtio-net-device to slot 1             */
+        /* Net1 Hardware Configuration (Internal, SLOT 30 @ 0xa003c00)         */
+        /* QEMU allocates second -device virtio-net-device to slot 30          */
+        /* Same page as slot 31, different offset                              */
         /* ═══════════════════════════════════════════════════════════════════ */
-        net1_hw.virtio_mmio_regs_paddr = 0xa000000;  /* Same page as slot 0 */
+        net1_hw.virtio_mmio_regs_paddr = 0xa000000;  /* Same page as slot 31 */
         net1_hw.virtio_mmio_regs_size = 0x1000;      /* 4KB page */
-        net1_hw.virtio_irq_irq_number = 49;          /* IRQ for slot 1 (SPI 17) */
+        net1_hw.virtio_irq_irq_number = 54;          /* IRQ for slot 30 (SPI 46) */
 
         /* CRITICAL: Set MMIO region as uncached device memory */
         net1_drv.virtio_mmio_regs_hardware_cached = false;

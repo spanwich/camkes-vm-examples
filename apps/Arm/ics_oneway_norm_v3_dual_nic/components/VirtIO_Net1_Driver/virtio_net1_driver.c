@@ -996,9 +996,9 @@ static int virtio_net_init(void)
     printf("╚══════════════════════════════════════════════════════════╝\n");
     printf("\n");
 
-    /* Access VirtIO device at SLOT 1 (offset 0x200 from page base 0xa000000) */
+    /* Access VirtIO device at SLOT 30 (offset 0xc00 from page base 0xa003000) */
     /* This is the SECOND virtio-net-device added to QEMU */
-    virtio_regs_base = (volatile uint32_t *)((uintptr_t)virtio_mmio_regs + 0x200);
+    virtio_regs_base = (volatile uint32_t *)((uintptr_t)virtio_mmio_regs + 0xc00);
 
     /* Verify we have the network device using pointer arithmetic */
     uint32_t magic = VREG_READ(VIRTIO_MMIO_MAGIC_VALUE);

@@ -1044,7 +1044,7 @@ static int virtio_net_init(void)
     uint32_t version = VREG_READ(VIRTIO_MMIO_VERSION);
     uint32_t device_id = VREG_READ(VIRTIO_MMIO_DEVICE_ID);
 
-    printf("%s: VirtIO @ SLOT 0 (+0x000): Magic=0x%x, Version=%u, DeviceID=%u\n",
+    printf("%s: VirtIO @ slot 7 (+0xe00): Magic=0x%x, Version=%u, DeviceID=%u\n",
            COMPONENT_NAME, magic, version, device_id);
 
     if (magic != 0x74726976) {
@@ -1052,13 +1052,55 @@ static int virtio_net_init(void)
         return -1;
     }
 
-    if (device_id != 1) {
-        printf("%s: ERROR: DeviceID=%u (expected 1 for network)\n", COMPONENT_NAME, device_id);
-        printf("%s: QEMU may have allocated the device to a different slot.\n", COMPONENT_NAME);
+    /* CRITICAL CHECK: Enforce modern VirtIO protocol */
+    if (version != 2) {
+        printf("\n");
+        printf("╔════════════════════════════════════════════════════════════════╗\n");
+        printf("║  ❌ FATAL ERROR: Legacy VirtIO Protocol Detected              ║\n");
+        printf("╚════════════════════════════════════════════════════════════════╝\n");
+        printf("\n");
+        printf("%s: VirtIO Version=%u (expected 2 for modern protocol)\n", COMPONENT_NAME, version);
+        printf("\n");
+        printf("VirtIO legacy mode (Version 1) DOES NOT WORK on seL4 ARM32 hypervisor!\n");
+        printf("\n");
+        printf("ROOT CAUSE:\n");
+        printf("  - Legacy VirtIO has MMIO write failures in Stage 2 page tables\n");
+        printf("  - QueueReady/QueueSel registers become unresponsive\n");
+        printf("  - Device initialization will FAIL\n");
+        printf("\n");
+        printf("REQUIRED FIX:\n");
+        printf("  Add this QEMU flag to enable modern VirtIO protocol:\n");
+        printf("\n");
+        printf("  ./simulate --extra-qemu-args=\"-global virtio-mmio.force-legacy=false \\\n");
+        printf("    -netdev user,id=net0,hostfwd=tcp::6000-:6000 \\\n");
+        printf("    -device virtio-net-device,netdev=net0 \\\n");
+        printf("    -netdev user,id=net1,hostfwd=tcp::7000-:7000 \\\n");
+        printf("    -device virtio-net-device,netdev=net1\"\n");
+        printf("\n");
+        printf("WHAT THIS DOES:\n");
+        printf("  ✓ Enables VirtIO 1.0+ modern protocol (Version 2)\n");
+        printf("  ✓ Fixes MMIO write issues\n");
+        printf("  ✓ Allocates devices to slots 6-7 (not 30-31)\n");
+        printf("  ✓ Makes QueueReady registers writable\n");
+        printf("\n");
+        printf("DOCUMENTATION:\n");
+        printf("  See: research-docs/VIRTIO-FORCE-LEGACY-REQUIREMENT.md\n");
+        printf("\n");
+        printf("╔════════════════════════════════════════════════════════════════╗\n");
+        printf("║  System halted - cannot continue with legacy VirtIO           ║\n");
+        printf("╚════════════════════════════════════════════════════════════════╝\n");
+        printf("\n");
         return -1;
     }
 
-    printf("%s: ✓ Found VirtIO network device at slot 31\n", COMPONENT_NAME);
+    if (device_id != 1) {
+        printf("%s: ERROR: DeviceID=%u (expected 1 for network)\n", COMPONENT_NAME, device_id);
+        printf("%s: QEMU may have allocated the device to a different slot.\n", COMPONENT_NAME);
+        printf("%s: With force-legacy=false, devices should be at slots 6-7.\n", COMPONENT_NAME);
+        return -1;
+    }
+
+    printf("%s: ✓ Found VirtIO network device (modern protocol, Version 2)\n", COMPONENT_NAME);
 
     /* Reset device */
     VREG_WRITE(VIRTIO_MMIO_STATUS, 0);

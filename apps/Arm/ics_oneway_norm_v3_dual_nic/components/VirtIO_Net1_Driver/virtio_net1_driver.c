@@ -688,17 +688,54 @@ static void process_rx_packets(void)
         return;
     }
 
-    while (last_used_idx != vq->used->idx) {
+    /* CRITICAL BUG CHECK: Detect incorrect ring buffer state
+     * In VirtIO, last_used_idx tracks what we've processed, vq->used->idx is what device added.
+     * Using modular arithmetic: if (used - last) wraps negative, we have a serious bug.
+     * Normal: used >= last (or used wrapped forward)
+     * BUG: last > used in a way that indicates we're ahead of the device
+     */
+    uint16_t pending = (uint16_t)(vq->used->idx - last_used_idx);
+
+    if (pending == 0) {
+        return;  /* Already caught above, but double-check */
+    }
+
+    if (pending > 32768) {  /* More than half the uint16_t range - likely wraparound bug */
+        printf("%s: ERROR - Ring buffer index corruption detected!\n", COMPONENT_NAME);
+        printf("%s: last_used_idx=%u, vq->used->idx=%u, pending=%u\n",
+               COMPONENT_NAME, last_used_idx, vq->used->idx, pending);
+        printf("%s: This indicates last_used_idx got ahead of device - RESETTING to device index\n",
+               COMPONENT_NAME);
+        last_used_idx = vq->used->idx;
+        return;
+    }
+
+    /* Process packets using correct wraparound arithmetic */
+    uint32_t loop_count = 0;
+    while ((uint16_t)(vq->used->idx - last_used_idx) > 0) {
         uint16_t used_ring_idx = last_used_idx % vq->num;
         struct virtq_used_elem *used_elem = &vq->used->ring[used_ring_idx];
 
         uint16_t desc_idx = used_elem->id;
         uint32_t len = used_elem->len;
 
-        /* CRITICAL DEBUG: Print indices to detect infinite loop */
-        static uint32_t loop_count = 0;
+        /* CRITICAL DEBUG: Print indices to detect issues */
         loop_count++;
         if (loop_count <= 10 || (loop_count % 100) == 0) {
+            printf("%s: [LOOP #%u] last_used_idx=%u, vq->used->idx=%u, pending=%u, used_ring_idx=%u, desc_idx=%u, len=%u\n",
+                   COMPONENT_NAME, loop_count, last_used_idx, vq->used->idx,
+                   (uint16_t)(vq->used->idx - last_used_idx), used_ring_idx, desc_idx, len);
+        }
+
+        /* Safety check: prevent infinite loops */
+        if (loop_count > 1000) {
+            printf("%s: ERROR - Processed 1000 packets in single call, breaking to prevent freeze\n",
+                   COMPONENT_NAME);
+            break;
+        }
+
+        /* CRITICAL BUG FIX VERIFICATION */
+        if (loop_count <= 5) {
             printf("%s: [LOOP #%u] last_used_idx=%u, vq->used->idx=%u, used_ring_idx=%u, desc_idx=%u, len=%u\n",
                    COMPONENT_NAME, loop_count, last_used_idx, vq->used->idx, used_ring_idx, desc_idx, len);
             printf("%s:   vq->used addr=%p, vq->used->idx value at %p\n",
@@ -1113,6 +1150,11 @@ void inbound_ready_handle(void)
              (ics_msg->metadata.dst_ip >> 16) & 0xFF,
              (ics_msg->metadata.dst_ip >> 8) & 0xFF,
              ics_msg->metadata.dst_ip & 0xFF);
+
+    /* CRITICAL: Set callback argument BEFORE tcp_connect()
+     * This prevents null pointer dereference in inbound_tcp_sent_callback
+     */
+    tcp_arg(pcb, &inbound_tcp_client);
 
     /* Connect to internal network destination */
     printf("%s: INBOUND: Connecting to %u.%u.%u.%u:%u...\n",

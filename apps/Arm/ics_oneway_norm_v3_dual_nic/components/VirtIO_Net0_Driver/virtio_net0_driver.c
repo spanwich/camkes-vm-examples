@@ -746,8 +746,37 @@ static void process_rx_packets(void)
                    COMPONENT_NAME, (void*)vq->used, (void*)&vq->used->idx);
         }
 
+        /* CRITICAL: Validate VirtIO reported length before processing
+         * Bug: VirtIO sometimes reports garbage lengths (65524, 0, etc.)
+         * Valid Ethernet frames: 60-1514 bytes + 12 byte VirtIO header = 72-1526 bytes
+         */
+        if (len < VIRTIO_NET_HDR_SIZE || len > (1514 + VIRTIO_NET_HDR_SIZE)) {
+            printf("%s: ⚠️  INVALID packet length from VirtIO: %u bytes (expected %u-%u)\n",
+                   COMPONENT_NAME, len, VIRTIO_NET_HDR_SIZE, 1514 + VIRTIO_NET_HDR_SIZE);
+            printf("%s:     desc_idx=%u, used_ring_idx=%u, last_used_idx=%u, vq->used->idx=%u\n",
+                   COMPONENT_NAME, desc_idx, used_ring_idx, last_used_idx, vq->used->idx);
+            printf("%s:     Skipping corrupted packet to prevent system freeze\n", COMPONENT_NAME);
+
+            /* Mark buffer as free and continue */
+            if (desc_idx < MAX_PACKETS) {
+                rx_buffer_used[desc_idx] = false;
+            }
+
+            last_used_idx++;
+            continue;  /* Skip this corrupted entry */
+        }
+
+        /* Validate descriptor index is in range */
+        if (desc_idx >= MAX_PACKETS) {
+            printf("%s: ⚠️  INVALID descriptor index: %u (max %u)\n",
+                   COMPONENT_NAME, desc_idx, MAX_PACKETS);
+            printf("%s:     Skipping corrupted descriptor\n", COMPONENT_NAME);
+            last_used_idx++;
+            continue;
+        }
+
         /* Get packet buffer (use buffer index, not physical address from descriptor) */
-        int buf_idx = (desc_idx < MAX_PACKETS) ? desc_idx : 0;
+        int buf_idx = desc_idx;
         uint8_t *buffer = packet_buffers[buf_idx];
 
         /* Skip virtio_net_hdr at start of buffer */

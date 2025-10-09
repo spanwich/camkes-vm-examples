@@ -41,7 +41,18 @@
 #include "common.h"
 
 #define COMPONENT_NAME "VirtIO_Net1_Driver"
-#define TCP_SERVER_PORT 7000  /* OUTBOUND: Internal connections */
+#define TCP_SERVER_PORT 7000  /* OUTBOUND: Internal connections - this driver listens here */
+
+/*
+ * CROSS-DOMAIN PORT MAPPING CONFIGURATION
+ * These define where forwarded messages are sent (not where we listen)
+ *
+ * IMPORTANT: Use QEMU gateway IP (10.0.2.2) to reach host machine via port forwarding
+ * Guest IP (10.0.2.15) won't work - that's trying to connect to itself
+ */
+#define INBOUND_FORWARD_IP "10.0.2.2"     /* QEMU gateway - forwards to host */
+#define INBOUND_FORWARD_PORT 18000         /* Host port where nc -l 18000 listens */
+#define OUTBOUND_FORWARD_PORT 6000         /* Where to send messages from ICS_Outbound (internal→external) */
 
 /*
  * DEBUG CONFIGURATION
@@ -897,10 +908,23 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
 
     /* ═══ Forward TCP data to ICS_Outbound (OUTBOUND path) ═══ */
 
+    /* CRITICAL: Check if dataport is properly mapped by CAmkES */
+    if (outbound_dp == NULL) {
+        printf("%s: ❌ FATAL: outbound_dp is NULL! CAmkES dataport not mapped\n", COMPONENT_NAME);
+        printf("%s:    This indicates seL4 capability/memory allocation failure\n", COMPONENT_NAME);
+        printf("%s:    Check CAmkES assembly connections and memory regions\n", COMPONENT_NAME);
+        pbuf_free(p);
+        return ERR_MEM;
+    }
+
+    printf("%s: ✓ Dataport check: outbound_dp=%p (valid)\n", COMPONENT_NAME, (void*)outbound_dp);
+
     /* Step 1: Create ICS message with metadata */
     ICS_Message *ics_msg = (ICS_Message *)outbound_dp;
 
     /* Step 2: Populate FrameMetadata (Phase 1: basic info, Phase 2: full header parsing) */
+    printf("%s: About to memset ics_msg->metadata at %p (size=%zu)\n",
+           COMPONENT_NAME, (void*)&ics_msg->metadata, sizeof(FrameMetadata));
     memset(&ics_msg->metadata, 0, sizeof(FrameMetadata));
 
     /* Basic metadata - will be enhanced with full frame parsing */
@@ -908,6 +932,11 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
     ics_msg->metadata.ip_protocol = 6;     /* TCP */
     ics_msg->metadata.is_ip = 1;
     ics_msg->metadata.is_tcp = 1;
+
+    /* Extract IP addresses from lwIP pcb (network byte order -> host byte order) */
+    ics_msg->metadata.src_ip = ntohl(ip4_addr_get_u32(&pcb->remote_ip));
+    ics_msg->metadata.dst_ip = ntohl(ip4_addr_get_u32(&pcb->local_ip));
+
     ics_msg->metadata.src_port = pcb->remote_port;
     ics_msg->metadata.dst_port = pcb->local_port;
     ics_msg->metadata.payload_offset = 0;  /* TCP payload directly */
@@ -1140,11 +1169,20 @@ static err_t inbound_tcp_connected_callback(void *arg, struct tcp_pcb *pcb, err_
  */
 void inbound_ready_handle(void)
 {
-    ICS_Message *ics_msg = (ICS_Message *)inbound_dp;
-
     printf("%s: ╔═══════════════════════════════════════════════════════════╗\n", COMPONENT_NAME);
     printf("%s: ║  INBOUND: Received message from ICS_Inbound              ║\n", COMPONENT_NAME);
     printf("%s: ╚═══════════════════════════════════════════════════════════╝\n", COMPONENT_NAME);
+
+    /* CRITICAL: Check if dataport is properly mapped by CAmkES */
+    if (inbound_dp == NULL) {
+        printf("%s: ❌ FATAL: inbound_dp is NULL! CAmkES dataport not mapped\n", COMPONENT_NAME);
+        printf("%s:    This indicates seL4 capability/memory allocation failure\n", COMPONENT_NAME);
+        return;
+    }
+
+    printf("%s: ✓ Dataport check: inbound_dp=%p (valid)\n", COMPONENT_NAME, (void*)inbound_dp);
+
+    ICS_Message *ics_msg = (ICS_Message *)inbound_dp;
 
     /* Validate message */
     if (ics_msg->payload_length > MAX_PAYLOAD_SIZE) {
@@ -1153,10 +1191,14 @@ void inbound_ready_handle(void)
         return;
     }
 
-    /* Check if we already have an active connection */
+    /* Check if we already have an active connection - if so, close it and create new one */
     if (inbound_tcp_client.active) {
-        printf("%s: INBOUND: WARNING - Previous connection still active, dropping message\n", COMPONENT_NAME);
-        return;
+        printf("%s: INBOUND: Previous connection still active, closing it to handle new message\n", COMPONENT_NAME);
+        if (inbound_tcp_client.pcb != NULL) {
+            tcp_close(inbound_tcp_client.pcb);
+        }
+        inbound_tcp_client.active = false;
+        inbound_tcp_client.pcb = NULL;
     }
 
     /* Print metadata */
@@ -1185,27 +1227,29 @@ void inbound_ready_handle(void)
     inbound_tcp_client.bytes_sent = 0;
     inbound_tcp_client.active = true;
 
-    /* Set up destination IP address */
+    /* Set up destination IP address - use QEMU gateway to reach host */
     ip_addr_t dest_ip;
-    IP4_ADDR(&dest_ip,
-             (ics_msg->metadata.dst_ip >> 24) & 0xFF,
-             (ics_msg->metadata.dst_ip >> 16) & 0xFF,
-             (ics_msg->metadata.dst_ip >> 8) & 0xFF,
-             ics_msg->metadata.dst_ip & 0xFF);
+    ipaddr_aton(INBOUND_FORWARD_IP, &dest_ip);  /* 10.0.2.2 - QEMU gateway */
 
     /* CRITICAL: Set callback argument BEFORE tcp_connect()
      * This prevents null pointer dereference in inbound_tcp_sent_callback
      */
     tcp_arg(pcb, &inbound_tcp_client);
 
-    /* Connect to internal network destination */
-    printf("%s: INBOUND: Connecting to %u.%u.%u.%u:%u...\n",
-           COMPONENT_NAME,
-           (ics_msg->metadata.dst_ip >> 24) & 0xFF, (ics_msg->metadata.dst_ip >> 16) & 0xFF,
-           (ics_msg->metadata.dst_ip >> 8) & 0xFF, ics_msg->metadata.dst_ip & 0xFF,
-           ics_msg->metadata.dst_port);
+    /* CROSS-DOMAIN PORT MAPPING:
+     * External port 6000 (Net0) → maps to → Host port 18000 (via QEMU gateway)
+     * This creates the protocol break diode architecture
+     */
+    uint16_t mapped_port = INBOUND_FORWARD_PORT;  /* Configurable destination port */
 
-    err_t err = tcp_connect(pcb, &dest_ip, ics_msg->metadata.dst_port, inbound_tcp_connected_callback);
+    printf("%s: INBOUND: Port mapping: external:%u → host:%s:%u (via QEMU gateway)\n",
+           COMPONENT_NAME, ics_msg->metadata.dst_port, INBOUND_FORWARD_IP, mapped_port);
+
+    /* Connect to host via QEMU gateway */
+    printf("%s: INBOUND: Connecting to host via %s:%u...\n",
+           COMPONENT_NAME, INBOUND_FORWARD_IP, mapped_port);
+
+    err_t err = tcp_connect(pcb, &dest_ip, mapped_port, inbound_tcp_connected_callback);
     if (err != ERR_OK) {
         printf("%s: INBOUND: tcp_connect failed: %d\n", COMPONENT_NAME, err);
         tcp_close(pcb);

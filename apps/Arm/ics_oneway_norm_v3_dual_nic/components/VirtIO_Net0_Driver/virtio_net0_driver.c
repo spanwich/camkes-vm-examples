@@ -692,11 +692,9 @@ static void process_rx_packets(void)
         return;
     }
 
-    /* CRITICAL BUG CHECK: Detect incorrect ring buffer state
-     * In VirtIO, last_used_idx tracks what we've processed, vq->used->idx is what device added.
-     * Using modular arithmetic: if (used - last) wraps negative, we have a serious bug.
-     * Normal: used >= last (or used wrapped forward)
-     * BUG: last > used in a way that indicates we're ahead of the device
+    /* CRITICAL BUG CHECK: Stop reading beyond what device has written
+     * We should NEVER process more entries than the device has added to used ring.
+     * The problem: after skipping corrupted packets, last_used_idx can get ahead of vq->used->idx
      */
     uint16_t pending = (uint16_t)(vq->used->idx - last_used_idx);
 
@@ -704,12 +702,13 @@ static void process_rx_packets(void)
         return;  /* Already caught above, but double-check */
     }
 
-    if (pending > 32768) {  /* More than half the uint16_t range - likely wraparound bug */
-        printf("%s: ERROR - Ring buffer index corruption detected!\n", COMPONENT_NAME);
-        printf("%s: last_used_idx=%u, vq->used->idx=%u, pending=%u\n",
+    /* Detect if we've gotten ahead of the device (reading garbage entries)
+     * This happens when we skip corrupted packets but don't properly sync indices
+     */
+    if (pending > vq->num) {  /* pending > queue size means we're reading invalid entries */
+        printf("%s: ⚠️  last_used_idx ahead of device! last=%u, device=%u, diff=%u\n",
                COMPONENT_NAME, last_used_idx, vq->used->idx, pending);
-        printf("%s: This indicates last_used_idx got ahead of device - RESETTING to device index\n",
-               COMPONENT_NAME);
+        printf("%s: Resetting to device index to re-sync\n", COMPONENT_NAME);
         last_used_idx = vq->used->idx;
         return;
     }
@@ -972,6 +971,19 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
     printf("%s: INBOUND: Forwarding %u bytes to ICS_Inbound (proto=TCP, src_port=%u, dst_port=%u)\n",
            COMPONENT_NAME, ics_msg->payload_length,
            ics_msg->metadata.src_port, ics_msg->metadata.dst_port);
+
+    /* Always show RAW payload for debugging */
+    printf("%s: RAW PAYLOAD (%u bytes): \"", COMPONENT_NAME, ics_msg->payload_length);
+    for (uint16_t i = 0; i < ics_msg->payload_length && i < 200; i++) {
+        char c = ics_msg->payload[i];
+        if (c >= 32 && c <= 126) printf("%c", c);
+        else if (c == '\n') printf("\\n");
+        else if (c == '\r') printf("\\r");
+        else if (c == '\t') printf("\\t");
+        else printf("[0x%02x]", (unsigned char)c);
+    }
+    if (ics_msg->payload_length > 200) printf("... (%u more bytes)", ics_msg->payload_length - 200);
+    printf("\"\n");
 
     #if DEBUG_MESSAGE_FLOW
     printf("   ✓ ICS message prepared in shared memory (inbound_dp)\n");

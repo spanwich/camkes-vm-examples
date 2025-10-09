@@ -958,6 +958,178 @@ static void setup_tcp_echo_server(void)
     printf("%s: TCP echo server created (will bind after DHCP)\n", COMPONENT_NAME);
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ * OUTBOUND PATH: ICS_Outbound → External Network (TCP Client)
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
+
+/* TCP client connection state for OUTBOUND forwarding */
+struct tcp_outbound_client_state {
+    struct tcp_pcb *pcb;
+    uint8_t *payload_data;
+    uint16_t payload_len;
+    uint16_t bytes_sent;
+    bool active;
+};
+
+static struct tcp_outbound_client_state outbound_tcp_client = {0};
+
+/*
+ * TCP client callbacks for OUTBOUND path
+ */
+static err_t outbound_tcp_sent_callback(void *arg, struct tcp_pcb *pcb, u16_t len)
+{
+    struct tcp_outbound_client_state *state = (struct tcp_outbound_client_state *)arg;
+
+    printf("%s: OUTBOUND: Sent %u bytes to external network\n", COMPONENT_NAME, len);
+
+    state->bytes_sent += len;
+
+    /* Check if all data sent */
+    if (state->bytes_sent >= state->payload_len) {
+        printf("%s: OUTBOUND: Complete - sent %u/%u bytes\n",
+               COMPONENT_NAME, state->bytes_sent, state->payload_len);
+
+        /* Close connection after successful transmission */
+        tcp_close(pcb);
+        state->active = false;
+        state->pcb = NULL;
+
+        return ERR_OK;
+    }
+
+    /* Send remaining data if needed */
+    uint16_t remaining = state->payload_len - state->bytes_sent;
+    uint16_t to_send = (remaining > tcp_sndbuf(pcb)) ? tcp_sndbuf(pcb) : remaining;
+
+    if (to_send > 0) {
+        err_t err = tcp_write(pcb, state->payload_data + state->bytes_sent, to_send, TCP_WRITE_FLAG_COPY);
+        if (err == ERR_OK) {
+            tcp_output(pcb);
+        } else {
+            printf("%s: OUTBOUND: tcp_write failed: %d\n", COMPONENT_NAME, err);
+        }
+    }
+
+    return ERR_OK;
+}
+
+static err_t outbound_tcp_connected_callback(void *arg, struct tcp_pcb *pcb, err_t err)
+{
+    struct tcp_outbound_client_state *state = (struct tcp_outbound_client_state *)arg;
+
+    if (err != ERR_OK) {
+        printf("%s: OUTBOUND: Connection failed: %d\n", COMPONENT_NAME, err);
+        state->active = false;
+        state->pcb = NULL;
+        return err;
+    }
+
+    printf("%s: OUTBOUND: Connected to external network\n", COMPONENT_NAME);
+
+    /* Set sent callback */
+    tcp_sent(pcb, outbound_tcp_sent_callback);
+
+    /* Send the payload */
+    uint16_t to_send = (state->payload_len > tcp_sndbuf(pcb)) ? tcp_sndbuf(pcb) : state->payload_len;
+
+    err = tcp_write(pcb, state->payload_data, to_send, TCP_WRITE_FLAG_COPY);
+    if (err != ERR_OK) {
+        printf("%s: OUTBOUND: tcp_write failed: %d\n", COMPONENT_NAME, err);
+        tcp_close(pcb);
+        state->active = false;
+        state->pcb = NULL;
+        return err;
+    }
+
+    state->bytes_sent = to_send;
+
+    /* Trigger transmission */
+    tcp_output(pcb);
+
+    printf("%s: OUTBOUND: Sent initial %u bytes\n", COMPONENT_NAME, to_send);
+
+    return ERR_OK;
+}
+
+/*
+ * OUTBOUND notification handler - called when ICS_Outbound has validated data
+ * Creates TCP client connection to forward data to external network
+ */
+void outbound_ready_handle(void)
+{
+    ICS_Message *ics_msg = (ICS_Message *)outbound_dp;
+
+    printf("%s: ╔═══════════════════════════════════════════════════════════╗\n", COMPONENT_NAME);
+    printf("%s: ║  OUTBOUND: Received message from ICS_Outbound            ║\n", COMPONENT_NAME);
+    printf("%s: ╚═══════════════════════════════════════════════════════════╝\n", COMPONENT_NAME);
+
+    /* Validate message */
+    if (ics_msg->payload_length > MAX_PAYLOAD_SIZE) {
+        printf("%s: OUTBOUND: Invalid payload length %u (max %u)\n",
+               COMPONENT_NAME, ics_msg->payload_length, MAX_PAYLOAD_SIZE);
+        return;
+    }
+
+    /* Check if we already have an active connection */
+    if (outbound_tcp_client.active) {
+        printf("%s: OUTBOUND: WARNING - Previous connection still active, dropping message\n", COMPONENT_NAME);
+        return;
+    }
+
+    /* Print metadata */
+    printf("%s: OUTBOUND: Protocol=%s, Src=%u.%u.%u.%u:%u, Dst=%u.%u.%u.%u:%u, Payload=%u bytes\n",
+           COMPONENT_NAME,
+           ics_msg->metadata.is_tcp ? "TCP" : (ics_msg->metadata.is_udp ? "UDP" : "Other"),
+           (ics_msg->metadata.src_ip >> 24) & 0xFF, (ics_msg->metadata.src_ip >> 16) & 0xFF,
+           (ics_msg->metadata.src_ip >> 8) & 0xFF, ics_msg->metadata.src_ip & 0xFF,
+           ics_msg->metadata.src_port,
+           (ics_msg->metadata.dst_ip >> 24) & 0xFF, (ics_msg->metadata.dst_ip >> 16) & 0xFF,
+           (ics_msg->metadata.dst_ip >> 8) & 0xFF, ics_msg->metadata.dst_ip & 0xFF,
+           ics_msg->metadata.dst_port,
+           ics_msg->payload_length);
+
+    /* Create TCP client connection */
+    struct tcp_pcb *pcb = tcp_new_ip_type(IPADDR_TYPE_V4);
+    if (pcb == NULL) {
+        printf("%s: OUTBOUND: Failed to create TCP PCB\n", COMPONENT_NAME);
+        return;
+    }
+
+    /* Set up client state */
+    outbound_tcp_client.pcb = pcb;
+    outbound_tcp_client.payload_data = ics_msg->payload;
+    outbound_tcp_client.payload_len = ics_msg->payload_length;
+    outbound_tcp_client.bytes_sent = 0;
+    outbound_tcp_client.active = true;
+
+    /* Set up destination IP address */
+    ip_addr_t dest_ip;
+    IP4_ADDR(&dest_ip,
+             (ics_msg->metadata.dst_ip >> 24) & 0xFF,
+             (ics_msg->metadata.dst_ip >> 16) & 0xFF,
+             (ics_msg->metadata.dst_ip >> 8) & 0xFF,
+             ics_msg->metadata.dst_ip & 0xFF);
+
+    /* Connect to external network destination */
+    printf("%s: OUTBOUND: Connecting to %u.%u.%u.%u:%u...\n",
+           COMPONENT_NAME,
+           (ics_msg->metadata.dst_ip >> 24) & 0xFF, (ics_msg->metadata.dst_ip >> 16) & 0xFF,
+           (ics_msg->metadata.dst_ip >> 8) & 0xFF, ics_msg->metadata.dst_ip & 0xFF,
+           ics_msg->metadata.dst_port);
+
+    err_t err = tcp_connect(pcb, &dest_ip, ics_msg->metadata.dst_port, outbound_tcp_connected_callback);
+    if (err != ERR_OK) {
+        printf("%s: OUTBOUND: tcp_connect failed: %d\n", COMPONENT_NAME, err);
+        tcp_close(pcb);
+        outbound_tcp_client.active = false;
+        outbound_tcp_client.pcb = NULL;
+        return;
+    }
+
+    printf("%s: OUTBOUND: Connection initiated\n", COMPONENT_NAME);
+}
+
 /*
  * VirtIO IRQ Handler
  */
@@ -1966,10 +2138,11 @@ void post_init(void)
     /* No echo connections needed - we forward directly to ICS pipeline */
     printf("\n");
     printf("╔══════════════════════════════════════════════════════════╗\n");
-    printf("║  ICS PIPELINE INTEGRATION READY                          ║\n");
+    printf("║  ICS PIPELINE INTEGRATION READY - BIDIRECTIONAL          ║\n");
     printf("╚══════════════════════════════════════════════════════════╝\n");
-    printf("%s: Ready for bidirectional ICS traffic (INBOUND: TCP:6000 → ICS_Inbound)\n", COMPONENT_NAME);
-    printf("%s: OUTBOUND path: ICS_Outbound → TCP (not yet implemented)\n", COMPONENT_NAME);
+    printf("%s: ✅ INBOUND path: TCP:6000 → ICS_Inbound (External → Internal)\n", COMPONENT_NAME);
+    printf("%s: ✅ OUTBOUND path: ICS_Outbound → TCP client (Internal → External)\n", COMPONENT_NAME);
+    printf("%s: Ready for full bidirectional ICS traffic forwarding\n", COMPONENT_NAME);
 
     /* post_init() MUST return to allow other components to start! */
     printf("%s: post_init() complete - returning to allow ICS pipeline to start\n", COMPONENT_NAME);

@@ -190,18 +190,26 @@ assembly {
 
     configuration {
         /* ═══════════════════════════════════════════════════════════════════ */
-        /* Net0 Hardware Configuration (External, slot 31 @ 0xa003e00)         */
+        /* Net0 Hardware Configuration (External, SLOT 0 @ 0xa000000)          */
+        /* QEMU assigns first -device virtio-net-device to slot 0              */
         /* ═══════════════════════════════════════════════════════════════════ */
-        net0_hw.virtio_mmio_regs_paddr = 0xa003000;  /* Page containing slot 31 */
+        net0_hw.virtio_mmio_regs_paddr = 0xa000000;  /* Page containing slot 0-7 */
         net0_hw.virtio_mmio_regs_size = 0x1000;      /* 4KB page */
-        net0_hw.virtio_irq_irq_number = 79;          /* IRQ for slot 31 (SPI 47) */
+        net0_hw.virtio_irq_irq_number = 48;          /* IRQ for slot 0 (SPI 16) */
+
+        /* CRITICAL: Set MMIO region as uncached device memory */
+        net0_drv.virtio_mmio_regs_hardware_cached = false;
 
         /* ═══════════════════════════════════════════════════════════════════ */
-        /* Net1 Hardware Configuration (Internal, slot 30 @ 0xa003c00)         */
+        /* Net1 Hardware Configuration (Internal, SLOT 1 @ 0xa000200)          */
+        /* QEMU assigns second -device virtio-net-device to slot 1             */
         /* ═══════════════════════════════════════════════════════════════════ */
-        net1_hw.virtio_mmio_regs_paddr = 0xa003000;  /* Same page, different offset */
+        net1_hw.virtio_mmio_regs_paddr = 0xa000000;  /* Same page as slot 0 */
         net1_hw.virtio_mmio_regs_size = 0x1000;      /* 4KB page */
-        net1_hw.virtio_irq_irq_number = 78;          /* IRQ for slot 30 (SPI 46) */
+        net1_hw.virtio_irq_irq_number = 49;          /* IRQ for slot 1 (SPI 17) */
+
+        /* CRITICAL: Set MMIO region as uncached device memory */
+        net1_drv.virtio_mmio_regs_hardware_cached = false;
 
         /* ═══════════════════════════════════════════════════════════════════ */
         /* VirtIO_Net0_Driver Configuration (External, port 6000)              */

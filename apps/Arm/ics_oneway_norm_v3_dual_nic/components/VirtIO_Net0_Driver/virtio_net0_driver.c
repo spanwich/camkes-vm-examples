@@ -996,16 +996,55 @@ static int virtio_net_init(void)
     printf("╚══════════════════════════════════════════════════════════╝\n");
     printf("\n");
 
-    /* Access VirtIO device at slot 31 (offset 0xe00 from page base 0xa003000) */
-    /* sDDF confirmed QEMU allocates virtio-net-device to this slot */
-    virtio_regs_base = (volatile uint32_t *)((uintptr_t)virtio_mmio_regs + 0xe00);
+    /* ═══════════════════════════════════════════════════════════════ */
+    /* COMPREHENSIVE VIRTIO SLOT SCANNER                                */
+    /* Scan all 32 VirtIO MMIO slots to find which ones have devices   */
+    /* ═══════════════════════════════════════════════════════════════ */
+    printf("\n╔═══════════════════════════════════════════════════════════════╗\n");
+    printf("║  SCANNING ALL 32 VIRTIO MMIO SLOTS FOR ACTIVE DEVICES         ║\n");
+    printf("║  Base: 0x0a000000, Each slot: 0x200 bytes apart               ║\n");
+    printf("╚═══════════════════════════════════════════════════════════════╝\n\n");
+
+    for (int slot = 0; slot < 32; slot++) {
+        /* Calculate offset for this slot */
+        uint32_t offset = slot * 0x200;
+        volatile uint32_t *slot_base = (volatile uint32_t *)((uintptr_t)virtio_mmio_regs + offset);
+
+        /* Read device identification registers */
+        uint32_t slot_magic = slot_base[VIRTIO_MMIO_MAGIC_VALUE / 4];
+        uint32_t slot_version = slot_base[VIRTIO_MMIO_VERSION / 4];
+        uint32_t slot_device_id = slot_base[VIRTIO_MMIO_DEVICE_ID / 4];
+        uint32_t slot_vendor_id = slot_base[VIRTIO_MMIO_VENDOR_ID / 4];
+
+        /* Only print slots with valid VirtIO magic */
+        if (slot_magic == 0x74726976) {
+            printf("Slot %2d @ 0x%08lx (offset +0x%03x): Magic=0x%08x Version=%u DeviceID=%u Vendor=0x%08x",
+                   slot, 0x0a000000 + offset, offset,
+                   slot_magic, slot_version, slot_device_id, slot_vendor_id);
+
+            /* Identify device type */
+            if (slot_device_id == 1) {
+                printf(" [NETWORK]\n");
+            } else if (slot_device_id == 0) {
+                printf(" [NO DEVICE]\n");
+            } else {
+                printf(" [UNKNOWN TYPE]\n");
+            }
+        }
+    }
+
+    printf("\n");
+
+    /* Access VirtIO device at SLOT 0 (offset 0x000 from page base 0xa000000) */
+    /* QEMU assigns FIRST -device virtio-net-device to slot 0 */
+    virtio_regs_base = (volatile uint32_t *)((uintptr_t)virtio_mmio_regs + 0x000);
 
     /* Verify we have the network device using pointer arithmetic */
     uint32_t magic = VREG_READ(VIRTIO_MMIO_MAGIC_VALUE);
     uint32_t version = VREG_READ(VIRTIO_MMIO_VERSION);
     uint32_t device_id = VREG_READ(VIRTIO_MMIO_DEVICE_ID);
 
-    printf("%s: VirtIO @ slot 31 (+0xe00): Magic=0x%x, Version=%u, DeviceID=%u\n",
+    printf("%s: VirtIO @ SLOT 0 (+0x000): Magic=0x%x, Version=%u, DeviceID=%u\n",
            COMPONENT_NAME, magic, version, device_id);
 
     if (magic != 0x74726976) {
@@ -1125,7 +1164,34 @@ static int virtio_net_init(void)
     VREG_WRITE(VIRTIO_MMIO_QUEUE_AVAIL_HIGH, (uint32_t)(avail_paddr >> 32));
     VREG_WRITE(VIRTIO_MMIO_QUEUE_USED_LOW, (uint32_t)used_paddr);
     VREG_WRITE(VIRTIO_MMIO_QUEUE_USED_HIGH, (uint32_t)(used_paddr >> 32));
+
+    printf("\n%s: RX Queue Configuration BEFORE setting ready:\n", COMPONENT_NAME);
+    printf("  QueueNum written: %u\n", rx_virtq.num);
+    printf("  Desc  paddr: 0x%lx (LOW=0x%08x, HIGH=0x%08x)\n", desc_paddr, (uint32_t)desc_paddr, (uint32_t)(desc_paddr >> 32));
+    printf("  Avail paddr: 0x%lx (LOW=0x%08x, HIGH=0x%08x)\n", avail_paddr, (uint32_t)avail_paddr, (uint32_t)(avail_paddr >> 32));
+    printf("  Used  paddr: 0x%lx (LOW=0x%08x, HIGH=0x%08x)\n", used_paddr, (uint32_t)used_paddr, (uint32_t)(used_paddr >> 32));
+
+    printf("\n%s: Reading back RX queue registers BEFORE ready:\n", COMPONENT_NAME);
+    printf("  QueueNum:     0x%08x (expect 0x%08x)\n", VREG_READ(VIRTIO_MMIO_QUEUE_NUM), rx_virtq.num);
+    printf("  DescLow:      0x%08x (expect 0x%08x)\n", VREG_READ(VIRTIO_MMIO_QUEUE_DESC_LOW), (uint32_t)desc_paddr);
+    printf("  DescHigh:     0x%08x (expect 0x%08x)\n", VREG_READ(VIRTIO_MMIO_QUEUE_DESC_HIGH), (uint32_t)(desc_paddr >> 32));
+    printf("  AvailLow:     0x%08x (expect 0x%08x)\n", VREG_READ(VIRTIO_MMIO_QUEUE_AVAIL_LOW), (uint32_t)avail_paddr);
+    printf("  AvailHigh:    0x%08x (expect 0x%08x)\n", VREG_READ(VIRTIO_MMIO_QUEUE_AVAIL_HIGH), (uint32_t)(avail_paddr >> 32));
+    printf("  UsedLow:      0x%08x (expect 0x%08x)\n", VREG_READ(VIRTIO_MMIO_QUEUE_USED_LOW), (uint32_t)used_paddr);
+    printf("  UsedHigh:     0x%08x (expect 0x%08x)\n", VREG_READ(VIRTIO_MMIO_QUEUE_USED_HIGH), (uint32_t)(used_paddr >> 32));
+    printf("  QueueReady:   0x%08x (expect 0 before write)\n", VREG_READ(VIRTIO_MMIO_QUEUE_READY));
+
     VREG_WRITE(VIRTIO_MMIO_QUEUE_READY, 1);
+    DMB();
+
+    uint32_t rx_ready_after = VREG_READ(VIRTIO_MMIO_QUEUE_READY);
+    printf("\n%s: After writing QUEUE_READY=1:\n", COMPONENT_NAME);
+    printf("  QueueReady readback: 0x%08x (expect 1 if QEMU accepted config)\n", rx_ready_after);
+    if (rx_ready_after == 0) {
+        printf("  ❌ QEMU REJECTED RX queue - configuration invalid!\n");
+    } else {
+        printf("  ✅ QEMU ACCEPTED RX queue\n");
+    }
 
     /* TX queue */
     VREG_WRITE(VIRTIO_MMIO_QUEUE_SEL, VIRTIO_NET_TX_QUEUE);
@@ -1154,11 +1220,171 @@ static int virtio_net_init(void)
     VREG_WRITE(VIRTIO_MMIO_QUEUE_AVAIL_HIGH, (uint32_t)(tx_avail_paddr >> 32));
     VREG_WRITE(VIRTIO_MMIO_QUEUE_USED_LOW, (uint32_t)tx_used_paddr);
     VREG_WRITE(VIRTIO_MMIO_QUEUE_USED_HIGH, (uint32_t)(tx_used_paddr >> 32));
+
+    printf("\n%s: TX Queue Configuration BEFORE setting ready:\n", COMPONENT_NAME);
+    printf("  QueueNum written: %u\n", tx_virtq.num);
+    printf("  Desc  paddr: 0x%lx (LOW=0x%08x, HIGH=0x%08x)\n", tx_desc_paddr, (uint32_t)tx_desc_paddr, (uint32_t)(tx_desc_paddr >> 32));
+    printf("  Avail paddr: 0x%lx (LOW=0x%08x, HIGH=0x%08x)\n", tx_avail_paddr, (uint32_t)tx_avail_paddr, (uint32_t)(tx_avail_paddr >> 32));
+    printf("  Used  paddr: 0x%lx (LOW=0x%08x, HIGH=0x%08x)\n", tx_used_paddr, (uint32_t)tx_used_paddr, (uint32_t)(tx_used_paddr >> 32));
+
+    printf("\n%s: Reading back TX queue registers BEFORE ready:\n", COMPONENT_NAME);
+    printf("  QueueNum:     0x%08x (expect 0x%08x)\n", VREG_READ(VIRTIO_MMIO_QUEUE_NUM), tx_virtq.num);
+    printf("  DescLow:      0x%08x (expect 0x%08x)\n", VREG_READ(VIRTIO_MMIO_QUEUE_DESC_LOW), (uint32_t)tx_desc_paddr);
+    printf("  DescHigh:     0x%08x (expect 0x%08x)\n", VREG_READ(VIRTIO_MMIO_QUEUE_DESC_HIGH), (uint32_t)(tx_desc_paddr >> 32));
+    printf("  AvailLow:     0x%08x (expect 0x%08x)\n", VREG_READ(VIRTIO_MMIO_QUEUE_AVAIL_LOW), (uint32_t)tx_avail_paddr);
+    printf("  AvailHigh:    0x%08x (expect 0x%08x)\n", VREG_READ(VIRTIO_MMIO_QUEUE_AVAIL_HIGH), (uint32_t)(tx_avail_paddr >> 32));
+    printf("  UsedLow:      0x%08x (expect 0x%08x)\n", VREG_READ(VIRTIO_MMIO_QUEUE_USED_LOW), (uint32_t)tx_used_paddr);
+    printf("  UsedHigh:     0x%08x (expect 0x%08x)\n", VREG_READ(VIRTIO_MMIO_QUEUE_USED_HIGH), (uint32_t)(tx_used_paddr >> 32));
+    printf("  QueueReady:   0x%08x (expect 0 before write)\n", VREG_READ(VIRTIO_MMIO_QUEUE_READY));
+
     VREG_WRITE(VIRTIO_MMIO_QUEUE_READY, 1);
+    DMB();
+
+    uint32_t tx_ready_after = VREG_READ(VIRTIO_MMIO_QUEUE_READY);
+    printf("\n%s: After writing QUEUE_READY=1:\n", COMPONENT_NAME);
+    printf("  QueueReady readback: 0x%08x (expect 1 if QEMU accepted config)\n", tx_ready_after);
+    if (tx_ready_after == 0) {
+        printf("  ❌ QEMU REJECTED TX queue - configuration invalid!\n");
+    } else {
+        printf("  ✅ QEMU ACCEPTED TX queue\n");
+    }
 
     /* Device ready - activate the device */
     VREG_WRITE(VIRTIO_MMIO_STATUS, VREG_READ(VIRTIO_MMIO_STATUS) | VIRTIO_STATUS_DRIVER_OK);
     printf("%s: ✓ VirtIO device initialized and activated\n", COMPONENT_NAME);
+
+    /* ═══════════════════════════════════════════════════════════════════════
+     * COMPLETE VIRTIO MMIO REGISTER DUMP
+     * ═══════════════════════════════════════════════════════════════════════ */
+    printf("\n");
+    printf("╔══════════════════════════════════════════════════════════╗\n");
+    printf("║  COMPLETE VIRTIO MMIO REGISTER DUMP (Slot 31)           ║\n");
+    printf("╚══════════════════════════════════════════════════════════╝\n");
+    printf("VirtIO device base: %p (offset +0xe00 from page base)\n", virtio_regs_base);
+    printf("\nDevice Identification:\n");
+    printf("  [0x000] MagicValue:       0x%08x ('virt' = 0x74726976)\n", VREG_READ(0x000));
+    printf("  [0x004] Version:          0x%08x (2 = VirtIO 1.0)\n", VREG_READ(0x004));
+    printf("  [0x008] DeviceID:         0x%08x (1 = network device)\n", VREG_READ(0x008));
+    printf("  [0x00c] VendorID:         0x%08x (QEMU = 0x554d4551)\n", VREG_READ(0x00c));
+    printf("\nDevice Features:\n");
+    printf("  [0x010] DeviceFeatures:   0x%08x\n", VREG_READ(0x010));
+    printf("  [0x014] DeviceFeaturesSel: 0x%08x\n", VREG_READ(0x014));
+    printf("  [0x020] DriverFeatures:   0x%08x\n", VREG_READ(0x020));
+    printf("  [0x024] DriverFeaturesSel: 0x%08x\n", VREG_READ(0x024));
+    printf("\nQueue Configuration (current QueueSel=%u):\n", VREG_READ(0x030));
+    printf("  [0x030] QueueSel:         0x%08x\n", VREG_READ(0x030));
+    printf("  [0x034] QueueNumMax:      0x%08x\n", VREG_READ(0x034));
+    printf("  [0x038] QueueNum:         0x%08x\n", VREG_READ(0x038));
+    printf("  [0x044] QueueReady:       0x%08x\n", VREG_READ(0x044));
+    printf("\nQueue Descriptor Addresses:\n");
+    printf("  [0x080] QueueDescLow:     0x%08x\n", VREG_READ(0x080));
+    printf("  [0x084] QueueDescHigh:    0x%08x\n", VREG_READ(0x084));
+    printf("  [0x090] QueueAvailLow:    0x%08x\n", VREG_READ(0x090));
+    printf("  [0x094] QueueAvailHigh:   0x%08x\n", VREG_READ(0x094));
+    printf("  [0x0a0] QueueUsedLow:     0x%08x\n", VREG_READ(0x0a0));
+    printf("  [0x0a4] QueueUsedHigh:    0x%08x\n", VREG_READ(0x0a4));
+    printf("\nInterrupt and Status:\n");
+    printf("  [0x060] InterruptStatus:  0x%08x\n", VREG_READ(0x060));
+    printf("  [0x064] InterruptACK:     0x%08x\n", VREG_READ(0x064));
+    printf("  [0x070] Status:           0x%08x\n", VREG_READ(0x070));
+    printf("  [0x050] QueueNotify:      0x%08x\n", VREG_READ(0x050));
+    printf("═══════════════════════════════════════════════════════════\n\n");
+
+    /* ═══════════════════════════════════════════════════════════════════════
+     * DIAGNOSTIC: VirtIO Queue Readiness Test
+     * ═══════════════════════════════════════════════════════════════════════ */
+    printf("\n");
+    printf("╔══════════════════════════════════════════════════════════╗\n");
+    printf("║  VIRTIO QUEUE DIAGNOSTIC - Queue Ready Test             ║\n");
+    printf("╚══════════════════════════════════════════════════════════╝\n");
+
+    /* Test 1: Verify RX Queue (queue 0) is ready */
+    VREG_WRITE(VIRTIO_MMIO_QUEUE_SEL, 0);
+    uint32_t rx_ready = VREG_READ(VIRTIO_MMIO_QUEUE_READY);
+    printf("RX Queue (0): QueueReady = %u (expect 1)\n", rx_ready);
+
+    /* Test 2: Verify TX Queue (queue 1) is ready */
+    VREG_WRITE(VIRTIO_MMIO_QUEUE_SEL, 1);
+    uint32_t tx_ready = VREG_READ(VIRTIO_MMIO_QUEUE_READY);
+    printf("TX Queue (1): QueueReady = %u (expect 1)\n", tx_ready);
+
+    /* Test 3: Try toggling queue ready (write 0, then 1 again) */
+    printf("\nQueue Ready Toggle Test (TX queue):\n");
+    VREG_WRITE(VIRTIO_MMIO_QUEUE_READY, 0);
+    uint32_t after_disable = VREG_READ(VIRTIO_MMIO_QUEUE_READY);
+    printf("  After write 0: QueueReady = %u (expect 0)\n", after_disable);
+
+    VREG_WRITE(VIRTIO_MMIO_QUEUE_READY, 1);
+    uint32_t after_enable = VREG_READ(VIRTIO_MMIO_QUEUE_READY);
+    printf("  After write 1: QueueReady = %u (expect 1)\n", after_enable);
+
+    if (rx_ready == 1 && tx_ready == 1) {
+        printf("✅ Both queues report READY - QEMU accepted queue setup\n");
+    } else {
+        printf("❌ Queue ready check FAILED - QEMU may not have accepted queues\n");
+    }
+
+    /* ═══════════════════════════════════════════════════════════════════════
+     * DIAGNOSTIC: Queue Index Test
+     * ═══════════════════════════════════════════════════════════════════════ */
+    printf("\n");
+    printf("╔══════════════════════════════════════════════════════════╗\n");
+    printf("║  VIRTIO QUEUE DIAGNOSTIC - Index Increment Test         ║\n");
+    printf("╚══════════════════════════════════════════════════════════╝\n");
+
+    /* Check initial queue indices (from memory, not MMIO registers) */
+    printf("RX Queue indices (from memory):\n");
+    printf("  avail->idx = %u (driver's next available buffer)\n", rx_virtq.avail->idx);
+    printf("  used->idx  = %u (device's consumed buffers)\n", rx_virtq.used->idx);
+
+    printf("\nTX Queue indices (from memory):\n");
+    printf("  avail->idx = %u (driver's next available buffer)\n", tx_virtq.avail->idx);
+    printf("  used->idx  = %u (device's consumed buffers)\n", tx_virtq.used->idx);
+
+    /* Test: Send a dummy notification to TX queue and check if used index changes */
+    printf("\nSending notification to TX queue (queue 1)...\n");
+    VREG_WRITE(VIRTIO_MMIO_QUEUE_SEL, 1);
+    uint16_t tx_used_before = tx_virtq.used->idx;
+
+    VREG_WRITE(VIRTIO_MMIO_QUEUE_NOTIFY, 1);  /* Notify TX queue */
+    DMB();  /* Memory barrier to ensure write completes */
+
+    /* Wait a bit for QEMU to process */
+    for (volatile int i = 0; i < 100000; i++);
+
+    uint16_t tx_used_after = tx_virtq.used->idx;
+    printf("  TX used->idx before notify: %u\n", tx_used_before);
+    printf("  TX used->idx after notify:  %u\n", tx_used_after);
+
+    if (tx_used_after != tx_used_before) {
+        printf("✅ TX queue used index CHANGED - QEMU is responding to notifications!\n");
+    } else {
+        printf("⚠️  TX queue used index unchanged (expected - no buffers to consume)\n");
+    }
+
+    /* ═══════════════════════════════════════════════════════════════════════
+     * DIAGNOSTIC: Interrupt Enable Check
+     * ═══════════════════════════════════════════════════════════════════════ */
+    printf("\n");
+    printf("╔══════════════════════════════════════════════════════════╗\n");
+    printf("║  VIRTIO INTERRUPT DIAGNOSTIC                             ║\n");
+    printf("╚══════════════════════════════════════════════════════════╝\n");
+
+    uint32_t irq_status = VREG_READ(VIRTIO_MMIO_INTERRUPT_STATUS);
+    uint32_t dev_status = VREG_READ(VIRTIO_MMIO_STATUS);
+
+    printf("Interrupt Status Register: 0x%x\n", irq_status);
+    printf("Device Status Register:    0x%x (expect 0xF = DRIVER_OK)\n", dev_status);
+
+    if (dev_status & VIRTIO_STATUS_DRIVER_OK) {
+        printf("✅ Device is in DRIVER_OK state - ready to generate interrupts\n");
+    } else {
+        printf("❌ Device NOT in DRIVER_OK state - interrupts may not work\n");
+    }
+
+    printf("\nNote: VirtIO devices generate interrupts automatically when buffers\n");
+    printf("      are added to used ring. No explicit interrupt enable needed.\n");
+    printf("═══════════════════════════════════════════════════════════\n");
 
     return 0;
 }

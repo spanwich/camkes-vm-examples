@@ -48,7 +48,8 @@
  * Set to 1 to enable, 0 to disable
  */
 #define DEBUG_VERBOSE 0           /* Enable verbose debug output */
-#define DEBUG_PACKET_LOG 0        /* Enable detailed packet logging (VERY VERBOSE) */
+#define DEBUG_PACKET_LOG 1        /* Enable detailed packet logging (VERY VERBOSE) */
+#define DEBUG_MESSAGE_FLOW 1      /* Track message flow through RX→ICS→TX pipeline */
 #define ENABLE_GDB_WAIT 0         /* Enable 60-second GDB wait during init */
 #define ENABLE_PAINT_TEST 0       /* Enable virtqueue memory paint test */
 
@@ -258,6 +259,9 @@ struct tcp_echo_state {
 static struct virtq rx_virtq;
 static struct virtq tx_virtq;
 static uint8_t mac_addr[6];
+
+/* Message flow tracking */
+static uint32_t message_id_counter = 0;
 
 /* lwIP network interface */
 static struct netif netif_data;
@@ -823,15 +827,40 @@ static void process_rx_packets(void)
         printf("══════════════════════════════════════════════════════════\n\n");
         #endif /* DEBUG_PACKET_LOG */
 
+        #if DEBUG_MESSAGE_FLOW
+        uint32_t msg_id = ++message_id_counter;
+        printf("\n🔵 [MSG #%u] ═══ RX: Packet received from VirtIO device ═══\n", msg_id);
+        printf("   Size: %u bytes, Buffer index: %d\n", packet_len, buf_idx);
+        printf("   Action: Feeding to lwIP stack for processing\n");
+        #endif
+
         /* Allocate pbuf and copy packet data (skipping header) */
         struct pbuf *p = pbuf_alloc(PBUF_RAW, packet_len, PBUF_POOL);
         if (p != NULL) {
             pbuf_take(p, packet_data, packet_len);
 
+            #if DEBUG_MESSAGE_FLOW
+            printf("   ✓ pbuf allocated, passing to lwIP input handler\n");
+            #endif
+
             /* Feed packet to lwIP */
-            if (netif_data.input(p, &netif_data) != ERR_OK) {
+            err_t lwip_result = netif_data.input(p, &netif_data);
+
+            #if DEBUG_MESSAGE_FLOW
+            if (lwip_result == ERR_OK) {
+                printf("   ✓ lwIP accepted packet (will route to TCP/UDP/etc.)\n");
+            } else {
+                printf("   ✗ lwIP rejected packet (err=%d)\n", lwip_result);
+            }
+            #endif
+
+            if (lwip_result != ERR_OK) {
                 pbuf_free(p);
             }
+        } else {
+            #if DEBUG_MESSAGE_FLOW
+            printf("   ✗ Failed to allocate pbuf (out of memory)\n");
+            #endif
         }
 
         /* Mark buffer as free (buf_idx already defined above) */
@@ -868,6 +897,29 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
 
     /* ═══ Forward TCP data to ICS_Inbound (INBOUND path) ═══ */
 
+    #if DEBUG_MESSAGE_FLOW
+    uint32_t msg_id = ++message_id_counter;
+    printf("\n🟢 [MSG #%u] ═══ TCP: Data received from TCP connection ═══\n", msg_id);
+    printf("   Connection: %u.%u.%u.%u:%u → %u.%u.%u.%u:%u\n",
+           ip4_addr1(&pcb->remote_ip), ip4_addr2(&pcb->remote_ip),
+           ip4_addr3(&pcb->remote_ip), ip4_addr4(&pcb->remote_ip), pcb->remote_port,
+           ip4_addr1(&pcb->local_ip), ip4_addr2(&pcb->local_ip),
+           ip4_addr3(&pcb->local_ip), ip4_addr4(&pcb->local_ip), pcb->local_port);
+    printf("   Payload size: %u bytes\n", p->len);
+
+    /* Print ASCII payload preview */
+    printf("   Payload preview: \"");
+    for (uint16_t i = 0; i < (p->len < 60 ? p->len : 60); i++) {
+        char c = ((char*)p->payload)[i];
+        if (c >= 32 && c <= 126) printf("%c", c);
+        else if (c == '\n') printf("\\n");
+        else if (c == '\r') printf("\\r");
+        else printf(".");
+    }
+    if (p->len > 60) printf("...");
+    printf("\"\n");
+    #endif
+
     /* Step 1: Create ICS message with metadata */
     ICS_Message *ics_msg = (ICS_Message *)inbound_dp;
 
@@ -892,8 +944,18 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
            COMPONENT_NAME, ics_msg->payload_length,
            ics_msg->metadata.src_port, ics_msg->metadata.dst_port);
 
+    #if DEBUG_MESSAGE_FLOW
+    printf("   ✓ ICS message prepared in shared memory (inbound_dp)\n");
+    printf("   Action: Signaling ICS_Inbound component via inbound_ready_emit()\n");
+    #endif
+
     /* Step 4: Signal ICS_Inbound that message is ready */
     inbound_ready_emit();
+
+    #if DEBUG_MESSAGE_FLOW
+    printf("   ✓ Signal sent to ICS_Inbound - message handoff complete\n");
+    printf("   [MSG #%u now in ICS pipeline - waiting for processing]\n\n", msg_id);
+    #endif
 
     /* Tell TCP we've processed the data */
     tcp_recved(pcb, p->len);
@@ -1100,6 +1162,13 @@ void outbound_ready_handle(void)
 {
     ICS_Message *ics_msg = (ICS_Message *)outbound_dp;
 
+    #if DEBUG_MESSAGE_FLOW
+    uint32_t msg_id = ++message_id_counter;
+    printf("\n🟡 [MSG #%u] ═══ ICS→NET: Received from ICS_Outbound ═══\n", msg_id);
+    printf("   Source: ICS pipeline validation complete\n");
+    printf("   Action: Creating TCP client to forward to external network\n");
+    #endif
+
     printf("%s: ╔═══════════════════════════════════════════════════════════╗\n", COMPONENT_NAME);
     printf("%s: ║  OUTBOUND: Received message from ICS_Outbound            ║\n", COMPONENT_NAME);
     printf("%s: ╚═══════════════════════════════════════════════════════════╝\n", COMPONENT_NAME);
@@ -1108,14 +1177,42 @@ void outbound_ready_handle(void)
     if (ics_msg->payload_length > MAX_PAYLOAD_SIZE) {
         printf("%s: OUTBOUND: Invalid payload length %u (max %u)\n",
                COMPONENT_NAME, ics_msg->payload_length, MAX_PAYLOAD_SIZE);
+        #if DEBUG_MESSAGE_FLOW
+        printf("   ✗ [MSG #%u] DROPPED - invalid payload size\n\n", msg_id);
+        #endif
         return;
     }
 
     /* Check if we already have an active connection */
     if (outbound_tcp_client.active) {
         printf("%s: OUTBOUND: WARNING - Previous connection still active, dropping message\n", COMPONENT_NAME);
+        #if DEBUG_MESSAGE_FLOW
+        printf("   ✗ [MSG #%u] DROPPED - TCP client busy\n\n", msg_id);
+        #endif
         return;
     }
+
+    #if DEBUG_MESSAGE_FLOW
+    printf("   Payload size: %u bytes\n", ics_msg->payload_length);
+    printf("   Destination: %u.%u.%u.%u:%u\n",
+           (ics_msg->metadata.dst_ip >> 24) & 0xFF,
+           (ics_msg->metadata.dst_ip >> 16) & 0xFF,
+           (ics_msg->metadata.dst_ip >> 8) & 0xFF,
+           ics_msg->metadata.dst_ip & 0xFF,
+           ics_msg->metadata.dst_port);
+
+    /* Print ASCII payload preview */
+    printf("   Payload preview: \"");
+    for (uint16_t i = 0; i < (ics_msg->payload_length < 60 ? ics_msg->payload_length : 60); i++) {
+        char c = ics_msg->payload[i];
+        if (c >= 32 && c <= 126) printf("%c", c);
+        else if (c == '\n') printf("\\n");
+        else if (c == '\r') printf("\\r");
+        else printf(".");
+    }
+    if (ics_msg->payload_length > 60) printf("...");
+    printf("\"\n");
+    #endif
 
     /* Print metadata */
     printf("%s: OUTBOUND: Protocol=%s, Src=%u.%u.%u.%u:%u, Dst=%u.%u.%u.%u:%u, Payload=%u bytes\n",

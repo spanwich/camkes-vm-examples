@@ -48,7 +48,8 @@
  * Set to 1 to enable, 0 to disable
  */
 #define DEBUG_VERBOSE 0           /* Enable verbose debug output */
-#define DEBUG_PACKET_LOG 0        /* Enable detailed packet logging (VERY VERBOSE) */
+#define DEBUG_PACKET_LOG 1        /* Enable detailed packet logging (VERY VERBOSE) */
+#define DEBUG_MESSAGE_FLOW 1      /* Track message flow through RX→ICS→TX pipeline */
 #define ENABLE_GDB_WAIT 0         /* Enable 60-second GDB wait during init */
 #define ENABLE_PAINT_TEST 0       /* Enable virtqueue memory paint test */
 

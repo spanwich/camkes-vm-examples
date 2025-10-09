@@ -1001,11 +1001,13 @@ static int virtio_net_init(void)
     /* Scan all 32 VirtIO MMIO slots to find which ones have devices   */
     /* ═══════════════════════════════════════════════════════════════ */
     printf("\n╔═══════════════════════════════════════════════════════════════╗\n");
-    printf("║  SCANNING ALL 32 VIRTIO MMIO SLOTS FOR ACTIVE DEVICES         ║\n");
+    printf("║  SCANNING MAPPED VIRTIO MMIO SLOTS FOR ACTIVE DEVICES         ║\n");
     printf("║  Base: 0x0a000000, Each slot: 0x200 bytes apart               ║\n");
+    printf("║  Scanning slots 0-7 only (one 4KB page mapped)                ║\n");
     printf("╚═══════════════════════════════════════════════════════════════╝\n\n");
 
-    for (int slot = 0; slot < 32; slot++) {
+    /* Only scan slots within the mapped 4KB page (8 slots of 0x200 bytes each) */
+    for (int slot = 0; slot < 8; slot++) {
         /* Calculate offset for this slot */
         uint32_t offset = slot * 0x200;
         volatile uint32_t *slot_base = (volatile uint32_t *)((uintptr_t)virtio_mmio_regs + offset);

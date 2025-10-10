@@ -1,12 +1,8 @@
 #!/bin/bash
-# QEMU Run Script for VLAN-based ICS Security Gateway Deployment
+# QEMU Run Script for Remote Deployment
 #
-# This script starts the Modbus bidirectional POC firewall with TAP networking
-# for transparent deployment between SCADA and PLC using VLAN isolation.
-#
-# Network Architecture:
-#   eth0 (192.168.95.2) ←→ tap0 (10.2.0.1) ←→ QEMU Net0 (10.2.0.2)
-#   eth1 (192.168.90.1) ←→ tap1 (10.3.0.1) ←→ QEMU Net1 (10.3.0.2)
+# This script is designed to run on a remote server where only the
+# pre-built image and scripts have been copied (no build directory).
 
 set -e
 
@@ -32,12 +28,19 @@ if ! ip link show tap0 &>/dev/null || ! ip link show tap1 &>/dev/null; then
     exit 1
 fi
 
-# Check if iptables NAT rules are configured
-NAT_RULES_COUNT=$(iptables -t nat -L PREROUTING -n | grep -c "10.2.0.2\|10.3.0.2" || true)
+# Check if iptables NAT rules are configured (requires sudo to read)
+# Try with sudo first, fall back to non-sudo if not available
+if command -v sudo &> /dev/null && sudo -n true 2>/dev/null; then
+    NAT_RULES_COUNT=$(sudo iptables -t nat -L PREROUTING -n 2>/dev/null | grep -c "10.2.0.2\|10.3.0.2" || echo "0")
+else
+    NAT_RULES_COUNT=$(iptables -t nat -L PREROUTING -n 2>/dev/null | grep -c "10.2.0.2\|10.3.0.2" || echo "0")
+fi
+
 if [ "$NAT_RULES_COUNT" -lt 2 ]; then
-    echo -e "${YELLOW}WARNING: iptables NAT rules not configured!${NC}"
+    echo -e "${YELLOW}WARNING: iptables NAT rules may not be configured!${NC}"
     echo ""
-    echo "For proper operation, configure iptables NAT:"
+    echo "Cannot verify iptables rules (requires sudo)."
+    echo "If you haven't configured iptables yet, run:"
     echo "  sudo ./setup-iptables.sh"
     echo ""
     echo "Or run the combined network setup:"
@@ -54,27 +57,53 @@ fi
 echo -e "${BLUE}Network Configuration:${NC}"
 echo ""
 echo "Physical NICs:"
-ip addr show eth0 2>/dev/null | grep -E "inet " | awk '{print "  eth0: " $2 " (impersonates PLC)"}' || echo "  eth0: NOT CONFIGURED"
-ip addr show eth1 2>/dev/null | grep -E "inet " | awk '{print "  eth1: " $2 " (impersonates router)"}' || echo "  eth1: NOT CONFIGURED"
+
+# Auto-detect physical interfaces by their configured IPs
+ETH0_NAME=$(ip addr show | grep -B2 "inet 192.168.95.2" | grep -oP '^\d+: \K[^:]+' | head -1)
+ETH1_NAME=$(ip addr show | grep -B2 "inet 192.168.90.1" | grep -oP '^\d+: \K[^:]+' | head -1)
+
+if [ -n "$ETH0_NAME" ]; then
+    ip addr show "$ETH0_NAME" | grep -E "inet " | awk -v name="$ETH0_NAME" '{print "  " name ": " $2 " (impersonates PLC)"}'
+else
+    echo "  (No interface with 192.168.95.2 found)"
+fi
+
+if [ -n "$ETH1_NAME" ]; then
+    ip addr show "$ETH1_NAME" | grep -E "inet " | awk -v name="$ETH1_NAME" '{print "  " name ": " $2 " (impersonates router)"}'
+else
+    echo "  (No interface with 192.168.90.1 found)"
+fi
 echo ""
 echo "TAP Interfaces (Private Networks):"
 ip addr show tap0 | grep -E "inet " | awk '{print "  tap0: " $2 " (QEMU Net0 gateway)"}'
 ip addr show tap1 | grep -E "inet " | awk '{print "  tap1: " $2 " (QEMU Net1 gateway)"}'
 echo ""
 
-# Find the build directory
-BUILD_DIR="../../../../../../build_modbus"
-if [ ! -d "$BUILD_DIR" ]; then
-    echo -e "${RED}ERROR: Build directory not found: ${BUILD_DIR}${NC}"
+# Find the kernel image
+KERNEL_IMAGE=""
+
+# Check common locations
+if [ -f "capdl-loader-image-arm-qemu-arm-virt" ]; then
+    KERNEL_IMAGE="capdl-loader-image-arm-qemu-arm-virt"
+elif [ -f "images/capdl-loader-image-arm-qemu-arm-virt" ]; then
+    KERNEL_IMAGE="images/capdl-loader-image-arm-qemu-arm-virt"
+elif [ -f "../capdl-loader-image-arm-qemu-arm-virt" ]; then
+    KERNEL_IMAGE="../capdl-loader-image-arm-qemu-arm-virt"
+else
+    echo -e "${RED}ERROR: Kernel image not found!${NC}"
     echo ""
-    echo "Please build the project first:"
-    echo "  cd /home/iamfo470/phd/camkes-vm-examples"
-    echo "  mkdir -p build_modbus && cd build_modbus"
-    echo "  ../init-build.sh -DPLATFORM=qemu-arm-virt -DAARCH32=TRUE -DCAMKES_APP=modbus_bidirection_poc"
-    echo "  ninja"
+    echo "Looking for: capdl-loader-image-arm-qemu-arm-virt"
+    echo "Searched locations:"
+    echo "  - Current directory"
+    echo "  - ./images/"
+    echo "  - ../"
     echo ""
+    echo "Please ensure the built image is in the same directory as this script."
     exit 1
 fi
+
+echo -e "${GREEN}Found kernel image: ${KERNEL_IMAGE}${NC}"
+echo ""
 
 # QEMU configuration for TAP networking
 QEMU_ARGS="-global virtio-mmio.force-legacy=false \
@@ -121,6 +150,11 @@ echo ""
 echo "=========================================="
 echo ""
 
-# Run QEMU
-cd ${BUILD_DIR}
-./simulate --extra-qemu-args="${QEMU_ARGS}"
+# Run QEMU directly with the kernel image
+qemu-system-arm \
+  -machine virt,virtualization=on,highmem=off,secure=off \
+  -cpu cortex-a15 \
+  -nographic \
+  -m size=1024 \
+  ${QEMU_ARGS} \
+  -kernel "${KERNEL_IMAGE}"

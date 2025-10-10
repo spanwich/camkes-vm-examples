@@ -40,10 +40,22 @@ echo "  TAP1 (Secure Subnet):     ${TAP1_NAME} → ${TAP1_IP}/24 (SCADA IP)"
 echo "  User: ${USER}"
 echo ""
 
-# Cleanup existing TAP interfaces
+# Cleanup existing TAP interfaces (force delete and recreate)
 echo -e "${YELLOW}[1/5] Cleaning up existing TAP interfaces...${NC}"
-ip link delete ${TAP0_NAME} 2>/dev/null || true
-ip link delete ${TAP1_NAME} 2>/dev/null || true
+if ip link show ${TAP0_NAME} &>/dev/null; then
+    echo "  - Found existing ${TAP0_NAME}, deleting..."
+    ip link set ${TAP0_NAME} down 2>/dev/null || true
+    ip addr flush dev ${TAP0_NAME} 2>/dev/null || true
+    ip link delete ${TAP0_NAME} 2>/dev/null || true
+    echo "    ✓ Deleted ${TAP0_NAME}"
+fi
+if ip link show ${TAP1_NAME} &>/dev/null; then
+    echo "  - Found existing ${TAP1_NAME}, deleting..."
+    ip link set ${TAP1_NAME} down 2>/dev/null || true
+    ip addr flush dev ${TAP1_NAME} 2>/dev/null || true
+    ip link delete ${TAP1_NAME} 2>/dev/null || true
+    echo "    ✓ Deleted ${TAP1_NAME}"
+fi
 echo "  ✓ Cleanup complete"
 echo ""
 
@@ -87,20 +99,20 @@ ip addr show ${TAP0_NAME} | grep -E "inet |state"
 ip addr show ${TAP1_NAME} | grep -E "inet |state"
 echo ""
 
-# Optional: Bridge to physical NICs (commented out - manual configuration needed)
-echo -e "${YELLOW}OPTIONAL: Bridge to Physical NICs${NC}"
-echo "To connect TAP interfaces to physical NICs, run:"
+# Optional: Bridge to physical NICs (using 'ip' commands, no brctl needed)
+echo -e "${YELLOW}OPTIONAL: Bridge to Physical NICs (without brctl)${NC}"
+echo "If your server doesn't have 'brctl', use 'ip' commands instead:"
 echo ""
-echo "  # Connect tap0 to internal network (e.g., eth0):"
-echo "  sudo brctl addbr br_internal"
-echo "  sudo brctl addif br_internal tap0"
-echo "  sudo brctl addif br_internal eth0  # Your internal NIC"
+echo "  # Create bridge for tap0 → internal network (e.g., eth0):"
+echo "  sudo ip link add name br_internal type bridge"
+echo "  sudo ip link set tap0 master br_internal"
+echo "  sudo ip link set eth0 master br_internal  # Your internal NIC"
 echo "  sudo ip link set br_internal up"
 echo ""
-echo "  # Connect tap1 to secure subnet (e.g., eth1):"
-echo "  sudo brctl addbr br_secure"
-echo "  sudo brctl addif br_secure tap1"
-echo "  sudo brctl addif br_secure eth1  # Your secure subnet NIC"
+echo "  # Create bridge for tap1 → secure subnet (e.g., eth1):"
+echo "  sudo ip link add name br_secure type bridge"
+echo "  sudo ip link set tap1 master br_secure"
+echo "  sudo ip link set eth1 master br_secure  # Your secure subnet NIC"
 echo "  sudo ip link set br_secure up"
 echo ""
 

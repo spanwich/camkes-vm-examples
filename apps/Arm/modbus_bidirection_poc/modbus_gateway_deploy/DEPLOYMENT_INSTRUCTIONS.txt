@@ -1,0 +1,104 @@
+========================================
+ICS Security Gateway - Remote Deployment
+========================================
+
+DEPLOYMENT STEPS:
+
+1. EXTRACT PACKAGE
+   ----------------
+   tar xzf modbus_gateway_deploy.tar.gz
+   cd modbus_gateway_deploy
+
+2. VERIFY QEMU INSTALLATION
+   -------------------------
+   qemu-system-arm --version
+
+   If not installed:
+     sudo apt update
+     sudo apt install qemu-system-arm
+
+3. CONFIGURE NETWORK (One-time setup)
+   -----------------------------------
+   sudo ./setup-vlan-networking.sh
+
+   This configures:
+   - Physical NICs: eth0 (192.168.95.2), eth1 (192.168.90.1)
+   - TAP interfaces: tap0 (10.2.0.1), tap1 (10.3.0.1)
+   - iptables NAT rules (DNAT/SNAT)
+   - IP forwarding
+
+   IMPORTANT: Real PLC MUST be moved to isolated VLAN!
+
+4. START SECURITY GATEWAY
+   -----------------------
+   ./run-remote.sh
+
+   Expected output:
+   - Network configuration summary
+   - QEMU starts with dual VirtIO networks
+   - Both drivers show "TCP Echo Server listening on port 502"
+
+5. TEST CONNECTIVITY
+   ------------------
+   From host:
+     ping 10.2.0.2  # Should reach QEMU Net0
+     ping 10.3.0.2  # Should reach QEMU Net1
+
+   From SCADA:
+     modbus_client -h 192.168.95.2 -p 502
+
+TROUBLESHOOTING:
+
+  TAP interfaces not found:
+    sudo ./setup-vlan-networking.sh
+
+  iptables rules not configured:
+    sudo ./setup-iptables.sh
+
+  No connectivity to QEMU:
+    - Check TAP interfaces are UP: ip addr show tap0 tap1
+    - Check iptables: sudo iptables -t nat -L -n -v
+    - Check IP forwarding: cat /proc/sys/net/ipv4/ip_forward (should be 1)
+
+  Capture traffic:
+    sudo tcpdump -i tap0 -n port 502
+    sudo tcpdump -i tap1 -n port 502
+
+FILES INCLUDED:
+
+  capdl-loader-image-arm-qemu-arm-virt  - QEMU kernel image
+  setup-vlan-networking.sh              - Network configuration
+  setup-iptables.sh                     - iptables NAT setup
+  run-remote.sh                         - QEMU startup script
+  README.md                             - Complete documentation
+  VLAN_ARCHITECTURE.md                  - Architecture details
+  DEPLOYMENT_INSTRUCTIONS.txt           - This file
+
+MAKING PERSISTENT (Optional):
+
+  To survive reboots, install iptables-persistent:
+    sudo apt install iptables-persistent
+    sudo netfilter-persistent save
+
+  Or create systemd service (see README.md)
+
+DOCUMENTATION:
+
+  See README.md for:
+  - Complete architecture explanation
+  - Traffic flow diagrams
+  - Troubleshooting guide
+  - Performance considerations
+
+  See VLAN_ARCHITECTURE.md for:
+  - Detailed VLAN design
+  - IP address mapping
+  - iptables NAT rules explained
+
+SUPPORT:
+
+  All scripts are self-documenting with --help
+  Check QEMU console for detailed diagnostic messages
+  Use tcpdump to verify traffic flow
+
+========================================

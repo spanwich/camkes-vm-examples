@@ -1,0 +1,73 @@
+========================================
+FIX: iptables Rules Using Wrong Interface Names
+========================================
+
+ISSUE:
+Your iptables rules are currently configured for "eth0" and "eth1", but your
+actual interfaces are "ens224" and "ens256". This means the NAT rules won't
+intercept any traffic!
+
+VERIFICATION:
+Run this command to see the problem:
+  sudo iptables -t nat -L PREROUTING -n -v --line-numbers
+
+Current output shows:
+  1  0  0 DNAT  6  --  eth0  *  ...
+  2  0  0 DNAT  6  --  eth1  *  ...
+                     ^^^^  ^^^^  ← WRONG! Should be ens224 and ens256
+
+FIX:
+The setup-iptables.sh script has been updated to auto-detect your interface
+names. Just re-run it:
+
+OPTION 1 (Auto-detect - Recommended):
+-------------------------------------
+If your interfaces already have the correct IPs configured:
+  sudo ./setup-iptables.sh
+
+The script will:
+  ✓ Auto-detect ens224 (has IP 192.168.95.2)
+  ✓ Auto-detect ens256 (has IP 192.168.90.1)
+  ✓ Flush old eth0/eth1 rules
+  ✓ Create new rules for ens224/ens256
+
+OPTION 2 (Explicit):
+--------------------
+Explicitly specify interface names:
+  ETH0_NAME=ens224 ETH1_NAME=ens256 sudo -E ./setup-iptables.sh
+
+VERIFICATION AFTER FIX:
+-----------------------
+Check NAT rules now reference correct interfaces:
+  sudo iptables -t nat -L PREROUTING -n -v --line-numbers
+
+Expected output:
+  Chain PREROUTING (policy ACCEPT 0 packets, 0 bytes)
+  num   pkts bytes target     prot opt in     out     source               destination
+  1        0     0 DNAT       6    --  ens224 *       0.0.0.0/0            192.168.95.2         tcp dpt:502 to:10.2.0.2:502
+  2        0     0 DNAT       6    --  ens256 *       0.0.0.0/0            192.168.90.1         tcp dpt:502 to:10.3.0.2:502
+                                    ^^^^^^ ^^^^^^  ← CORRECT! Now using ens224/ens256
+
+  Chain POSTROUTING (policy ACCEPT 0 packets, 0 bytes)
+  num   pkts bytes target     prot opt in     out     source               destination
+  1        0     0 SNAT       0    --  *      ens224  10.2.0.0/24          0.0.0.0/0            to:192.168.95.2
+  2        0     0 SNAT       0    --  *      ens256  10.3.0.0/24          0.0.0.0/0            to:192.168.90.1
+                                           ^^^^^^ ^^^^^^  ← CORRECT!
+
+WHAT'S FIXED:
+-------------
+✓ setup-iptables.sh now accepts ETH0_NAME/ETH1_NAME environment variables
+✓ Auto-detects interface names by looking for IPs 192.168.95.2 and 192.168.90.1
+✓ Shows clear error if interfaces not found with available interface list
+✓ All iptables rules use correct variable names (not hardcoded eth0/eth1)
+✓ Traffic flow descriptions updated to show actual interface names
+
+QUICK SUMMARY:
+--------------
+On your server:
+  cd modbus_gateway_deploy
+  sudo ./setup-iptables.sh        # Auto-detects ens224/ens256
+
+Done! Your NAT rules will now intercept traffic on the correct interfaces.
+
+========================================

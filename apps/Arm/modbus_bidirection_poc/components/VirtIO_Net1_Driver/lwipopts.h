@@ -40,8 +40,8 @@
 #define LWIP_WND_SCALE                  1
 #define TCP_RCV_SCALE                   2
 #define MEMP_NUM_TCP_SEG                TCP_SND_QUEUELEN
-#define MEMP_NUM_TCP_PCB                8       /* Max TCP connections */
-#define MEMP_NUM_TCP_PCB_LISTEN         4       /* Max listening sockets */
+#define MEMP_NUM_TCP_PCB                128     /* Max TCP connections (increased from 8) */
+#define MEMP_NUM_TCP_PCB_LISTEN         16      /* Max listening sockets (increased from 4) */
 
 /* UDP configuration */
 #define LWIP_UDP                        1

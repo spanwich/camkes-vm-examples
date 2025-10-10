@@ -44,15 +44,17 @@
 #define TCP_SERVER_PORT 502  /* OUTBOUND: Modbus port - pretends to be SCADA */
 
 /*
- * GRFICS DEPLOYMENT CONFIGURATION
+ * VLAN-BASED DEPLOYMENT CONFIGURATION
  *
- * Net1 faces Secure Subnet (192.168.95.0/24 - isolated switch)
- * - Listens on 192.168.90.5:502 (pretends to be SCADA)
- * - Forwards validated traffic to real PLC on 192.168.95.2:502
+ * Net1 uses PRIVATE network (10.3.0.0/24) connected to tap1
+ * - Listens on 10.3.0.2:502
+ * - Receives traffic from eth1 (192.168.90.1) via iptables DNAT
+ * - Forwards validated traffic to Net0 (10.2.0.2)
  *
- * This creates transparent man-in-the-middle for PLC→SCADA traffic
+ * Host iptables translates:
+ *   eth1 (192.168.90.1:502) ←→ tap1 (10.3.0.2:502)
  */
-#define INBOUND_FORWARD_IP "192.168.95.2"     /* Real PLC IP (on secure switch) */
+#define INBOUND_FORWARD_IP "10.2.0.2"         /* Forward to Net0 (private network) */
 #define INBOUND_FORWARD_PORT 502               /* Modbus TCP port */
 #define OUTBOUND_FORWARD_PORT 502              /* Unused - Net0 handles outbound */
 
@@ -173,7 +175,7 @@ typedef struct virtio_net_hdr {
 
 /* Packet buffer configuration */
 #define PACKET_BUFFER_SIZE              2048
-#define MAX_PACKETS                     32
+#define MAX_PACKETS                     256    /* Increased to handle 128 TCP connections (2x for TX+RX) */
 
 /*
  * VirtIO MMIO Register Structure
@@ -482,6 +484,12 @@ static err_t netif_output(struct netif *netif, struct pbuf *p)
 
     tx_count++;
 
+    /* CRITICAL DEBUG: Confirm this function is being called */
+    if (tx_count <= 20) {
+        printf("%s: ⚡ netif_output() CALLED - tx_count=%u, pbuf len=%u\n",
+               COMPONENT_NAME, tx_count, p->tot_len);
+    }
+
     /* Detailed TX logging for first 10 packets */
     if (tx_count <= 10) {
         uint32_t timestamp_ms = sys_now();
@@ -698,73 +706,77 @@ static void process_rx_packets(void)
                COMPONENT_NAME, check_count, vq->used->idx, last_used_idx);
     }
 
-    if (vq->used->idx == last_used_idx) {
-        return;
-    }
-
-    /* CRITICAL BUG CHECK: Stop reading beyond what device has written
-     * We should NEVER process more entries than the device has added to used ring.
-     * The problem: after skipping corrupted packets, last_used_idx can get ahead of vq->used->idx
+    /* Process packets using correct wraparound arithmetic
+     * CRITICAL: Re-read used->idx on EVERY iteration to avoid reading stale data
+     * when we skip corrupted packets
      */
-    uint16_t pending = (uint16_t)(vq->used->idx - last_used_idx);
-
-    if (pending == 0) {
-        return;  /* Already caught above, but double-check */
-    }
-
-    /* Detect if we've gotten ahead of the device (reading garbage entries)
-     * This happens when we skip corrupted packets but don't properly sync indices
-     */
-    if (pending > vq->num) {  /* pending > queue size means we're reading invalid entries */
-        printf("%s: ⚠️  last_used_idx ahead of device! last=%u, device=%u, diff=%u\n",
-               COMPONENT_NAME, last_used_idx, vq->used->idx, pending);
-        printf("%s: Resetting to device index to re-sync\n", COMPONENT_NAME);
-        last_used_idx = vq->used->idx;
-        return;
-    }
-
-    /* Process packets using correct wraparound arithmetic */
     uint32_t loop_count = 0;
-    while ((uint16_t)(vq->used->idx - last_used_idx) > 0) {
+    while (1) {
+        /* VirtIO Spec 2.4.5: Read used->idx with ACQUIRE semantics
+         * This ensures we see all ring entry writes BEFORE we read the ring data.
+         * Must re-read on every iteration to avoid advancing past valid entries.
+         */
+        uint16_t current_used_idx = __atomic_load_n(&vq->used->idx, __ATOMIC_ACQUIRE);
+
+        /* CRITICAL: Use wraparound-safe comparison for uint16_t indices
+         * When current_used_idx wraps (65535 -> 0), simple == comparison fails!
+         * Example: last_used_idx=4776, current_used_idx=89 after wraparound
+         * Correct check: (uint16_t)(current_used_idx - last_used_idx) == 0
+         *
+         * IMPORTANT: VirtIO used->idx is EXCLUSIVE upper bound
+         * If used->idx=2, valid entries are indices 0 and 1 only
+         * Reading at index 2 when used->idx=2 accesses uninitialized/stale data
+         */
+        uint16_t pending_packets = (uint16_t)(current_used_idx - last_used_idx);
+
+        /* CRITICAL DEBUG: Log EVERY loop iteration to catch the exact moment we read wrong */
+        if (loop_count < 5 || pending_packets > 0) {
+            printf("%s: [LOOP-START #%u] current_used=%u, last_used=%u, pending=%u\n",
+                   COMPONENT_NAME, loop_count, current_used_idx, last_used_idx, pending_packets);
+        }
+
+        if (pending_packets == 0) {
+            printf("%s: [LOOP-EXIT] No more packets (current_used=%u == last_used=%u)\n",
+                   COMPONENT_NAME, current_used_idx, last_used_idx);
+            return;  /* No more packets to process */
+        }
+
+        /* SAFETY: Detect impossible wraparound scenarios */
+        if (pending_packets > 1000) {
+            printf("%s: ⚠️ ERROR: Impossible pending count %u (wraparound bug!)\n",
+                   COMPONENT_NAME, pending_packets);
+            printf("%s:   current_used_idx=%u, last_used_idx=%u\n",
+                   COMPONENT_NAME, current_used_idx, last_used_idx);
+            printf("%s:   Forcing exit to prevent infinite loop\n", COMPONENT_NAME);
+            return;
+        }
+
         uint16_t used_ring_idx = last_used_idx % vq->num;
         struct virtq_used_elem *used_elem = &vq->used->ring[used_ring_idx];
 
         uint16_t desc_idx = used_elem->id;
         uint32_t len = used_elem->len;
 
-        /* CRITICAL DEBUG: Print indices to detect issues */
+        /* Safety check: prevent infinite loops (should never happen with memory barrier) */
         loop_count++;
-        if (loop_count <= 10 || (loop_count % 100) == 0) {
-            printf("%s: [LOOP #%u] last_used_idx=%u, vq->used->idx=%u, pending=%u, used_ring_idx=%u, desc_idx=%u, len=%u\n",
-                   COMPONENT_NAME, loop_count, last_used_idx, vq->used->idx,
-                   (uint16_t)(vq->used->idx - last_used_idx), used_ring_idx, desc_idx, len);
-        }
-
-        /* Safety check: prevent infinite loops */
         if (loop_count > 1000) {
             printf("%s: ERROR - Processed 1000 packets in single call, breaking to prevent freeze\n",
                    COMPONENT_NAME);
+            printf("%s:   last_used_idx=%u, current_used_idx=%u, pending=%u\n",
+                   COMPONENT_NAME, last_used_idx, current_used_idx,
+                   (uint16_t)(current_used_idx - last_used_idx));
             break;
         }
 
-        /* CRITICAL BUG FIX VERIFICATION */
-        if (loop_count <= 5) {
-            printf("%s: [LOOP #%u] last_used_idx=%u, vq->used->idx=%u, used_ring_idx=%u, desc_idx=%u, len=%u\n",
-                   COMPONENT_NAME, loop_count, last_used_idx, vq->used->idx, used_ring_idx, desc_idx, len);
-            printf("%s:   vq->used addr=%p, vq->used->idx value at %p\n",
-                   COMPONENT_NAME, (void*)vq->used, (void*)&vq->used->idx);
-        }
-
         /* CRITICAL: Validate VirtIO reported length before processing
-         * Bug: VirtIO sometimes reports garbage lengths (65524, 0, etc.)
          * Valid Ethernet frames: 60-1514 bytes + 12 byte VirtIO header = 72-1526 bytes
+         * With memory barrier fix, invalid lengths should be VERY rare (real hardware corruption)
          */
         if (len < VIRTIO_NET_HDR_SIZE || len > (1514 + VIRTIO_NET_HDR_SIZE)) {
-            printf("%s: ⚠️  INVALID packet length from VirtIO: %u bytes (expected %u-%u)\n",
+            printf("%s: ⚠️  INVALID packet length: %u bytes (expected %u-%u)\n",
                    COMPONENT_NAME, len, VIRTIO_NET_HDR_SIZE, 1514 + VIRTIO_NET_HDR_SIZE);
-            printf("%s:     desc_idx=%u, used_ring_idx=%u, last_used_idx=%u, vq->used->idx=%u\n",
-                   COMPONENT_NAME, desc_idx, used_ring_idx, last_used_idx, vq->used->idx);
-            printf("%s:     Skipping corrupted packet to prevent system freeze\n", COMPONENT_NAME);
+            printf("%s:     desc_idx=%u, used_ring_idx=%u, last_used_idx=%u, current_used_idx=%u\n",
+                   COMPONENT_NAME, desc_idx, used_ring_idx, last_used_idx, current_used_idx);
 
             /* Mark buffer as free and continue */
             if (desc_idx < MAX_PACKETS) {
@@ -803,7 +815,7 @@ static void process_rx_packets(void)
         /* Log packet arrival with detailed inspection (VERY VERBOSE - only for debugging) */
         uint32_t timestamp_ms = sys_now();
         printf("\n╔══════════════════════════════════════════════════════════╗\n");
-        printf("║  📥 INCOMING PACKET #%u [T=%u.%03us]                      ║\n",
+        printf("║  📥 [Net1] INCOMING PACKET #%u [T=%u.%03us]              ║\n",
                packets_received, timestamp_ms / 1000, timestamp_ms % 1000);
         printf("╚══════════════════════════════════════════════════════════╝\n");
         printf("  Size: %u bytes (total %u with VirtIO header)\n", packet_len, len);
@@ -892,13 +904,54 @@ static void process_rx_packets(void)
 }
 
 /*
+ * Connection tracking
+ */
+static uint32_t active_connections = 0;
+static uint32_t total_connections_created = 0;
+static uint32_t total_connections_closed = 0;
+
+/*
+ * TCP Error callback - handles connection errors and cleanup
+ */
+static void tcp_echo_err(void *arg, err_t err)
+{
+    const char *err_name;
+    switch (err) {
+        case ERR_ABRT:     err_name = "ERR_ABRT (Connection aborted)"; break;
+        case ERR_RST:      err_name = "ERR_RST (Connection reset)"; break;
+        case ERR_CLSD:     err_name = "ERR_CLSD (Connection closed)"; break;
+        case ERR_CONN:     err_name = "ERR_CONN (Not connected)"; break;
+        case ERR_TIMEOUT:  err_name = "ERR_TIMEOUT (Timeout)"; break;
+        default:           err_name = "UNKNOWN"; break;
+    }
+
+    active_connections--;
+    total_connections_closed++;
+
+    printf("%s: ⚠️  TCP connection error - err=%d (%s)\n", COMPONENT_NAME, err, err_name);
+    printf("%s:    → Active connections: %u | Total created: %u | Total closed: %u\n",
+           COMPONENT_NAME, active_connections, total_connections_created, total_connections_closed);
+
+    /* PCB is already freed by lwIP when err callback is called - don't access it! */
+}
+
+/*
  * TCP Echo callbacks
  */
 static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err)
 {
     if (p == NULL) {
-        /* Connection closed */
-        printf("%s: TCP connection closed\n", COMPONENT_NAME);
+        /* Connection closed gracefully by remote peer */
+        active_connections--;
+        total_connections_closed++;
+
+        printf("%s: 🔌 TCP connection closed gracefully\n", COMPONENT_NAME);
+        printf("%s:    Remote: %u.%u.%u.%u:%u\n", COMPONENT_NAME,
+               ip4_addr1(&pcb->remote_ip), ip4_addr2(&pcb->remote_ip),
+               ip4_addr3(&pcb->remote_ip), ip4_addr4(&pcb->remote_ip), pcb->remote_port);
+        printf("%s:    → Active connections: %u | Total created: %u | Total closed: %u\n",
+               COMPONENT_NAME, active_connections, total_connections_created, total_connections_closed);
+
         tcp_close(pcb);
         return ERR_OK;
     }
@@ -977,10 +1030,34 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
 
 static err_t tcp_echo_accept(void *arg, struct tcp_pcb *newpcb, err_t err)
 {
-    printf("%s: TCP connection accepted\n", COMPONENT_NAME);
+    if (err != ERR_OK || newpcb == NULL) {
+        printf("%s: ❌ TCP accept FAILED - err=%d (%s), newpcb=%p\n",
+               COMPONENT_NAME, err,
+               err == -1 ? "OUT OF MEMORY (ERR_MEM)" :
+               err == -13 ? "CONNECTION ABORTED (ERR_ABRT)" : "UNKNOWN",
+               newpcb);
+        if (err == -1) {
+            printf("%s:    → lwIP ran out of TCP PCBs! Check MEMP_NUM_TCP_PCB in lwipopts.h\n",
+                   COMPONENT_NAME);
+            printf("%s:    → Current active connections: %u\n", COMPONENT_NAME, active_connections);
+        }
+        return err != ERR_OK ? err : ERR_VAL;
+    }
+
+    active_connections++;
+    total_connections_created++;
+
+    printf("%s: ✓ TCP connection accepted from %u.%u.%u.%u:%u (pcb=%p)\n",
+           COMPONENT_NAME,
+           ip4_addr1(&newpcb->remote_ip), ip4_addr2(&newpcb->remote_ip),
+           ip4_addr3(&newpcb->remote_ip), ip4_addr4(&newpcb->remote_ip), newpcb->remote_port,
+           newpcb);
+    printf("%s:    → Active connections: %u | Total created: %u | Total closed: %u\n",
+           COMPONENT_NAME, active_connections, total_connections_created, total_connections_closed);
 
     tcp_setprio(newpcb, TCP_PRIO_MIN);
     tcp_recv(newpcb, tcp_echo_recv);
+    tcp_err(newpcb, tcp_echo_err);  /* Register error callback for connection cleanup */
 
     return ERR_OK;
 }
@@ -1560,145 +1637,41 @@ static int virtio_net_init(void)
     /* Device ready - activate the device */
     VREG_WRITE(VIRTIO_MMIO_STATUS, VREG_READ(VIRTIO_MMIO_STATUS) | VIRTIO_STATUS_DRIVER_OK);
     printf("%s: ✓ VirtIO device initialized and activated\n", COMPONENT_NAME);
+    /* ═══ CRITICAL: Test if MMIO writes work ═══ */
+    printf("\n%s: Testing MMIO write capability...\n", COMPONENT_NAME);
 
-    /* ═══════════════════════════════════════════════════════════════════════
-     * COMPLETE VIRTIO MMIO REGISTER DUMP
-     * ═══════════════════════════════════════════════════════════════════════ */
-    printf("\n");
-    printf("╔══════════════════════════════════════════════════════════╗\n");
-    printf("║  COMPLETE VIRTIO MMIO REGISTER DUMP (Slot 30)           ║\n");
-    printf("╚══════════════════════════════════════════════════════════╝\n");
-    printf("VirtIO device base: %p (offset +0x200 from page base)\n", virtio_regs_base);
-    printf("\nDevice Identification:\n");
-    printf("  [0x000] MagicValue:       0x%08x ('virt' = 0x74726976)\n", VREG_READ(0x000));
-    printf("  [0x004] Version:          0x%08x (2 = VirtIO 1.0)\n", VREG_READ(0x004));
-    printf("  [0x008] DeviceID:         0x%08x (1 = network device)\n", VREG_READ(0x008));
-    printf("  [0x00c] VendorID:         0x%08x (QEMU = 0x554d4551)\n", VREG_READ(0x00c));
-    printf("\nDevice Features:\n");
-    printf("  [0x010] DeviceFeatures:   0x%08x\n", VREG_READ(0x010));
-    printf("  [0x014] DeviceFeaturesSel: 0x%08x\n", VREG_READ(0x014));
-    printf("  [0x020] DriverFeatures:   0x%08x\n", VREG_READ(0x020));
-    printf("  [0x024] DriverFeaturesSel: 0x%08x\n", VREG_READ(0x024));
-    printf("\nQueue Configuration (current QueueSel=%u):\n", VREG_READ(0x030));
-    printf("  [0x030] QueueSel:         0x%08x\n", VREG_READ(0x030));
-    printf("  [0x034] QueueNumMax:      0x%08x\n", VREG_READ(0x034));
-    printf("  [0x038] QueueNum:         0x%08x\n", VREG_READ(0x038));
-    printf("  [0x044] QueueReady:       0x%08x\n", VREG_READ(0x044));
-    printf("\nQueue Descriptor Addresses:\n");
-    printf("  [0x080] QueueDescLow:     0x%08x\n", VREG_READ(0x080));
-    printf("  [0x084] QueueDescHigh:    0x%08x\n", VREG_READ(0x084));
-    printf("  [0x090] QueueAvailLow:    0x%08x\n", VREG_READ(0x090));
-    printf("  [0x094] QueueAvailHigh:   0x%08x\n", VREG_READ(0x094));
-    printf("  [0x0a0] QueueUsedLow:     0x%08x\n", VREG_READ(0x0a0));
-    printf("  [0x0a4] QueueUsedHigh:    0x%08x\n", VREG_READ(0x0a4));
-    printf("\nInterrupt and Status:\n");
-    printf("  [0x060] InterruptStatus:  0x%08x\n", VREG_READ(0x060));
-    printf("  [0x064] InterruptACK:     0x%08x\n", VREG_READ(0x064));
-    printf("  [0x070] Status:           0x%08x\n", VREG_READ(0x070));
-    printf("  [0x050] QueueNotify:      0x%08x\n", VREG_READ(0x050));
-    printf("═══════════════════════════════════════════════════════════\n\n");
-
-    /* ═══════════════════════════════════════════════════════════════════════
-     * VIRTIO QUEUE DIAGNOSTIC - Verify queue operation
-     * ═══════════════════════════════════════════════════════════════════════ */
-    printf("\n");
-    printf("╔══════════════════════════════════════════════════════════╗\n");
-    printf("║  VIRTIO QUEUE DIAGNOSTIC - Queue Ready Test             ║\n");
-    printf("╚══════════════════════════════════════════════════════════╝\n");
-
-    /* Test 1: Verify both queues report ready */
+    /* Select queue 0 (RX queue) */
     VREG_WRITE(VIRTIO_MMIO_QUEUE_SEL, 0);
-    uint32_t rx_ready = VREG_READ(VIRTIO_MMIO_QUEUE_READY);
-    printf("RX Queue (0): QueueReady = %u (expect 1)\n", rx_ready);
 
-    VREG_WRITE(VIRTIO_MMIO_QUEUE_SEL, 1);
-    uint32_t tx_ready = VREG_READ(VIRTIO_MMIO_QUEUE_READY);
-    printf("TX Queue (1): QueueReady = %u (expect 1)\n", tx_ready);
+    /* Read current QueueReady state */
+    uint32_t original_ready = VREG_READ(VIRTIO_MMIO_QUEUE_READY);
+    printf("%s:   Queue 0 original ready state = 0x%x\n", COMPONENT_NAME, original_ready);
 
-    /* Test 2: Try toggling queue ready and see if it changes */
-    printf("\nTesting QueueReady register write capability:\n");
-    VREG_WRITE(VIRTIO_MMIO_QUEUE_SEL, 0);
-    printf("  Setting RX queue ready to 0...\n");
-    VREG_WRITE(VIRTIO_MMIO_QUEUE_READY, 0);
-    DMB();
-    uint32_t rx_after_clear = VREG_READ(VIRTIO_MMIO_QUEUE_READY);
-    printf("  RX QueueReady after clear: %u (should be 0)\n", rx_after_clear);
+    /* Test write by toggling QueueReady */
+    VREG_WRITE(VIRTIO_MMIO_QUEUE_READY, 0x0);
+    uint32_t read_back_0 = VREG_READ(VIRTIO_MMIO_QUEUE_READY);
 
-    printf("  Setting RX queue ready back to 1...\n");
-    VREG_WRITE(VIRTIO_MMIO_QUEUE_READY, 1);
-    DMB();
-    uint32_t rx_after_set = VREG_READ(VIRTIO_MMIO_QUEUE_READY);
-    printf("  RX QueueReady after set: %u (should be 1)\n", rx_after_set);
+    VREG_WRITE(VIRTIO_MMIO_QUEUE_READY, 0x1);
+    uint32_t read_back_1 = VREG_READ(VIRTIO_MMIO_QUEUE_READY);
 
-    if (rx_after_clear == 0 && rx_after_set == 1) {
-        printf("✅ QueueReady register is WRITABLE and responds correctly\n");
-    } else {
-        printf("❌ QueueReady register NOT responding to writes\n");
+    printf("%s:   Write 0x0, read back: 0x%x (expect 0x0)\n", COMPONENT_NAME, read_back_0);
+    printf("%s:   Write 0x1, read back: 0x%x (expect 0x1)\n", COMPONENT_NAME, read_back_1);
+
+    /* Restore original state */
+    VREG_WRITE(VIRTIO_MMIO_QUEUE_READY, original_ready);
+
+    if (read_back_0 != 0x0 || read_back_1 != 0x1) {
+        printf("\n%s: ❌❌❌ FATAL ERROR: MMIO WRITES DO NOT WORK! ❌❌❌\n", COMPONENT_NAME);
+        printf("%s: Device memory attributes are incorrect.\n", COMPONENT_NAME);
+        printf("%s: This will cause infinite IRQ loops and duplicate packets.\n", COMPONENT_NAME);
+        printf("%s: Cannot continue - terminating initialization.\n\n", COMPONENT_NAME);
+        return -1;
     }
 
-    /* ═══════════════════════════════════════════════════════════════════════
-     * VIRTIO QUEUE DIAGNOSTIC - Queue Index Test
-     * ═══════════════════════════════════════════════════════════════════════ */
-    printf("\n");
-    printf("╔══════════════════════════════════════════════════════════╗\n");
-    printf("║  VIRTIO QUEUE DIAGNOSTIC - Queue Index Test             ║\n");
-    printf("╚══════════════════════════════════════════════════════════╝\n");
+    printf("%s:   ✅ MMIO writes work correctly!\n\n", COMPONENT_NAME);
 
-    /* Check current queue indices */
-    printf("RX Queue (0) indices:\n");
-    printf("  avail->idx = %u (driver writes here)\n", rx_virtq.avail->idx);
-    printf("  used->idx  = %u (device writes here)\n", rx_virtq.used->idx);
-
-    printf("\nTX Queue (1) indices:\n");
-    printf("  avail->idx = %u (driver writes here)\n", tx_virtq.avail->idx);
-    printf("  used->idx  = %u (device writes here)\n", tx_virtq.used->idx);
-
-    /* Test: Send a dummy notification to TX queue and check if used index changes */
-    printf("\nSending notification to TX queue (queue 1)...\n");
-    VREG_WRITE(VIRTIO_MMIO_QUEUE_SEL, 1);
-    uint16_t tx_used_before = tx_virtq.used->idx;
-
-    VREG_WRITE(VIRTIO_MMIO_QUEUE_NOTIFY, 1);  /* Notify TX queue */
-    DMB();  /* Memory barrier to ensure write completes */
-
-    /* Wait a bit for QEMU to process */
-    for (volatile int i = 0; i < 100000; i++);
-
-    uint16_t tx_used_after = tx_virtq.used->idx;
-    printf("  TX used->idx before notify: %u\n", tx_used_before);
-    printf("  TX used->idx after notify:  %u\n", tx_used_after);
-
-    if (tx_used_after != tx_used_before) {
-        printf("✅ QEMU processed the notification! Device is RESPONSIVE!\n");
-    } else {
-        printf("⚠️  used->idx did not change (expected - no actual TX buffers queued)\n");
-    }
 
     /* ═══════════════════════════════════════════════════════════════════════
-     * VIRTIO QUEUE DIAGNOSTIC - Interrupt Enable Check
-     * ═══════════════════════════════════════════════════════════════════════ */
-    printf("\n");
-    printf("╔══════════════════════════════════════════════════════════╗\n");
-    printf("║  VIRTIO QUEUE DIAGNOSTIC - Interrupt Configuration      ║\n");
-    printf("╚══════════════════════════════════════════════════════════╝\n");
-
-    uint32_t device_status = VREG_READ(VIRTIO_MMIO_STATUS);
-    printf("Device Status: 0x%02x\n", device_status);
-    printf("  ACKNOWLEDGE   (0x01): %s\n", (device_status & 0x01) ? "✓" : "✗");
-    printf("  DRIVER        (0x02): %s\n", (device_status & 0x02) ? "✓" : "✗");
-    printf("  FEATURES_OK   (0x08): %s\n", (device_status & 0x08) ? "✓" : "✗");
-    printf("  DRIVER_OK     (0x04): %s\n", (device_status & 0x04) ? "✓" : "✗");
-
-    uint32_t interrupt_status = VREG_READ(VIRTIO_MMIO_INTERRUPT_STATUS);
-    printf("\nInterrupt Status: 0x%08x\n", interrupt_status);
-    printf("  USED_BUFFER (0x01): %s\n", (interrupt_status & 0x01) ? "PENDING" : "clear");
-    printf("  CONFIG      (0x02): %s\n", (interrupt_status & 0x02) ? "PENDING" : "clear");
-
-    uint32_t interrupt_ack = VREG_READ(VIRTIO_MMIO_INTERRUPT_ACK);
-    printf("\nInterrupt ACK: 0x%08x\n", interrupt_ack);
-
-    printf("\n═══ End of VirtIO Queue Diagnostics ═══\n\n");
-
     return 0;
 }
 
@@ -1709,249 +1682,13 @@ void post_init(void)
 {
     printf("%s: Component started\n\n", COMPONENT_NAME);
 
-    /* ═══════════════════════════════════════════════════════════
-     * CRITICAL DEBUG: Verify MMIO mapping is correct
-     * ═══════════════════════════════════════════════════════════ */
-    printf("\n");
-    printf("╔══════════════════════════════════════════════════════════╗\n");
-    printf("║  MMIO MAPPING VERIFICATION TEST                          ║\n");
-    printf("╚══════════════════════════════════════════════════════════╝\n");
-
-    /* virtio_mmio_regs is the CAmkES dataport mapped to physical 0xa003000 */
-    volatile uint32_t *base = (volatile uint32_t *)virtio_mmio_regs;
-
-    printf("Virtual address of virtio_mmio_regs: %p\n", base);
-    printf("Expected physical address: 0xa003000 (page containing VirtIO slot 31 at +0xe00)\n");
-    printf("VirtIO device should be at offset +0xe00 from page base\n\n");
-
-    /* Dump first 64 bytes of the mapped region (entire page header) */
-    printf("═══ Dumping first 64 bytes of mapped region ═══\n");
-    for (int i = 0; i < 16; i++) {
-        printf("  [0x%03x] = 0x%08x", i * 4, base[i]);
-        if (i == 0) printf("  ← Should be 0x00000000 (empty)");
-        printf("\n");
-    }
-
-    /* Now check VirtIO device at offset 0xe00 (slot 31) */
-    printf("\n═══ VirtIO device at offset +0xe00 (896 words) ═══\n");
-    volatile uint32_t *virtio_dev = base + (0xe00 / 4);
-
-    printf("VirtIO Magic Value   [+0x000] = 0x%08x (expect 0x74726976 'virt')\n", virtio_dev[0]);
-    printf("VirtIO Version       [+0x004] = 0x%08x (expect 0x2 for VirtIO 1.0)\n", virtio_dev[1]);
-    printf("VirtIO Device ID     [+0x008] = 0x%08x (expect 0x1 for network)\n", virtio_dev[2]);
-    printf("VirtIO Vendor ID     [+0x00c] = 0x%08x (expect 0x554d4551 'QEMU')\n", virtio_dev[3]);
-
-    /* Verify magic value */
-    if (virtio_dev[0] == 0x74726976) {
-        printf("\n✅ SUCCESS: VirtIO magic value is CORRECT!\n");
-        printf("   The MMIO mapping IS working for READS!\n");
-    } else {
-        printf("\n❌ FAILURE: VirtIO magic value is WRONG!\n");
-        printf("   Expected: 0x74726976\n");
-        printf("   Got:      0x%08x\n", virtio_dev[0]);
-        printf("   This means the mapping is pointing to the WRONG address!\n");
-    }
-
-    /* Test if we can read the entire VirtIO register space */
-    printf("\n═══ Reading all VirtIO MMIO registers ═══\n");
-    for (int i = 0; i < 16; i++) {
-        uint32_t val = virtio_dev[i];
-        printf("  VirtIO[0x%03x] = 0x%08x", i * 4, val);
-
-        switch (i * 4) {
-            case 0x000: printf("  (Magic)"); break;
-            case 0x004: printf("  (Version)"); break;
-            case 0x008: printf("  (DeviceID)"); break;
-            case 0x00c: printf("  (VendorID)"); break;
-            case 0x010: printf("  (DeviceFeatures)"); break;
-            case 0x030: printf("  (QueueSel)"); break;
-            case 0x034: printf("  (QueueNumMax)"); break;
-            case 0x070: printf("  (Status)"); break;
-        }
-        printf("\n");
-    }
-
-    printf("\n═══ Testing WRITE capability ═══\n");
-    printf("Attempting to write to QueueSel register...\n");
-
-    /* Save original value */
-    uint32_t orig_queuesel = virtio_dev[0x030 / 4];
-    printf("Original QueueSel value: 0x%08x\n", orig_queuesel);
-
-    /* Try to write different values */
-    printf("Writing 0x1 to QueueSel...\n");
-    virtio_dev[0x030 / 4] = 0x1;
-    DSB();  /* Ensure write completes */
-    uint32_t readback1 = virtio_dev[0x030 / 4];
-    printf("Read back: 0x%08x (expect 0x1 if writes work)\n", readback1);
-
-    printf("Writing 0x0 to QueueSel...\n");
-    virtio_dev[0x030 / 4] = 0x0;
-    DSB();
-    uint32_t readback0 = virtio_dev[0x030 / 4];
-    printf("Read back: 0x%08x (expect 0x0 if writes work)\n", readback0);
-
-    if (readback1 == 0x1 && readback0 == 0x0) {
-        printf("\n✅ WRITES WORK! The MMIO mapping is fully functional!\n");
-    } else {
-        printf("\n❌ WRITES DON'T WORK! Reads work but writes are being dropped!\n");
-        printf("   This confirms Device memory attributes are WRONG!\n");
-    }
-
-    printf("╔══════════════════════════════════════════════════════════╗\n");
-    printf("║  END OF MMIO MAPPING VERIFICATION                        ║\n");
-    printf("╚══════════════════════════════════════════════════════════╝\n\n");
-
-    /* ═══════════════════════════════════════════════════════════
-     * QEMU→Component Direction Test: Can component see QEMU writes?
-     * ═══════════════════════════════════════════════════════════ */
-    printf("\n");
-    printf("╔══════════════════════════════════════════════════════════╗\n");
-    printf("║  CRITICAL TEST: Paint Virtqueue Memory Directly         ║\n");
-    printf("║  (Tests if QEMU never touches memory OR writes blocked) ║\n");
-    printf("╚══════════════════════════════════════════════════════════╝\n");
-    printf("\n");
-    printf("OBJECTIVE: Distinguish between two hypotheses:\n");
-    printf("  Hypothesis 1: QEMU never touches memory (doesn't know address)\n");
-    printf("               → Direct write works, we see test pattern\n");
-    printf("  Hypothesis 2: Page table blocks QEMU→Component writes\n");
-    printf("               → Direct write fails, still see 0x00000000\n");
-    printf("\n");
-
     /* Initialize VirtIO device */
     if (virtio_net_init() != 0) {
         printf("%s: Failed to initialize VirtIO device\n", COMPONENT_NAME);
         return;
     }
 
-    /* ═══════════════════════════════════════════════════════════
-     * PAINT TEST: Write to virtqueue memory from GDB
-     * ═══════════════════════════════════════════════════════════ */
-#if ENABLE_PAINT_TEST
-    printf("\n");
-    printf("╔══════════════════════════════════════════════════════════╗\n");
-    printf("║  PAINT TEST: Virtqueue RX Used Ring Memory              ║\n");
-    printf("╚══════════════════════════════════════════════════════════╝\n");
-    printf("\n");
-    printf("This test writes DIRECTLY to virtqueue memory from GDB\n");
-    printf("to prove whether QEMU can't access memory OR page blocks writes.\n");
-    printf("\n");
-
-    /* Get the used ring address from virtio_net_init() */
-    extern struct virtq rx_virtq;  /* Declared earlier in this file */
-    volatile uint16_t *used_idx_ptr = &rx_virtq.used->idx;
-    volatile uint32_t *used_ring_ptr = (volatile uint32_t *)rx_virtq.used;
-
-    printf("RX Used Ring addresses:\n");
-    printf("  Virtual address:  %p\n", (void*)rx_virtq.used);
-    printf("  used->idx pointer: %p\n", (void*)used_idx_ptr);
-    printf("\n");
-
-    /* Read physical address from earlier debug output - it's already printed */
-    printf("Physical address was printed earlier as 'RX used paddr'\n");
-    printf("Look for that line above to get the physical address.\n");
-    printf("\n");
-
-    printf("STEP 1: Read current values (should be 0x00000000)...\n");
-    uint16_t idx_before = *used_idx_ptr;
-    uint32_t word0_before = used_ring_ptr[0];
-    uint32_t word1_before = used_ring_ptr[1];
-    printf("  used->idx = 0x%04x\n", idx_before);
-    printf("  used ring word[0] = 0x%08x\n", word0_before);
-    printf("  used ring word[1] = 0x%08x\n", word1_before);
-    printf("\n");
-
-    printf("╔══════════════════════════════════════════════════════════╗\n");
-    printf("║  ACTION REQUIRED: Paint memory from GDB                 ║\n");
-    printf("╚══════════════════════════════════════════════════════════╝\n");
-    printf("\n");
-    printf("INSTRUCTIONS:\n");
-    printf("1. Connect GDB:\n");
-    printf("   gdb-multiarch\n");
-    printf("   set architecture aarch64\n");
-    printf("   target remote :1234\n");
-    printf("   continue\n");
-    printf("\n");
-    printf("2. Press Ctrl+C to interrupt\n");
-    printf("\n");
-    printf("3. Find RX used ring physical address from output above\n");
-    printf("   (Look for 'RX used paddr = 0x...')\n");
-    printf("   Example: If paddr = 0x80834408, then:\n");
-    printf("\n");
-    printf("4. Write test pattern to physical address:\n");
-    printf("   set *((unsigned short *)0x<PADDR>+2) = 0x1234\n");
-    printf("   # Write to used->idx (offset +2 for idx field)\n");
-    printf("\n");
-    printf("   Or write full words:\n");
-    printf("   set *((unsigned int *)0x<PADDR>) = 0xdeadbeef\n");
-    printf("   set *((unsigned int *)0x<PADDR>+4) = 0xcafebabe\n");
-    printf("\n");
-    printf("5. Type 'continue' to resume\n");
-    printf("\n");
-    printf("Waiting 60 seconds for manual GDB painting...\n");
-    printf("\n");
-
-    /* Countdown */
-    for (int i = 60; i > 0; i--) {
-        if (i % 10 == 0 || i <= 5) {
-            printf("[T=%d] %d seconds remaining...\n", 60-i, i);
-        }
-        for (volatile int j = 0; j < 50000000; j++);
-    }
-    printf("[T=60] Countdown complete!\n\n");
-
-    printf("STEP 2: Read values after GDB paint attempt...\n");
-    uint16_t idx_after = *used_idx_ptr;
-    uint32_t word0_after = used_ring_ptr[0];
-    uint32_t word1_after = used_ring_ptr[1];
-    printf("  used->idx = 0x%04x", idx_after);
-    if (idx_after != idx_before) {
-        printf("  ← CHANGED from 0x%04x! ✅", idx_before);
-    }
-    printf("\n");
-    printf("  used ring word[0] = 0x%08x", word0_after);
-    if (word0_after != word0_before) {
-        printf("  ← CHANGED from 0x%08x! ✅", word0_before);
-    }
-    printf("\n");
-    printf("  used ring word[1] = 0x%08x", word1_after);
-    if (word1_after != word1_before) {
-        printf("  ← CHANGED from 0x%08x! ✅", word1_before);
-    }
-    printf("\n\n");
-
-    printf("═══════════════════════════════════════════════════════════\n");
-    printf("PAINT TEST RESULT:\n");
-    printf("═══════════════════════════════════════════════════════════\n");
-    if (idx_after != idx_before || word0_after != word0_before || word1_after != word1_before) {
-        printf("✅ SUCCESS: Values CHANGED!\n");
-        printf("\n");
-        printf("CONCLUSION: Direct writes to RAM work!\n");
-        printf("  → Hypothesis 1 CONFIRMED: QEMU never touches memory\n");
-        printf("  → QEMU doesn't know where virtqueue is (MMIO writes dropped)\n");
-        printf("  → Page table ALLOWS QEMU→Component memory access\n");
-        printf("  → Problem is ONLY that QEMU wasn't told the addresses\n");
-        printf("\n");
-        printf("IMPLICATION: Fix MMIO writes → QEMU learns addresses → Network works!\n");
-    } else {
-        printf("❌ UNCHANGED: All values still 0x00000000\n");
-        printf("\n");
-        printf("Either:\n");
-        printf("  1. You didn't write from GDB (try again), OR\n");
-        printf("  2. Hypothesis 2 CONFIRMED: Page table blocks QEMU→Component writes\n");
-        printf("     → Even if QEMU knew addresses, it couldn't write to virtqueue\n");
-        printf("     → This is a MORE SERIOUS problem (bidirectional block)\n");
-        printf("\n");
-        printf("If you DID write from GDB and it's still zero:\n");
-        printf("  → Page table permissions block writes in BOTH directions\n");
-        printf("  → Need to fix permissions for both Component→QEMU AND QEMU→Component\n");
-    }
-    printf("═══════════════════════════════════════════════════════════\n\n");
-#else
-    printf("%s: Paint test disabled (ENABLE_PAINT_TEST=0)\n\n", COMPONENT_NAME);
-#endif
-
-    /* Allocate packet buffers from DMA memory (matching sDDF approach) */
+    /* Allocate packet buffers from DMA memory */
     printf("%s: Allocating %d DMA packet buffers (%d bytes each)...\n",
            COMPONENT_NAME, MAX_PACKETS, PACKET_BUFFER_SIZE);
     for (int i = 0; i < MAX_PACKETS; i++) {
@@ -1965,16 +1702,14 @@ void post_init(void)
     printf("%s: ✓ Allocated DMA packet buffers (vaddr=%p, paddr=0x%lx)\n",
            COMPONENT_NAME, packet_buffers[0], packet_buffers_paddr[0]);
 
-    /* Allocate TX headers array (one header per possible TX descriptor) */
+    /* Allocate TX headers array */
     size_t tx_headers_size = MAX_PACKETS * sizeof(virtio_net_hdr_t);
-    tx_headers = camkes_dma_alloc(tx_headers_size, 16, false);  /* 16-byte aligned */
+    tx_headers = camkes_dma_alloc(tx_headers_size, 16, false);
     if (!tx_headers) {
         printf("%s: ERROR: Failed to allocate TX headers DMA memory\n", COMPONENT_NAME);
         return;
     }
     tx_headers_paddr = camkes_dma_get_paddr(tx_headers);
-
-    /* Initialize all TX headers (zero-fill = no offloads) */
     memset(tx_headers, 0, tx_headers_size);
     printf("%s: ✓ Allocated TX headers array (vaddr=%p, paddr=0x%lx)\n",
            COMPONENT_NAME, tx_headers, tx_headers_paddr);
@@ -1987,34 +1722,6 @@ void post_init(void)
     printf("%s: Initializing lwIP TCP/IP stack...\n", COMPONENT_NAME);
     lwip_init();
 
-    /* Add network interface with STATIC IP (GRFICS deployment) */
-    struct ip4_addr ipaddr, netmask, gw;
-    IP4_ADDR(&ipaddr, 192, 168, 90, 5);    /* Static IP: 192.168.90.5 (SCADA address) */
-    IP4_ADDR(&netmask, 255, 255, 255, 0);  /* Netmask: 255.255.255.0 */
-    IP4_ADDR(&gw, 192, 168, 95, 1);        /* Gateway: 192.168.95.1 */
-
-    printf("%s: Using STATIC IP configuration (GRFICS deployment):\n", COMPONENT_NAME);
-    printf("%s:   IP:      192.168.90.5 (pretends to be SCADA)\n", COMPONENT_NAME);
-    printf("%s:   Netmask: 255.255.255.0\n", COMPONENT_NAME);
-    printf("%s:   Gateway: 192.168.95.1\n", COMPONENT_NAME);
-
-    netif_add(&netif_data, &ipaddr, &netmask, &gw, NULL, custom_netif_init, ethernet_input);
-    netif_set_default(&netif_data);
-    netif_set_status_callback(&netif_data, netif_status_callback);
-    netif_set_up(&netif_data);
-
-    /* Skip DHCP - use static IP */
-    printf("%s: Network interface UP with static IP\n", COMPONENT_NAME);
-
-    /* TEMPORARY: Re-enable immediate TCP server creation to test verbose debug
-     * This WILL cause malloc fault at address 0x10, but allows us to capture
-     * detailed debug output to understand the failure.
-     */
-    printf("%s: ⚠️  TESTING: Creating TCP server immediately (will likely fault)\n", COMPONENT_NAME);
-    setup_tcp_echo_server();
-    tcp_server_initialized = true;  /* Set flag to prevent duplicate initialization */
-    printf("%s: ✓ Initialization complete\n", COMPONENT_NAME);
-    printf("%s: Network ready\n\n", COMPONENT_NAME);
 
     /* QueueSel Runtime Verification Test */
     printf("\n╔══════════════════════════════════════════════════════════╗\n");
@@ -2232,14 +1939,14 @@ void post_init(void)
     printf("Test complete. System continuing...\n\n");
     #endif
 
-    /* No echo connections needed - we forward directly to ICS pipeline */
+    /* VirtIO_Net1_Driver: Handles INTERNAL network (PLC/protected device side) */
     printf("\n");
     printf("╔══════════════════════════════════════════════════════════╗\n");
-    printf("║  ICS PIPELINE INTEGRATION READY - BIDIRECTIONAL          ║\n");
+    printf("║  [Net1] INTERNAL NETWORK READY (PLC/Protected Device)   ║\n");
     printf("╚══════════════════════════════════════════════════════════╝\n");
-    printf("%s: ✅ OUTBOUND path: TCP:7000 → ICS_Outbound (Internal → External)\n", COMPONENT_NAME);
-    printf("%s: ✅ INBOUND path: ICS_Inbound → TCP client (External → Internal)\n", COMPONENT_NAME);
-    printf("%s: Ready for full bidirectional ICS traffic forwarding\n", COMPONENT_NAME);
+    printf("%s: ✅ RX path: TCP:%d → ICS_Outbound pipeline (Internal → External)\n", COMPONENT_NAME, TCP_SERVER_PORT);
+    printf("%s: ✅ TX path: ICS_Outbound_Resp → TCP:%d client (External → Internal)\n", COMPONENT_NAME, TCP_SERVER_PORT);
+    printf("%s: Ready to receive PLC traffic and forward filtered responses\n", COMPONENT_NAME);
 
     /* post_init() MUST return to allow other components to start! */
     printf("%s: post_init() complete - returning to allow ICS pipeline to start\n", COMPONENT_NAME);
@@ -2251,6 +1958,50 @@ void post_init(void)
  * CRITICAL: This is called AFTER all components have initialized.
  * Moving the infinite event loop HERE (from post_init) allows EchoComponent's run() to execute.
  */
+int run(void)
+{
+    /* Main event loop - process lwIP timers, RX packets, and ICS notifications */
+    /* Note: TCP server is now initialized in RX path after first packet */
+    while (1) {
+        /* Check for INBOUND notifications from ICS_Inbound (non-blocking) */
+        if (inbound_ready_poll()) {
+            inbound_ready_handle();
+        }
+
+        /* Process lwIP timers and RX packets */
+        sys_check_timeouts();
+        process_rx_packets();
+
+        seL4_Yield();
+    }
+
+    return 0;
+}
+
+    /* Add network interface with STATIC IP */
+    struct ip4_addr ipaddr, netmask, gw;
+    IP4_ADDR(&ipaddr, 10, 3, 0, 2);
+    IP4_ADDR(&netmask, 255, 255, 255, 0);
+    IP4_ADDR(&gw, 10, 3, 0, 1);
+
+    printf("%s: Using STATIC IP configuration:\n", COMPONENT_NAME);
+    printf("%s:   IP:      10.3.0.2\n", COMPONENT_NAME);
+    printf("%s:   Netmask: 255.255.255.0\n", COMPONENT_NAME);
+    printf("%s:   Gateway: 10.3.0.1\n", COMPONENT_NAME);
+
+    netif_add(&netif_data, &ipaddr, &netmask, &gw, NULL, custom_netif_init, ethernet_input);
+    netif_set_default(&netif_data);
+    netif_set_status_callback(&netif_data, netif_status_callback);
+    netif_set_up(&netif_data);
+
+    printf("%s: Network interface UP with static IP\n", COMPONENT_NAME);
+    setup_tcp_echo_server();
+    tcp_server_initialized = true;
+    printf("%s: ✓ Initialization complete\n", COMPONENT_NAME);
+    printf("%s: Network ready\n\n", COMPONENT_NAME);
+
+    printf("%s: post_init() complete - returning to allow pipeline to start\n", COMPONENT_NAME);
+}
 int run(void)
 {
     /* Main event loop - process lwIP timers, RX packets, and ICS notifications */

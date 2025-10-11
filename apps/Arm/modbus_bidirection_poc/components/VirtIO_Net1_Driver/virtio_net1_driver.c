@@ -1896,7 +1896,7 @@ static int virtio_net_init(void)
 void post_init(void)
 {
     printf("%s: Component started\n", COMPONENT_NAME);
-    printf("%s: 🔖 SOFTWARE VERSION: v2.24-debug-checksums (2025-10-11)\n", COMPONENT_NAME);
+    printf("%s: 🔖 SOFTWARE VERSION: v2.15-bridge-architecture (2025-10-11)\n", COMPONENT_NAME);
     printf("%s: 🔧 Features: Pure L2 bridge - NO NAT, real gateway IPs (192.168.95.1)\n\n", COMPONENT_NAME);
 
     /* Initialize VirtIO device */

@@ -672,16 +672,46 @@ static err_t netif_output(struct netif *netif, struct pbuf *p)
  * lwIP processes them normally.
  */
 /*
- * Custom input function for bridge architecture
- * With bridges, packets arrive with real IPs - no NAT needed!
+ * Custom input function for protocol-break architecture
+ *
+ * CRITICAL: Packets arrive with dest IP = 192.168.95.2 (PLC) but interface IP = 192.168.96.2
+ * lwIP's ip_input() rejects packets not destined for interface IP
+ * Solution: Rewrite destination IP to match interface IP before passing to lwIP
  */
 static err_t custom_input_promiscuous(struct pbuf *p, struct netif *inp)
 {
-    /* Bridge architecture: just remove ethernet header and pass to lwIP */
-    if (pbuf_remove_header(p, sizeof(struct eth_hdr)) == 0) {
-        return ip_input(p, inp);
+    /* Remove Ethernet header first */
+    if (pbuf_remove_header(p, sizeof(struct eth_hdr)) != 0) {
+        return ethernet_input(p, inp);
     }
-    return ethernet_input(p, inp);
+
+    /* Check if this is an IPv4 packet */
+    if (p->len >= 20) {  /* Minimum IPv4 header size */
+        struct ip_hdr *iphdr = (struct ip_hdr *)p->payload;
+
+        /* Extract destination IP */
+        uint32_t pkt_dest_ip = ntohl(iphdr->dest.addr);
+        uint32_t interface_ip = ntohl(inp->ip_addr.addr);
+
+        /* If packet is not destined for our interface IP, rewrite it */
+        if (pkt_dest_ip != interface_ip) {
+            printf("%s: 🔄 Rewriting dest IP: %u.%u.%u.%u → %u.%u.%u.%u\n",
+                   COMPONENT_NAME,
+                   (pkt_dest_ip >> 24) & 0xFF, (pkt_dest_ip >> 16) & 0xFF,
+                   (pkt_dest_ip >> 8) & 0xFF, pkt_dest_ip & 0xFF,
+                   (interface_ip >> 24) & 0xFF, (interface_ip >> 16) & 0xFF,
+                   (interface_ip >> 8) & 0xFF, interface_ip & 0xFF);
+
+            /* Rewrite destination IP to interface IP */
+            iphdr->dest.addr = inp->ip_addr.addr;
+
+            /* Recalculate IP checksum */
+            iphdr->_chksum = 0;
+            iphdr->_chksum = inet_chksum(iphdr, IPH_HL(iphdr) * 4);
+        }
+    }
+
+    return ip_input(p, inp);
 }
 
 /*
@@ -2073,8 +2103,8 @@ static int virtio_net_init(void)
 void post_init(void)
 {
     printf("%s: Component started\n", COMPONENT_NAME);
-    printf("%s: 🔖 SOFTWARE VERSION: v2.16-add-pfsense-gateway (2025-10-11)\n", COMPONENT_NAME);
-    printf("%s: 🔧 Features: Bridge architecture with pfSense gateway for SCADA routing\n\n", COMPONENT_NAME);
+    printf("%s: 🔖 SOFTWARE VERSION: v2.17-fix-dest-ip-rewrite (2025-10-11)\n", COMPONENT_NAME);
+    printf("%s: 🔧 Features: Rewrites dest IP (192.168.95.2→192.168.96.2) so lwIP accepts packets\n\n", COMPONENT_NAME);
 
     /* Initialize VirtIO device */
     if (virtio_net_init() != 0) {

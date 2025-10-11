@@ -2675,7 +2675,7 @@ static int virtio_net_init(void)
 void post_init(void)
 {
     printf("%s: Component started\n", COMPONENT_NAME);
-    printf("%s: 🔖 NET1 SOFTWARE VERSION: v2.25-fix-net1-gateway (2025-10-11)\n", COMPONENT_NAME);
+    printf("%s: 🔖 NET1 SOFTWARE VERSION: v2.26-fix-inbound-handler (2025-10-11)\n", COMPONENT_NAME);
     printf("%s: 🔧 Features: Internal gateway (no upstream GW), IP 192.168.95.1, checksums fixed\n\n", COMPONENT_NAME);
 
     /* Initialize connection tracking table */

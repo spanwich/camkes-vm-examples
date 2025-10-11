@@ -1907,20 +1907,20 @@ static err_t outbound_tcp_connected_callback(void *arg, struct tcp_pcb *pcb, err
 }
 
 /*
- * OUTBOUND notification handler - called when ICS_Outbound has validated data
- * Creates TCP client connection to forward data to external network
+ * OUTBOUND notification handler - called when ICS_Outbound has PLC response
+ * Looks up existing TCP connection and sends response back to SCADA
  */
 void outbound_ready_handle(void)
 {
     #if DEBUG_MESSAGE_FLOW
     uint32_t msg_id = ++message_id_counter;
-    printf("\n🟡 [MSG #%u] ═══ ICS→NET: Received from ICS_Outbound ═══\n", msg_id);
-    printf("   Source: ICS pipeline validation complete\n");
-    printf("   Action: Creating TCP client to forward to external network\n");
+    printf("\n🟡 [MSG #%u] ═══ ICS→NET: Received PLC response from ICS_Outbound ═══\n", msg_id);
+    printf("   Source: ICS_Outbound validation complete\n");
+    printf("   Action: Forward response to SCADA via existing TCP connection\n");
     #endif
 
     printf("%s: ╔═══════════════════════════════════════════════════════════╗\n", COMPONENT_NAME);
-    printf("%s: ║  OUTBOUND: Received message from ICS_Outbound            ║\n", COMPONENT_NAME);
+    printf("%s: ║  OUTBOUND: Received PLC response from ICS_Outbound       ║\n", COMPONENT_NAME);
 
     /* CRITICAL: Check if dataport is properly mapped by CAmkES */
     if (outbound_dp == NULL) {
@@ -1945,39 +1945,9 @@ void outbound_ready_handle(void)
         return;
     }
 
-    /* Check if we already have an active connection - if so, close it and create new one */
-    if (outbound_tcp_client.active) {
-        printf("%s: OUTBOUND: Previous connection still active, closing it to handle new message\n", COMPONENT_NAME);
-        if (outbound_tcp_client.pcb != NULL) {
-            tcp_close(outbound_tcp_client.pcb);
-        }
-        outbound_tcp_client.active = false;
-        outbound_tcp_client.pcb = NULL;
-    }
-
-    #if DEBUG_MESSAGE_FLOW
-    printf("   Payload size: %u bytes\n", ics_msg->payload_length);
-    printf("   Destination: %u.%u.%u.%u:%u\n",
-           (ics_msg->metadata.dst_ip >> 24) & 0xFF,
-           (ics_msg->metadata.dst_ip >> 16) & 0xFF,
-           (ics_msg->metadata.dst_ip >> 8) & 0xFF,
-           ics_msg->metadata.dst_ip & 0xFF,
-           ics_msg->metadata.dst_port);
-
-    /* Print ASCII payload preview */
-    printf("   Payload preview: \"");
-    for (uint16_t i = 0; i < (ics_msg->payload_length < 60 ? ics_msg->payload_length : 60); i++) {
-        char c = ics_msg->payload[i];
-        if (c >= 32 && c <= 126) printf("%c", c);
-        else if (c == '\n') printf("\\n");
-        else if (c == '\r') printf("\\r");
-        else printf(".");
-    }
-    if (ics_msg->payload_length > 60) printf("...");
-    printf("\"\n");
-    #endif
-
-    /* Print metadata */
+    /* Print metadata - src/dst are SWAPPED because this is a response
+     * Original request: SCADA (src) → PLC (dst)
+     * Response: PLC (src) → SCADA (dst) */
     printf("%s: OUTBOUND: Protocol=%s, Src=%u.%u.%u.%u:%u, Dst=%u.%u.%u.%u:%u, Payload=%u bytes\n",
            COMPONENT_NAME,
            ics_msg->metadata.is_tcp ? "TCP" : (ics_msg->metadata.is_udp ? "UDP" : "Other"),
@@ -1989,52 +1959,49 @@ void outbound_ready_handle(void)
            ics_msg->metadata.dst_port,
            ics_msg->payload_length);
 
-    /* Create TCP client connection */
-    struct tcp_pcb *pcb = tcp_new_ip_type(IPADDR_TYPE_V4);
-    if (pcb == NULL) {
-        printf("%s: OUTBOUND: Failed to create TCP PCB\n", COMPONENT_NAME);
+    /* Look up existing TCP connection by metadata
+     * The metadata should have: src=PLC, dst=SCADA
+     * We need to find the connection where: SCADA originally connected to us */
+    struct connection_metadata *meta = connection_lookup_by_tuple(
+        ics_msg->metadata.dst_ip,  /* Original SCADA IP */
+        ics_msg->metadata.src_ip,  /* Original PLC IP (destination) */
+        ics_msg->metadata.dst_port,  /* SCADA port */
+        ics_msg->metadata.src_port   /* PLC port (502) */
+    );
+
+    if (meta == NULL || meta->pcb == NULL) {
+        printf("%s: ❌ OUTBOUND: No active connection found for %u.%u.%u.%u:%u → %u.%u.%u.%u:%u\n",
+               COMPONENT_NAME,
+               (ics_msg->metadata.dst_ip >> 24) & 0xFF, (ics_msg->metadata.dst_ip >> 16) & 0xFF,
+               (ics_msg->metadata.dst_ip >> 8) & 0xFF, ics_msg->metadata.dst_ip & 0xFF,
+               ics_msg->metadata.dst_port,
+               (ics_msg->metadata.src_ip >> 24) & 0xFF, (ics_msg->metadata.src_ip >> 16) & 0xFF,
+               (ics_msg->metadata.src_ip >> 8) & 0xFF, ics_msg->metadata.src_ip & 0xFF,
+               ics_msg->metadata.src_port);
+        printf("%s:    Connection may have been closed or timed out\n", COMPONENT_NAME);
         return;
     }
 
-    /* Set up client state */
-    outbound_tcp_client.pcb = pcb;
-    outbound_tcp_client.payload_data = ics_msg->payload;
-    outbound_tcp_client.payload_len = ics_msg->payload_length;
-    outbound_tcp_client.bytes_sent = 0;
-    outbound_tcp_client.active = true;
+    printf("%s: ✓ Found existing connection (pcb=%p)\n", COMPONENT_NAME, (void*)meta->pcb);
 
-    /* Set up destination IP address - use QEMU gateway to reach host */
-    ip_addr_t dest_ip;
-    ipaddr_aton(OUTBOUND_FORWARD_IP, &dest_ip);  /* 10.0.2.2 - QEMU gateway */
-
-    /* CRITICAL: Set callback argument BEFORE tcp_connect()
-     * This prevents null pointer dereference in outbound_tcp_sent_callback
-     */
-    tcp_arg(pcb, &outbound_tcp_client);
-
-    /* CROSS-DOMAIN PORT MAPPING:
-     * Internal port 7000 (Net1) → maps to → Host port 19000 (via QEMU gateway)
-     * This creates the protocol break diode architecture
-     */
-    uint16_t mapped_port = OUTBOUND_FORWARD_PORT;  /* Configurable destination port */
-
-    printf("%s: OUTBOUND: Port mapping: internal:%u → host:%s:%u (via QEMU gateway)\n",
-           COMPONENT_NAME, ics_msg->metadata.dst_port, OUTBOUND_FORWARD_IP, mapped_port);
-
-    /* Connect to host via QEMU gateway */
-    printf("%s: OUTBOUND: Connecting to host via %s:%u...\n",
-           COMPONENT_NAME, OUTBOUND_FORWARD_IP, mapped_port);
-
-    err_t err = tcp_connect(pcb, &dest_ip, mapped_port, outbound_tcp_connected_callback);
+    /* Send response data back to SCADA via existing TCP connection */
+    err_t err = tcp_write(meta->pcb, ics_msg->payload, ics_msg->payload_length, TCP_WRITE_FLAG_COPY);
     if (err != ERR_OK) {
-        printf("%s: OUTBOUND: tcp_connect failed: %d\n", COMPONENT_NAME, err);
-        tcp_close(pcb);
-        outbound_tcp_client.active = false;
-        outbound_tcp_client.pcb = NULL;
+        printf("%s: ❌ OUTBOUND: tcp_write failed: %d (%s)\n",
+               COMPONENT_NAME, err,
+               err == ERR_MEM ? "OUT OF MEMORY" :
+               err == ERR_CONN ? "NOT CONNECTED" : "OTHER ERROR");
         return;
     }
 
-    printf("%s: OUTBOUND: Connection initiated\n", COMPONENT_NAME);
+    /* Flush output buffer */
+    tcp_output(meta->pcb);
+
+    printf("%s: ✓ OUTBOUND: Sent %u bytes to SCADA\n", COMPONENT_NAME, ics_msg->payload_length);
+
+    #if DEBUG_MESSAGE_FLOW
+    printf("   ✓ [MSG #%u] Response delivered to SCADA\n\n", msg_id);
+    #endif
 }
 
 /*
@@ -2452,8 +2419,8 @@ static int virtio_net_init(void)
 void post_init(void)
 {
     printf("%s: Component started\n", COMPONENT_NAME);
-    printf("%s: 🔖 NET0 SOFTWARE VERSION: v2.30-link-pcb-metadata (2025-10-11)\n", COMPONENT_NAME);
-    printf("%s: 🔧 Features: PCB-metadata linking, original PLC IP forwarding, connection tracking\n\n", COMPONENT_NAME);
+    printf("%s: 🔖 NET0 SOFTWARE VERSION: v2.31-bidirectional-response (2025-10-11)\n", COMPONENT_NAME);
+    printf("%s: 🔧 Features: Bidirectional TCP, PLC response forwarding via existing connections\n\n", COMPONENT_NAME);
 
     /* Initialize connection tracking table */
     memset(connection_table, 0, sizeof(connection_table));

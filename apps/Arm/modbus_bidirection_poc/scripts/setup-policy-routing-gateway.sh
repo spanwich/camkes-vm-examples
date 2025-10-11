@@ -88,6 +88,11 @@ if ! ip route | grep -q "default via 192.168.96.1"; then
     ip route add default via 192.168.96.1 dev ${ETH0_NAME} metric 200 2>/dev/null || true
 fi
 
+# Add route for SCADA network (192.168.90.0/24) via pfSense
+ip route del 192.168.90.0/24 2>/dev/null || true
+ip route add 192.168.90.0/24 via 192.168.96.1 dev ${ETH0_NAME}
+echo "  → Route: 192.168.90.0/24 via 192.168.96.1 (pfSense) on ${ETH0_NAME}"
+
 # Step 5: Policy-Based Routing (CRITICAL!)
 echo -e "${YELLOW}[5/8] Configure policy-based routing (prevents kernel bypass)${NC}"
 
@@ -135,13 +140,21 @@ iptables -A FORWARD -i ${ETH1_NAME} -o ${ETH0_NAME} -j DROP
 echo -e "${YELLOW}[7/8] Configure iptables NAT rules${NC}"
 iptables -t nat -F
 
-# DNAT: Incoming traffic to QEMU
-iptables -t nat -A PREROUTING -i ${ETH0_NAME} -d ${ETH0_IP} -p tcp --dport 502 -j DNAT --to-destination ${QEMU_NET0_IP}:502
-iptables -t nat -A PREROUTING -i ${ETH1_NAME} -d ${ETH1_IP} -p tcp --dport 502 -j DNAT --to-destination ${QEMU_NET1_IP}:502
+# DNAT: Route ENTIRE SUBNETS to gateway
+# External subnet (192.168.95.0/24) → Net0 gateway (10.2.0.2)
+iptables -t nat -A PREROUTING -i ${ETH0_NAME} -d 192.168.95.0/24 -p tcp --dport 502 -j DNAT --to-destination ${QEMU_NET0_IP}:502
+echo "  → DNAT: 192.168.95.0/24 (${ETH0_NAME}) → ${QEMU_NET0_IP}:502"
 
-# SNAT: Outgoing traffic from QEMU
-iptables -t nat -A POSTROUTING -o ${ETH0_NAME} -s 10.2.0.0/24 -j SNAT --to-source ${ETH0_IP}
-iptables -t nat -A POSTROUTING -o ${ETH1_NAME} -s 10.3.0.0/24 -j SNAT --to-source ${ETH1_IP}
+# Internal subnet (192.168.90.0/24) → Net1 gateway (10.3.0.2)
+iptables -t nat -A PREROUTING -i ${ETH1_NAME} -d 192.168.90.0/24 -p tcp --dport 502 -j DNAT --to-destination ${QEMU_NET1_IP}:502
+echo "  → DNAT: 192.168.90.0/24 (${ETH1_NAME}) → ${QEMU_NET1_IP}:502"
+
+# SNAT: Outgoing traffic from QEMU (use MASQUERADE for connection tracking)
+# MASQUERADE automatically reverses DNAT mappings - client gets response from original dest IP
+iptables -t nat -A POSTROUTING -o ${ETH0_NAME} -s 10.2.0.0/24 -j MASQUERADE
+iptables -t nat -A POSTROUTING -o ${ETH1_NAME} -s 10.3.0.0/24 -j MASQUERADE
+echo "  → MASQUERADE: 10.2.0.0/24 on ${ETH0_NAME} (connection tracking)"
+echo "  → MASQUERADE: 10.3.0.0/24 on ${ETH1_NAME} (connection tracking)"
 
 # Step 8: Verify configuration
 echo -e "${YELLOW}[8/8] Verification${NC}"

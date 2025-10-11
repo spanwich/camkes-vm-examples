@@ -63,7 +63,8 @@
  * Set to 1 to enable, 0 to disable
  */
 #define DEBUG_VERBOSE 0           /* Enable verbose debug output */
-#define DEBUG_PACKET_LOG 1        /* Enable detailed packet logging (VERY VERBOSE) */
+#define DEBUG_PACKET_LOG 0        /* Enable detailed packet logging (VERY VERBOSE - hex dumps) */
+#define DEBUG_PACKET_SUMMARY 1    /* Enable lightweight packet summary (source→dest, protocol) */
 #define DEBUG_MESSAGE_FLOW 1      /* Track message flow through RX→ICS→TX pipeline */
 #define ENABLE_GDB_WAIT 0         /* Enable 60-second GDB wait during init */
 #define ENABLE_PAINT_TEST 0       /* Enable virtqueue memory paint test */
@@ -175,7 +176,7 @@ typedef struct virtio_net_hdr {
 
 /* Packet buffer configuration */
 #define PACKET_BUFFER_SIZE              2048
-#define MAX_PACKETS                     256    /* Increased to handle 128 TCP connections (2x for TX+RX) */
+#define MAX_PACKETS                     32
 
 /*
  * VirtIO MMIO Register Structure
@@ -303,6 +304,9 @@ static uint32_t dhcp_bound = 0;
 
 /* lwIP time tracking */
 static volatile uint32_t lwip_time_ms = 0;
+
+/* Initialization status flag (shared with other components for validation) */
+static volatile bool initialization_successful = false;
 
 /*
  * lwIP system time function (required by lwIP NO_SYS mode)
@@ -732,25 +736,51 @@ static void process_rx_packets(void)
          */
         uint16_t pending_packets = (uint16_t)(current_used_idx - last_used_idx);
 
-        /* CRITICAL DEBUG: Log EVERY loop iteration to catch the exact moment we read wrong */
-        if (loop_count < 5 || pending_packets > 0) {
-            printf("%s: [LOOP-START #%u] current_used=%u, last_used=%u, pending=%u\n",
-                   COMPONENT_NAME, loop_count, current_used_idx, last_used_idx, pending_packets);
-        }
-
         if (pending_packets == 0) {
-            printf("%s: [LOOP-EXIT] No more packets (current_used=%u == last_used=%u)\n",
-                   COMPONENT_NAME, current_used_idx, last_used_idx);
             return;  /* No more packets to process */
         }
 
-        /* SAFETY: Detect impossible wraparound scenarios */
-        if (pending_packets > 1000) {
-            printf("%s: ⚠️ ERROR: Impossible pending count %u (wraparound bug!)\n",
-                   COMPONENT_NAME, pending_packets);
-            printf("%s:   current_used_idx=%u, last_used_idx=%u\n",
-                   COMPONENT_NAME, current_used_idx, last_used_idx);
-            printf("%s:   Forcing exit to prevent infinite loop\n", COMPONENT_NAME);
+        /* SAFETY: Detect impossible wraparound scenarios and desynchronization
+         *
+         * Check 1: VirtIO ring can hold at most vq->num entries.
+         *          If pending_packets > vq->num, it's IMPOSSIBLE - indicates desync!
+         *
+         * Example desync: last_used_idx=2034, current_used_idx=15, vq->num=256
+         *   -> pending = (uint16_t)(15 - 2034) = 63517
+         *   -> 63517 > 256 = DESYNC DETECTED!
+         *
+         * Check 2: VirtIO spec max queue size is 1024 (validated at init).
+         *          If last_used_idx is absurdly large, it's corrupted state.
+         *
+         * Why vq->num and not arbitrary 1000?
+         *   - vq->num is read from VIRTIO_MMIO_QUEUE_NUM_MAX register
+         *   - It's the actual PHYSICAL LIMIT of the device
+         *   - Theoretically sound: pending > ring_size is mathematically impossible
+         */
+        /* CRITICAL FIX: This is NOT desync - it's normal when last_used_idx advances
+         * ahead of device's used_idx update. The device might not have written new
+         * packets yet, so last_used_idx (our consumption counter) > current_used_idx
+         * (device production counter) causes wraparound: (uint16_t)(current - last)
+         * becomes 65535, 65534, etc.
+         *
+         * Real desync: pending > vq->num (ring physically can't hold that many)
+         * False alarm: last_used_idx caught up to device, no new packets available
+         */
+        if (pending_packets > vq->num) {
+            /* Check if this is a false alarm (last_used caught up to device) */
+            if (current_used_idx < last_used_idx) {
+                /* This is expected: we consumed faster than device produced
+                 * Just resync and exit - no packets available right now */
+                last_used_idx = current_used_idx;
+                return;
+            }
+
+            /* True desync - should never happen with proper memory barriers */
+            printf("%s: ⚠️ TRUE DESYNC: pending=%u exceeds ring_size=%u\n",
+                   COMPONENT_NAME, pending_packets, vq->num);
+            printf("%s:   last_used_idx=%u, current_used_idx=%u\n",
+                   COMPONENT_NAME, last_used_idx, current_used_idx);
+            last_used_idx = current_used_idx;
             return;
         }
 
@@ -880,6 +910,42 @@ static void process_rx_packets(void)
         printf("══════════════════════════════════════════════════════════\n\n");
         #endif /* DEBUG_PACKET_LOG */
 
+        #if DEBUG_PACKET_SUMMARY
+        /* Lightweight packet summary - just protocol and ports */
+        if (packet_len >= sizeof(struct ethhdr)) {
+            struct ethhdr *eth = (struct ethhdr *)packet_data;
+            uint16_t eth_proto = ntohs(eth->h_proto);
+
+            if (eth_proto == 0x0800 && packet_len >= sizeof(struct ethhdr) + sizeof(struct iphdr)) {
+                struct iphdr *ip = (struct iphdr *)(packet_data + sizeof(struct ethhdr));
+                uint32_t saddr = ntohl(ip->saddr);
+                uint32_t daddr = ntohl(ip->daddr);
+
+                if (ip->protocol == 6) {  /* TCP */
+                    size_t ip_hdr_len = (ip->ihl) * 4;
+                    if (packet_len >= sizeof(struct ethhdr) + ip_hdr_len + sizeof(struct tcphdr)) {
+                        struct tcphdr *tcp = (struct tcphdr *)(packet_data + sizeof(struct ethhdr) + ip_hdr_len);
+                        printf("📥 Net0 RX #%u: %u.%u.%u.%u:%u → %u.%u.%u.%u:%u TCP %s%s%s%s\n",
+                               packets_received,
+                               (saddr >> 24) & 0xFF, (saddr >> 16) & 0xFF, (saddr >> 8) & 0xFF, saddr & 0xFF, ntohs(tcp->source),
+                               (daddr >> 24) & 0xFF, (daddr >> 16) & 0xFF, (daddr >> 8) & 0xFF, daddr & 0xFF, ntohs(tcp->dest),
+                               tcp->syn ? "[SYN]" : "", tcp->ack ? "[ACK]" : "", tcp->fin ? "[FIN]" : "", tcp->rst ? "[RST]" : "");
+                    }
+                } else {
+                    printf("📥 Net0 RX #%u: %u.%u.%u.%u → %u.%u.%u.%u proto=%u (%ub)\n",
+                           packets_received,
+                           (saddr >> 24) & 0xFF, (saddr >> 16) & 0xFF, (saddr >> 8) & 0xFF, saddr & 0xFF,
+                           (daddr >> 24) & 0xFF, (daddr >> 16) & 0xFF, (daddr >> 8) & 0xFF, daddr & 0xFF,
+                           ip->protocol, packet_len);
+                }
+            } else if (eth_proto == 0x0806) {
+                printf("📥 Net0 RX #%u: ARP (%u bytes)\n", packets_received, packet_len);
+            } else {
+                printf("📥 Net0 RX #%u: EtherType=0x%04x (%u bytes)\n", packets_received, eth_proto, packet_len);
+            }
+        }
+        #endif /* DEBUG_PACKET_SUMMARY */
+
         #if DEBUG_MESSAGE_FLOW
         uint32_t msg_id = ++message_id_counter;
         printf("\n🔵 [MSG #%u] ═══ RX: Packet received from VirtIO device ═══\n", msg_id);
@@ -911,9 +977,9 @@ static void process_rx_packets(void)
                 pbuf_free(p);
             }
         } else {
-            #if DEBUG_MESSAGE_FLOW
-            printf("   ✗ Failed to allocate pbuf (out of memory)\n");
-            #endif
+            /* CRITICAL: pbuf allocation failed - this means lwIP is out of memory */
+            printf("%s: ⚠️  WARNING: Failed to allocate pbuf for packet #%u - dropping (lwIP out of memory)\n",
+                   COMPONENT_NAME, packets_received);
         }
 
         /* Mark buffer as free (buf_idx already defined above) */
@@ -921,6 +987,16 @@ static void process_rx_packets(void)
 
         /* Move to next packet */
         last_used_idx++;
+    }
+
+    /* Print pbuf pool statistics every 10 packets to monitor allocation/deallocation */
+    if (packets_received % 10 == 0 && packets_received > 0) {
+        printf("%s: 📊 PBUF Pool Stats - Used: %u/%u, Avail: %u, Peak: %u\n",
+               COMPONENT_NAME,
+               lwip_stats.memp[MEMP_PBUF_POOL]->used,
+               PBUF_POOL_SIZE,
+               lwip_stats.memp[MEMP_PBUF_POOL]->avail,
+               lwip_stats.memp[MEMP_PBUF_POOL]->max);
     }
 
     refill_rx_queue();
@@ -1510,9 +1586,22 @@ static int virtio_net_init(void)
 
     printf("\n");
 
+    /* CRITICAL: Check if CAmkES dataport is properly mapped */
+    if (virtio_mmio_regs == NULL) {
+        printf("%s: ❌ FATAL: virtio_mmio_regs dataport is NULL!\n", COMPONENT_NAME);
+        printf("%s:    CAmkES failed to map hardware component net0_hw\n", COMPONENT_NAME);
+        printf("%s:    Check ics_dual_nic.camkes configuration\n", COMPONENT_NAME);
+        return -1;
+    }
+
+    printf("%s: virtio_mmio_regs dataport mapped at %p\n", COMPONENT_NAME, (void *)virtio_mmio_regs);
+
     /* Access VirtIO device at SLOT 31 (offset 0xe00 from page base 0xa003000) */
     /* QEMU assigns FIRST -device virtio-net-device to slot 31 - matches vm_ethernet_echo */
     virtio_regs_base = (volatile uint32_t *)((uintptr_t)virtio_mmio_regs + 0xe00);
+
+    printf("%s: virtio_regs_base (slot 31) = %p (base + 0xe00)\n",
+           COMPONENT_NAME, (void *)virtio_regs_base);
 
     /* Verify we have the network device using pointer arithmetic */
     uint32_t magic = VREG_READ(VIRTIO_MMIO_MAGIC_VALUE);
@@ -1646,12 +1735,22 @@ static int virtio_net_init(void)
     printf("%s: DEBUG: QueueNumMax = %u\n", COMPONENT_NAME, VREG_READ(VIRTIO_MMIO_QUEUE_NUM_MAX));
     #endif
 
-    /* If QueueNumMax is 0, use a default value */
-    if (VREG_READ(VIRTIO_MMIO_QUEUE_NUM_MAX) == 0) {
+    /* Read and validate QueueNumMax from device register
+     * VirtIO spec: Max queue size is typically 1024 for network devices
+     */
+    uint32_t queue_num_max = VREG_READ(VIRTIO_MMIO_QUEUE_NUM_MAX);
+
+    if (queue_num_max == 0) {
         printf("%s: WARNING: QueueNumMax is 0, using default 256\n", COMPONENT_NAME);
         rx_virtq.num = 256;
+    } else if (queue_num_max > 1024) {
+        printf("%s: WARNING: QueueNumMax=%u exceeds VirtIO max (1024), capping to 1024\n",
+               COMPONENT_NAME, queue_num_max);
+        rx_virtq.num = 1024;
     } else {
-        rx_virtq.num = VREG_READ(VIRTIO_MMIO_QUEUE_NUM_MAX);
+        rx_virtq.num = queue_num_max;
+        printf("%s: RX Queue: QueueNumMax=%u (from device register)\n",
+               COMPONENT_NAME, queue_num_max);
     }
 
     #if DEBUG_VERBOSE
@@ -1713,11 +1812,20 @@ static int virtio_net_init(void)
     /* TX queue */
     VREG_WRITE(VIRTIO_MMIO_QUEUE_SEL, VIRTIO_NET_TX_QUEUE);
 
-    /* If QueueNumMax is 0, use default value */
-    if (VREG_READ(VIRTIO_MMIO_QUEUE_NUM_MAX) == 0) {
+    /* Read and validate QueueNumMax from device register */
+    queue_num_max = VREG_READ(VIRTIO_MMIO_QUEUE_NUM_MAX);
+
+    if (queue_num_max == 0) {
+        printf("%s: WARNING: TX QueueNumMax is 0, using default 256\n", COMPONENT_NAME);
         tx_virtq.num = 256;
+    } else if (queue_num_max > 1024) {
+        printf("%s: WARNING: TX QueueNumMax=%u exceeds VirtIO max (1024), capping to 1024\n",
+               COMPONENT_NAME, queue_num_max);
+        tx_virtq.num = 1024;
     } else {
-        tx_virtq.num = VREG_READ(VIRTIO_MMIO_QUEUE_NUM_MAX);
+        tx_virtq.num = queue_num_max;
+        printf("%s: TX Queue: QueueNumMax=%u (from device register)\n",
+               COMPONENT_NAME, queue_num_max);
     }
 
     /* Virtual addresses for driver access */
@@ -1802,8 +1910,6 @@ static int virtio_net_init(void)
 
     printf("%s:   ✅ MMIO writes work correctly!\n\n", COMPONENT_NAME);
 
-
-    /* ═══════════════════════════════════════════════════════════════════════
     return 0;
 }
 
@@ -1877,30 +1983,36 @@ void post_init(void)
     printf("%s: ✓ Initialization complete\n", COMPONENT_NAME);
     printf("%s: Network ready\n\n", COMPONENT_NAME);
 
+    /* Mark initialization as successful */
+    initialization_successful = true;
+
     printf("%s: post_init() complete - returning to allow pipeline to start\n", COMPONENT_NAME);
 }
+
 int run(void)
 {
-    /* Main event loop - process lwIP timers, RX packets, and ICS notifications */
-    /* Note: TCP server is now initialized in RX path after first packet */
-    while (1) {
-        /* Check for OUTBOUND notifications from ICS_Outbound (non-blocking) */
-        if (outbound_ready_poll()) {
-            outbound_ready_handle();
+    /* Validate initialization completed successfully */
+    if (!initialization_successful) {
+        printf("\n");
+        printf("╔══════════════════════════════════════════════════════════╗\n");
+        printf("║  ❌ FATAL: VirtIO_Net0_Driver initialization FAILED     ║\n");
+        printf("╚══════════════════════════════════════════════════════════╝\n");
+        printf("\n");
+        printf("%s: Initialization did not complete successfully\n", COMPONENT_NAME);
+        printf("%s: Common causes:\n", COMPONENT_NAME);
+        printf("%s:   - DMA memory pool exhausted (check MAX_PACKETS setting)\n", COMPONENT_NAME);
+        printf("%s:   - VirtIO device not found or misconfigured\n", COMPONENT_NAME);
+        printf("%s:   - Network interface setup failed\n", COMPONENT_NAME);
+        printf("\n");
+        printf("%s: SYSTEM HALTED - cannot continue without working network driver\n", COMPONENT_NAME);
+        printf("\n");
+        while (1) {
+            seL4_Yield();  /* Halt forever */
         }
-
-        /* Process lwIP timers and RX packets */
-        sys_check_timeouts();
-        process_rx_packets();
-
-        seL4_Yield();
     }
 
-    return 0;
-}
+    printf("%s: ✅ Initialization validation passed - starting main loop\n", COMPONENT_NAME);
 
-int run(void)
-{
     /* Main event loop - process lwIP timers, RX packets, and ICS notifications */
     /* Note: TCP server is now initialized in RX path after first packet */
     while (1) {

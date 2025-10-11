@@ -1,20 +1,20 @@
 /*
  * VirtIO_Net1_Driver - Internal Network (Bidirectional)
  *
- * This component manages the internal network interface with bidirectional
+ * This component manages the external network interface with bidirectional
  * data flow and protocol break architecture.
  *
  * Architecture:
  * - VirtIO-net device driver for packet RX/TX
  * - lwIP TCP/IP stack for network protocol handling
  * - DHCP client to obtain IP address from QEMU
- * - TCP server on port 7000 for OUTBOUND connections
- * - TCP client for INBOUND connections
+ * - TCP server on port 6000 for INBOUND connections
+ * - TCP client for OUTBOUND connections
  * - Frame header parsing to extract FrameMetadata
  *
  * Data Flow:
- *   INBOUND:  ICS_Inbound => create TCP packet => lwIP => Internal
- *   OUTBOUND: Internal TCP:7000 => lwIP => extract metadata+payload => ICS_Outbound
+ *   INBOUND:  Internal TCP:6000 => lwIP => extract metadata+payload => ICS_Inbound
+ *   OUTBOUND: ICS_Outbound => create TCP packet => lwIP => Internal
  */
 
 #include <camkes.h>
@@ -30,33 +30,54 @@
 /* lwIP headers */
 #include "lwip/init.h"
 #include "lwip/netif.h"
+#include "lwip/pbuf.h"
 #include "lwip/dhcp.h"
 #include "lwip/tcp.h"
+#include "lwip/udp.h"
 #include "lwip/timeouts.h"
 #include "lwip/etharp.h"
 #include "lwip/stats.h"
+#include "lwip/inet_chksum.h"
+#include "lwip/prot/tcp.h"
+#include "lwip/prot/udp.h"
+#include "lwip/prot/ip.h"
 #include "netif/ethernet.h"
 
 /* ICS common definitions */
 #include "common.h"
 
 #define COMPONENT_NAME "VirtIO_Net1_Driver"
-#define TCP_SERVER_PORT 502  /* OUTBOUND: Modbus port - pretends to be SCADA */
+#define TCP_SERVER_PORT 502  /* INBOUND: Modbus port - pretends to be PLC */
+
+/* Connection tracking for metadata preservation */
+#define MAX_CONNECTIONS 64
+
+struct connection_metadata {
+    struct tcp_pcb *pcb;           /* lwIP connection pointer (key) */
+    uint32_t original_src_ip;      /* Original source IP (e.g., 192.168.90.5 SCADA) */
+    uint32_t original_dest_ip;     /* Original destination IP (e.g., 192.168.95.2 PLC) */
+    uint16_t src_port;             /* Source port */
+    uint16_t dest_port;            /* Destination port */
+    bool active;                   /* Is this slot in use? */
+};
+
+static struct connection_metadata connection_table[MAX_CONNECTIONS];
+static int connection_count = 0;
 
 /*
  * VLAN-BASED DEPLOYMENT CONFIGURATION
  *
- * Net1 uses PRIVATE network (10.3.0.0/24) connected to tap1
- * - Listens on 10.3.0.2:502
- * - Receives traffic from eth1 (192.168.90.1) via iptables DNAT
- * - Forwards validated traffic to Net0 (10.2.0.2)
+ * Net1 uses PRIVATE network (10.2.0.0/24) connected to tap0
+ * - Listens on 10.2.0.2:502
+ * - Receives traffic from eth0 (192.168.95.2) via iptables DNAT
+ * - Forwards validated traffic to Net1 (10.3.0.2)
  *
  * Host iptables translates:
- *   eth1 (192.168.90.1:502) ←→ tap1 (10.3.0.2:502)
+ *   eth0 (192.168.95.2:502) ←→ tap0 (10.2.0.2:502)
  */
-#define INBOUND_FORWARD_IP "10.2.0.2"         /* Forward to Net0 (private network) */
-#define INBOUND_FORWARD_PORT 502               /* Modbus TCP port */
-#define OUTBOUND_FORWARD_PORT 502              /* Unused - Net0 handles outbound */
+#define OUTBOUND_FORWARD_IP "10.3.0.2"        /* Forward to Net1 (private network) */
+#define OUTBOUND_FORWARD_PORT 502              /* Modbus TCP port */
+#define INBOUND_FORWARD_PORT 502               /* Unused - Net1 handles inbound */
 
 /*
  * DEBUG CONFIGURATION
@@ -68,6 +89,18 @@
 #define DEBUG_MESSAGE_FLOW 1      /* Track message flow through RX→ICS→TX pipeline */
 #define ENABLE_GDB_WAIT 0         /* Enable 60-second GDB wait during init */
 #define ENABLE_PAINT_TEST 0       /* Enable virtqueue memory paint test */
+
+/*
+ * PROTOCOL FILTER CONFIGURATION
+ * Control which protocols to show in debug output
+ * Set to 1 to SHOW protocol, 0 to HIDE protocol
+ */
+#define FILTER_SHOW_ARP 0         /* Show ARP packets (0x0806) */
+#define FILTER_SHOW_IPV6 0        /* Show IPv6 packets (0x86dd) */
+#define FILTER_SHOW_TCP 1         /* Show TCP packets */
+#define FILTER_SHOW_UDP 1         /* Show UDP packets */
+#define FILTER_SHOW_ICMP 1        /* Show ICMP packets */
+#define FILTER_SHOW_OTHER 1       /* Show all other protocols */
 
 /* VirtIO MMIO Register Offsets */
 #define VIRTIO_MMIO_MAGIC_VALUE         0x000
@@ -176,7 +209,7 @@ typedef struct virtio_net_hdr {
 
 /* Packet buffer configuration */
 #define PACKET_BUFFER_SIZE              2048
-#define MAX_PACKETS                     32     /* Match Net0 - DMA pool can't handle 256 */
+#define MAX_PACKETS                     32
 
 /*
  * VirtIO MMIO Register Structure
@@ -407,6 +440,8 @@ static err_t netif_output(struct netif *netif, struct pbuf *p);
 static err_t custom_netif_init(struct netif *netif);
 static void netif_status_callback(struct netif *netif);
 static void setup_tcp_echo_server(void);
+static inline uint16_t ip_fast_csum(const void *iph, unsigned int ihl);
+static uint16_t tcp_checksum(struct iphdr *ip, struct tcphdr *tcp, uint16_t tcp_len);
 
 /*
  * Get free RX buffer index
@@ -429,18 +464,20 @@ static void refill_rx_queue(void)
 {
     struct virtq *vq = &rx_virtq;
     static bool first_call = true;
+    static uint32_t refill_call_count = 0;
     int buffers_added = 0;
 
-    /* Debug: count how many buffers are marked as used */
-    if (first_call) {
-        int used_count = 0;
-        for (int i = 0; i < MAX_PACKETS; i++) {
-            if (rx_buffer_used[i]) used_count++;
-        }
-        printf("%s: refill_rx_queue: %d/%d buffers marked as used\n",
-               COMPONENT_NAME, used_count, MAX_PACKETS);
-        printf("%s: refill_rx_queue: vq->num=%u (virtqueue size)\n",
-               COMPONENT_NAME, vq->num);
+    refill_call_count++;
+
+    /* Debug: count how many buffers are free (available for refill) */
+    int free_count = 0;
+    for (int i = 0; i < MAX_PACKETS; i++) {
+        if (!rx_buffer_used[i]) free_count++;
+    }
+
+    if (first_call || free_count > 0) {
+        printf("%s: refill_rx_queue() call #%u: %d/%d buffers free (available to refill)\n",
+               COMPONENT_NAME, refill_call_count, free_count, MAX_PACKETS);
         first_call = false;
     }
 
@@ -471,12 +508,14 @@ static void refill_rx_queue(void)
         buffers_added++;
     }
 
-    printf("%s: Refilled RX queue with %d buffers (avail_idx now=%u)\n",
-           COMPONENT_NAME, buffers_added, vq->avail->idx);
-
-    /* Notify device of new buffers */
     if (buffers_added > 0) {
+        printf("%s: ✅ Refilled RX queue with %d buffers (avail_idx now=%u)\n",
+               COMPONENT_NAME, buffers_added, vq->avail->idx);
+        /* Notify device of new buffers */
         VREG_WRITE(VIRTIO_MMIO_QUEUE_NOTIFY, VIRTIO_NET_RX_QUEUE);
+    } else if (free_count > 0) {
+        printf("%s: ⚠️  WARNING: %d buffers were free but refill added 0! (avail_idx=%u)\n",
+               COMPONENT_NAME, free_count, vq->avail->idx);
     }
 }
 
@@ -522,6 +561,91 @@ static err_t netif_output(struct netif *netif, struct pbuf *p)
         printf("%s: Failed to copy pbuf: %u/%u bytes\n",
                COMPONENT_NAME, copied, p->tot_len);
         return ERR_BUF;
+    }
+
+    /*
+     * CRITICAL: Restore original IPs for protocol-break architecture
+     *
+     * lwIP generated response with interface IP as source (192.168.95.1)
+     * But SCADA expects response from PLC IP (192.168.95.2)
+     * Restore: 192.168.95.1 → 192.168.95.2 (source IP)
+     * Keep: 192.168.90.5 (destination IP to SCADA)
+     */
+    uint8_t *tx_data = packet_buffers[tx_buf_idx];
+    if (p->tot_len >= sizeof(struct ethhdr) + sizeof(struct iphdr)) {
+        struct ethhdr *eth = (struct ethhdr *)tx_data;
+        if (ntohs(eth->h_proto) == 0x0800) {  /* IPv4 */
+            struct iphdr *ip = (struct iphdr *)(tx_data + sizeof(struct ethhdr));
+
+            if (ip->protocol == 6) {  /* TCP */
+                /* Extract current IPs and ports */
+                uint32_t current_src = ntohl(ip->saddr);  /* 192.168.95.1 from lwIP */
+                uint32_t current_dest = ntohl(ip->daddr); /* 192.168.90.5 to SCADA */
+
+                size_t ip_hdr_len = (ip->ihl) * 4;
+                if (p->tot_len >= sizeof(struct ethhdr) + ip_hdr_len + sizeof(struct tcphdr)) {
+                    struct tcphdr *tcp = (struct tcphdr *)(tx_data + sizeof(struct ethhdr) + ip_hdr_len);
+                    uint16_t src_port = ntohs(tcp->source);  /* 502 */
+                    uint16_t dest_port = ntohs(tcp->dest);   /* SCADA's port */
+
+                    /* Lookup original metadata by destination (SCADA) port */
+                    struct connection_metadata *meta = NULL;
+                    for (int i = 0; i < MAX_CONNECTIONS; i++) {
+                        /* Defensive check: ensure index is valid */
+                        if (i >= MAX_CONNECTIONS) {
+                            printf("%s: ⚠️  TX: Invalid connection table index %d\n", COMPONENT_NAME, i);
+                            break;
+                        }
+
+                        if (connection_table[i].active &&
+                            connection_table[i].dest_port == src_port &&  /* Our port 502 */
+                            connection_table[i].src_port == dest_port) {  /* SCADA's port */
+                            meta = &connection_table[i];
+                            break;
+                        }
+                    }
+
+                    if (meta != NULL && meta->active) {
+                        /* Double-check metadata is valid before using */
+                        if (meta->original_dest_ip == 0) {
+                            printf("%s: ⚠️  TX: Invalid metadata - original_dest_ip is 0\n", COMPONENT_NAME);
+                        } else {
+                            /* Restore original destination IP (PLC IP) as source */
+                            ip->saddr = htonl(meta->original_dest_ip);  /* 192.168.95.2 */
+
+                            printf("%s: 🔄 TX: Restored source IP: %u.%u.%u.%u → %u.%u.%u.%u\n",
+                                   COMPONENT_NAME,
+                                   (current_src >> 24) & 0xFF, (current_src >> 16) & 0xFF,
+                                   (current_src >> 8) & 0xFF, current_src & 0xFF,
+                                   (meta->original_dest_ip >> 24) & 0xFF, (meta->original_dest_ip >> 16) & 0xFF,
+                                   (meta->original_dest_ip >> 8) & 0xFF, meta->original_dest_ip & 0xFF);
+
+                            /* Recalculate IP checksum using lwIP's inet_chksum */
+                            uint16_t old_ip_check = ip->check;
+                            ip->check = 0;
+                            uint16_t new_ip_check = inet_chksum(ip, ip->ihl * 4);
+                            ip->check = new_ip_check;
+
+                            printf("%s: 🔧 TX: IP checksum: 0x%04x → 0x%04x\n",
+                                   COMPONENT_NAME, ntohs(old_ip_check), ntohs(new_ip_check));
+
+                            /* Recalculate TCP checksum with pseudo-header */
+                            uint16_t old_tcp_check = tcp->check;
+                            tcp->check = 0;
+                            uint16_t tcp_len = ntohs(ip->tot_len) - (ip->ihl * 4);
+                            uint16_t new_tcp_check = tcp_checksum(ip, tcp, tcp_len);
+                            tcp->check = new_tcp_check;
+
+                            printf("%s: 🔧 TX: TCP checksum: 0x%04x → 0x%04x\n",
+                                   COMPONENT_NAME, ntohs(old_tcp_check), ntohs(new_tcp_check));
+                        }
+                    } else {
+                        printf("%s: ⚠️  TX: No metadata found for TCP port %u → %u\n",
+                               COMPONENT_NAME, src_port, dest_port);
+                    }
+                }
+            }
+        }
     }
 
     /* Detailed TX packet inspection for first 10 packets */
@@ -642,6 +766,276 @@ static err_t netif_output(struct netif *netif, struct pbuf *p)
 }
 
 /*
+ * ═══════════════════════════════════════════════════════════════
+ * HELPER FUNCTIONS
+ * ═══════════════════════════════════════════════════════════════
+ */
+
+/* Fast IP checksum calculation */
+static inline uint16_t ip_fast_csum(const void *iph, unsigned int ihl)
+{
+    const uint16_t *ptr = (const uint16_t *)iph;
+    uint32_t sum = 0;
+
+    while (ihl > 1) {
+        sum += *ptr++;
+        if (sum & 0x80000000)
+            sum = (sum & 0xFFFF) + (sum >> 16);
+        ihl -= 2;
+    }
+
+    if (ihl > 0)
+        sum += *(uint8_t *)ptr;
+
+    while (sum >> 16)
+        sum = (sum & 0xFFFF) + (sum >> 16);
+
+    return (uint16_t)~sum;
+}
+
+/* TCP checksum calculation with pseudo-header */
+static uint16_t tcp_checksum(struct iphdr *ip, struct tcphdr *tcp, uint16_t tcp_len)
+{
+    uint32_t sum = 0;
+    uint16_t *ptr;
+    int i;
+
+    /* Pseudo-header (source IP) */
+    sum += (ip->saddr >> 16) & 0xFFFF;
+    sum += ip->saddr & 0xFFFF;
+
+    /* Pseudo-header (dest IP) */
+    sum += (ip->daddr >> 16) & 0xFFFF;
+    sum += ip->daddr & 0xFFFF;
+
+    /* Pseudo-header (protocol and TCP length) */
+    sum += htons(IP_PROTO_TCP);
+    sum += htons(tcp_len);
+
+    /* TCP header and data */
+    ptr = (uint16_t *)tcp;
+    for (i = 0; i < tcp_len / 2; i++) {
+        sum += ptr[i];
+    }
+
+    /* Handle odd byte */
+    if (tcp_len & 1) {
+        sum += ((uint8_t *)tcp)[tcp_len - 1];
+    }
+
+    /* Fold 32-bit sum to 16 bits */
+    while (sum >> 16) {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+
+    return (uint16_t)~sum;
+}
+
+/*
+ * ═══════════════════════════════════════════════════════════════
+ * CONNECTION TRACKING FOR METADATA PRESERVATION
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * Problem: ICS validation needs original source/dest IPs
+ * - Packets arrive: 192.168.90.5 (SCADA) → 192.168.95.2 (PLC)
+ * - We rewrite: 192.168.90.5 → 192.168.95.1 (for lwIP acceptance)
+ * - ICS pipeline needs to know original dest was 192.168.95.2
+ * - TCP responses must restore: 192.168.95.2 → 192.168.90.5
+ *
+ * Solution: Connection tracking table
+ * - Store original IPs when packet arrives
+ * - Link to TCP PCB when connection established
+ * - Lookup metadata when sending responses
+ * - Restore original IPs before transmission
+ */
+
+/* Store metadata for a new connection */
+static struct connection_metadata* connection_add(uint32_t orig_src, uint32_t orig_dest,
+                                                   uint16_t sport, uint16_t dport)
+{
+    for (int i = 0; i < MAX_CONNECTIONS; i++) {
+        if (!connection_table[i].active) {
+            connection_table[i].active = true;
+            connection_table[i].pcb = NULL;  /* Will be set when TCP accept happens */
+            connection_table[i].original_src_ip = orig_src;
+            connection_table[i].original_dest_ip = orig_dest;
+            connection_table[i].src_port = sport;
+            connection_table[i].dest_port = dport;
+            connection_count++;
+
+            printf("%s: 📝 Stored metadata [%d]: %u.%u.%u.%u:%u → %u.%u.%u.%u:%u\n",
+                   COMPONENT_NAME, i,
+                   (orig_src >> 24) & 0xFF, (orig_src >> 16) & 0xFF,
+                   (orig_src >> 8) & 0xFF, orig_src & 0xFF, sport,
+                   (orig_dest >> 24) & 0xFF, (orig_dest >> 16) & 0xFF,
+                   (orig_dest >> 8) & 0xFF, orig_dest & 0xFF, dport);
+
+            return &connection_table[i];
+        }
+    }
+    printf("%s: ⚠️  Connection table full! Dropping metadata.\n", COMPONENT_NAME);
+    return NULL;
+}
+
+/* Link PCB to existing metadata entry */
+static void connection_link_pcb(struct tcp_pcb *pcb, uint16_t sport, uint16_t dport)
+{
+    for (int i = 0; i < MAX_CONNECTIONS; i++) {
+        if (connection_table[i].active &&
+            connection_table[i].src_port == sport &&
+            connection_table[i].dest_port == dport &&
+            connection_table[i].pcb == NULL) {
+            connection_table[i].pcb = pcb;
+            printf("%s: 🔗 Linked PCB to metadata [%d]\n", COMPONENT_NAME, i);
+            return;
+        }
+    }
+    printf("%s: ⚠️  No metadata found for %u → %u\n", COMPONENT_NAME, sport, dport);
+}
+
+/* Lookup metadata by PCB */
+static struct connection_metadata* connection_lookup_by_pcb(struct tcp_pcb *pcb)
+{
+    for (int i = 0; i < MAX_CONNECTIONS; i++) {
+        if (connection_table[i].active && connection_table[i].pcb == pcb) {
+            return &connection_table[i];
+        }
+    }
+    return NULL;
+}
+
+/* Lookup metadata by 5-tuple (for SYN packets before PCB exists) */
+static struct connection_metadata* connection_lookup_by_tuple(uint32_t src_ip, uint32_t dest_ip,
+                                                               uint16_t sport, uint16_t dport)
+{
+    for (int i = 0; i < MAX_CONNECTIONS; i++) {
+        if (connection_table[i].active &&
+            connection_table[i].original_src_ip == src_ip &&
+            connection_table[i].src_port == sport &&
+            connection_table[i].dest_port == dport) {
+            return &connection_table[i];
+        }
+    }
+    return NULL;
+}
+
+/* Remove connection metadata */
+static void connection_remove(struct tcp_pcb *pcb)
+{
+    for (int i = 0; i < MAX_CONNECTIONS; i++) {
+        if (connection_table[i].active && connection_table[i].pcb == pcb) {
+            printf("%s: 🗑️  Removing metadata [%d]\n", COMPONENT_NAME, i);
+            connection_table[i].active = false;
+            connection_table[i].pcb = NULL;
+            connection_count--;
+            return;
+        }
+    }
+}
+
+/*
+ * Custom input function for protocol-break architecture WITH metadata preservation
+ *
+ * CRITICAL: Packets arrive with dest IP = 192.168.95.2 (PLC) but interface IP = 192.168.95.1
+ * lwIP's ip_input() rejects packets not destined for interface IP
+ *
+ * Solution:
+ * 1. Store original src/dest IPs in connection table
+ * 2. Rewrite destination IP to match interface IP
+ * 3. Pass to lwIP for processing
+ * 4. Later restore original IPs when sending responses
+ */
+static err_t custom_input_promiscuous(struct pbuf *p, struct netif *inp)
+{
+    struct eth_hdr *ethhdr;
+    u16_t type;
+
+    /* Check Ethernet header */
+    if (p->len < sizeof(struct eth_hdr)) {
+        return ERR_ARG;
+    }
+
+    ethhdr = (struct eth_hdr *)p->payload;
+    type = ntohs(ethhdr->type);
+
+    /* Handle ARP packets normally - pass to lwIP's ARP handler */
+    if (type == ETHTYPE_ARP) {
+        /* Remove Ethernet header and pass to ethernet_input for ARP processing */
+        if (pbuf_remove_header(p, sizeof(struct eth_hdr)) == 0) {
+            etharp_input(p, inp);
+            return ERR_OK;
+        }
+        return ERR_ARG;
+    }
+
+    /* Handle IPv6 - pass to ethernet_input */
+    if (type == ETHTYPE_IPV6) {
+        return ethernet_input(p, inp);
+    }
+
+    /* Handle IPv4 with IP rewriting for protocol-break */
+    if (type == ETHTYPE_IP) {
+        /* Remove Ethernet header first */
+        if (pbuf_remove_header(p, sizeof(struct eth_hdr)) != 0) {
+            return ERR_ARG;
+        }
+
+        /* Check if this is an IPv4 packet */
+        if (p->len >= 20) {  /* Minimum IPv4 header size */
+            struct ip_hdr *iphdr = (struct ip_hdr *)p->payload;
+
+            /* Extract source and destination IPs */
+            uint32_t pkt_src_ip = ntohl(iphdr->src.addr);
+            uint32_t pkt_dest_ip = ntohl(iphdr->dest.addr);
+            uint32_t interface_ip = ntohl(inp->ip_addr.addr);
+
+            /* Extract ports if this is TCP */
+            uint16_t src_port = 0, dest_port = 0;
+            if (IPH_PROTO(iphdr) == IP_PROTO_TCP && p->len >= 20 + 20) {  /* IP + TCP headers */
+                struct tcp_hdr *tcphdr = (struct tcp_hdr *)((uint8_t *)iphdr + (IPH_HL(iphdr) * 4));
+                src_port = ntohs(tcphdr->src);
+                dest_port = ntohs(tcphdr->dest);
+            }
+
+            /* If packet is not destined for our interface IP, rewrite it */
+            if (pkt_dest_ip != interface_ip) {
+                printf("%s: 🔄 Rewriting dest IP: %u.%u.%u.%u → %u.%u.%u.%u\n",
+                       COMPONENT_NAME,
+                       (pkt_dest_ip >> 24) & 0xFF, (pkt_dest_ip >> 16) & 0xFF,
+                       (pkt_dest_ip >> 8) & 0xFF, pkt_dest_ip & 0xFF,
+                       (interface_ip >> 24) & 0xFF, (interface_ip >> 16) & 0xFF,
+                       (interface_ip >> 8) & 0xFF, interface_ip & 0xFF);
+
+                /* CRITICAL: Store original IPs BEFORE rewriting */
+                if (IPH_PROTO(iphdr) == IP_PROTO_TCP && src_port != 0 && dest_port != 0) {
+                    /* Check if we already have metadata for this connection */
+                    struct connection_metadata *meta = connection_lookup_by_tuple(
+                        pkt_src_ip, pkt_dest_ip, src_port, dest_port);
+
+                    if (!meta) {
+                        /* New connection - store metadata */
+                        connection_add(pkt_src_ip, pkt_dest_ip, src_port, dest_port);
+                    }
+                }
+
+                /* Rewrite destination IP to interface IP */
+                iphdr->dest.addr = inp->ip_addr.addr;
+
+                /* Recalculate IP checksum */
+                iphdr->_chksum = 0;
+                iphdr->_chksum = inet_chksum(iphdr, IPH_HL(iphdr) * 4);
+            }
+        }
+
+        return ip_input(p, inp);
+    }
+
+    /* Unknown protocol - drop */
+    pbuf_free(p);
+    return ERR_OK;
+}
+
+/*
  * Network interface initialization (called by lwIP)
  */
 static err_t custom_netif_init(struct netif *netif)
@@ -736,9 +1130,9 @@ static void process_rx_packets(void)
          */
         uint16_t pending_packets = (uint16_t)(current_used_idx - last_used_idx);
 
-        /* Exit early if no packets */
         if (pending_packets == 0) {
-            return;  /* No more packets to process */
+            /* No more packets - exit IRQ handler and let timer handle refill */
+            return;
         }
 
         /* SAFETY: Detect impossible wraparound scenarios and desynchronization
@@ -746,9 +1140,23 @@ static void process_rx_packets(void)
          * Check 1: VirtIO ring can hold at most vq->num entries.
          *          If pending_packets > vq->num, it's IMPOSSIBLE - indicates desync!
          *
-         * Check 2: Handle the case where last_used_idx advances ahead of device's
-         *          used_idx update (we consumed faster than device produced).
-         *          This causes wraparound: (uint16_t)(current - last) becomes 65535, etc.
+         * Example desync: last_used_idx=2034, current_used_idx=15, vq->num=256
+         *   -> pending = (uint16_t)(15 - 2034) = 63517
+         *   -> 63517 > 256 = DESYNC DETECTED!
+         *
+         * Check 2: VirtIO spec max queue size is 1024 (validated at init).
+         *          If last_used_idx is absurdly large, it's corrupted state.
+         *
+         * Why vq->num and not arbitrary 1000?
+         *   - vq->num is read from VIRTIO_MMIO_QUEUE_NUM_MAX register
+         *   - It's the actual PHYSICAL LIMIT of the device
+         *   - Theoretically sound: pending > ring_size is mathematically impossible
+         */
+        /* CRITICAL FIX: This is NOT desync - it's normal when last_used_idx advances
+         * ahead of device's used_idx update. The device might not have written new
+         * packets yet, so last_used_idx (our consumption counter) > current_used_idx
+         * (device production counter) causes wraparound: (uint16_t)(current - last)
+         * becomes 65535, 65534, etc.
          *
          * Real desync: pending > vq->num (ring physically can't hold that many)
          * False alarm: last_used_idx caught up to device, no new packets available
@@ -759,6 +1167,7 @@ static void process_rx_packets(void)
                 /* This is expected: we consumed faster than device produced
                  * Just resync and exit - no packets available right now */
                 last_used_idx = current_used_idx;
+                /* Don't refill here - let timer handle it to avoid IRQ storm */
                 return;
             }
 
@@ -768,6 +1177,7 @@ static void process_rx_packets(void)
             printf("%s:   last_used_idx=%u, current_used_idx=%u\n",
                    COMPONENT_NAME, last_used_idx, current_used_idx);
             last_used_idx = current_used_idx;
+            /* Don't refill here - let timer handle it to avoid IRQ storm */
             return;
         }
 
@@ -785,6 +1195,7 @@ static void process_rx_packets(void)
             printf("%s:   last_used_idx=%u, current_used_idx=%u, pending=%u\n",
                    COMPONENT_NAME, last_used_idx, current_used_idx,
                    (uint16_t)(current_used_idx - last_used_idx));
+            /* Don't refill here - let timer handle it to avoid IRQ storm */
             break;
         }
 
@@ -898,7 +1309,10 @@ static void process_rx_packets(void)
         #endif /* DEBUG_PACKET_LOG */
 
         #if DEBUG_PACKET_SUMMARY
-        /* Lightweight packet summary - just protocol and ports */
+        /* Lightweight packet summary - just protocol and ports (with filtering) */
+        bool show_packet = false;
+        uint8_t packet_protocol = 0;  /* 0=other, 6=TCP, 17=UDP, 1=ICMP */
+
         if (packet_len >= sizeof(struct ethhdr)) {
             struct ethhdr *eth = (struct ethhdr *)packet_data;
             uint16_t eth_proto = ntohs(eth->h_proto);
@@ -907,8 +1321,11 @@ static void process_rx_packets(void)
                 struct iphdr *ip = (struct iphdr *)(packet_data + sizeof(struct ethhdr));
                 uint32_t saddr = ntohl(ip->saddr);
                 uint32_t daddr = ntohl(ip->daddr);
+                packet_protocol = ip->protocol;
 
                 if (ip->protocol == 6) {  /* TCP */
+                    #if FILTER_SHOW_TCP
+                    show_packet = true;
                     size_t ip_hdr_len = (ip->ihl) * 4;
                     if (packet_len >= sizeof(struct ethhdr) + ip_hdr_len + sizeof(struct tcphdr)) {
                         struct tcphdr *tcp = (struct tcphdr *)(packet_data + sizeof(struct ethhdr) + ip_hdr_len);
@@ -918,26 +1335,66 @@ static void process_rx_packets(void)
                                (daddr >> 24) & 0xFF, (daddr >> 16) & 0xFF, (daddr >> 8) & 0xFF, daddr & 0xFF, ntohs(tcp->dest),
                                tcp->syn ? "[SYN]" : "", tcp->ack ? "[ACK]" : "", tcp->fin ? "[FIN]" : "", tcp->rst ? "[RST]" : "");
                     }
+                    #endif
+                } else if (ip->protocol == 17) {  /* UDP */
+                    #if FILTER_SHOW_UDP
+                    show_packet = true;
+                    printf("📥 Net1 RX #%u: %u.%u.%u.%u → %u.%u.%u.%u UDP (%ub)\n",
+                           packets_received,
+                           (saddr >> 24) & 0xFF, (saddr >> 16) & 0xFF, (saddr >> 8) & 0xFF, saddr & 0xFF,
+                           (daddr >> 24) & 0xFF, (daddr >> 16) & 0xFF, (daddr >> 8) & 0xFF, daddr & 0xFF,
+                           packet_len);
+                    #endif
+                } else if (ip->protocol == 1) {  /* ICMP */
+                    #if FILTER_SHOW_ICMP
+                    show_packet = true;
+                    printf("📥 Net1 RX #%u: %u.%u.%u.%u → %u.%u.%u.%u ICMP (%ub)\n",
+                           packets_received,
+                           (saddr >> 24) & 0xFF, (saddr >> 16) & 0xFF, (saddr >> 8) & 0xFF, saddr & 0xFF,
+                           (daddr >> 24) & 0xFF, (daddr >> 16) & 0xFF, (daddr >> 8) & 0xFF, daddr & 0xFF,
+                           packet_len);
+                    #endif
                 } else {
+                    #if FILTER_SHOW_OTHER
+                    show_packet = true;
                     printf("📥 Net1 RX #%u: %u.%u.%u.%u → %u.%u.%u.%u proto=%u (%ub)\n",
                            packets_received,
                            (saddr >> 24) & 0xFF, (saddr >> 16) & 0xFF, (saddr >> 8) & 0xFF, saddr & 0xFF,
                            (daddr >> 24) & 0xFF, (daddr >> 16) & 0xFF, (daddr >> 8) & 0xFF, daddr & 0xFF,
                            ip->protocol, packet_len);
+                    #endif
                 }
-            } else if (eth_proto == 0x0806) {
+            } else if (eth_proto == 0x0806) {  /* ARP */
+                #if FILTER_SHOW_ARP
+                show_packet = true;
                 printf("📥 Net1 RX #%u: ARP (%u bytes)\n", packets_received, packet_len);
+                #endif
+            } else if (eth_proto == 0x86dd) {  /* IPv6 */
+                #if FILTER_SHOW_IPV6
+                show_packet = true;
+                printf("📥 Net1 RX #%u: IPv6 (%u bytes)\n", packets_received, packet_len);
+                #endif
             } else {
+                #if FILTER_SHOW_OTHER
+                show_packet = true;
                 printf("📥 Net1 RX #%u: EtherType=0x%04x (%u bytes)\n", packets_received, eth_proto, packet_len);
+                #endif
             }
         }
         #endif /* DEBUG_PACKET_SUMMARY */
 
         #if DEBUG_MESSAGE_FLOW
-        uint32_t msg_id = ++message_id_counter;
-        printf("\n🔵 [MSG #%u] ═══ RX: Packet received from VirtIO device ═══\n", msg_id);
-        printf("   Size: %u bytes, Buffer index: %d\n", packet_len, buf_idx);
-        printf("   Action: Feeding to lwIP stack for processing\n");
+        /* Only show message flow for filtered packets */
+        #if DEBUG_PACKET_SUMMARY
+        if (show_packet) {
+        #endif
+            uint32_t msg_id = ++message_id_counter;
+            printf("\n🔵 [MSG #%u] ═══ RX: Packet received from VirtIO device ═══\n", msg_id);
+            printf("   Size: %u bytes, Buffer index: %d\n", packet_len, buf_idx);
+            printf("   Action: Feeding to lwIP stack for processing\n");
+        #if DEBUG_PACKET_SUMMARY
+        }
+        #endif
         #endif
 
         /* Allocate pbuf and copy packet data (skipping header) */
@@ -945,20 +1402,50 @@ static void process_rx_packets(void)
         if (p != NULL) {
             pbuf_take(p, packet_data, packet_len);
 
-            #if DEBUG_MESSAGE_FLOW
-            printf("   ✓ pbuf allocated, passing to lwIP input handler\n");
+            #if DEBUG_MESSAGE_FLOW && DEBUG_PACKET_SUMMARY
+            if (show_packet) {
+                printf("   ✓ pbuf allocated, passing to lwIP input handler\n");
+            }
             #endif
 
             /* Feed packet to lwIP */
             err_t lwip_result = netif_data.input(p, &netif_data);
 
-            #if DEBUG_MESSAGE_FLOW
-            if (lwip_result == ERR_OK) {
-                printf("   ✓ lwIP accepted packet (will route to TCP/UDP/etc.)\n");
-            } else {
-                printf("   ✗ lwIP rejected packet (err=%d)\n", lwip_result);
+            #if DEBUG_MESSAGE_FLOW && DEBUG_PACKET_SUMMARY
+            if (show_packet) {
+                if (lwip_result == ERR_OK) {
+                    printf("   ✓ lwIP accepted packet (will route to TCP/UDP/etc.)\n");
+                } else {
+                    printf("   ✗ lwIP rejected packet (err=%d)\n", lwip_result);
+                }
             }
             #endif
+
+            /* CRITICAL DIAGNOSTIC: Log TCP SYN packets to diagnose connection acceptance */
+            if (packet_len >= sizeof(struct ethhdr)) {
+                struct ethhdr *eth = (struct ethhdr *)packet_data;
+                uint16_t eth_proto_check = ntohs(eth->h_proto);
+
+                if (eth_proto_check == 0x0800 && packet_len >= sizeof(struct ethhdr) + sizeof(struct iphdr)) {  /* IPv4 */
+                    struct iphdr *ip = (struct iphdr *)(packet_data + sizeof(struct ethhdr));
+                    if (ip->protocol == 6) {  /* TCP */
+                        size_t ip_hdr_len = (ip->ihl) * 4;
+                        if (packet_len >= sizeof(struct ethhdr) + ip_hdr_len + sizeof(struct tcphdr)) {
+                            struct tcphdr *tcp = (struct tcphdr *)(packet_data + sizeof(struct ethhdr) + ip_hdr_len);
+                            uint32_t daddr = ntohl(ip->daddr);
+
+                            if (tcp->syn && !tcp->ack) {
+                                /* This is a SYN packet (connection attempt) */
+                                printf("%s: 🔍 SYN packet detected: Dest IP = %u.%u.%u.%u:%u (Interface IP = 192.168.95.2)\n",
+                                       COMPONENT_NAME,
+                                       (daddr >> 24) & 0xFF, (daddr >> 16) & 0xFF, (daddr >> 8) & 0xFF, daddr & 0xFF,
+                                       ntohs(tcp->dest));
+                                printf("%s:    → If dest IP matches interface IP, lwIP should accept. Otherwise it rejects.\n", COMPONENT_NAME);
+                            }
+                        }
+                    }
+                }
+            }
 
             if (lwip_result != ERR_OK) {
                 pbuf_free(p);
@@ -1047,7 +1534,7 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
         return err;
     }
 
-    /* ═══ Forward TCP data to ICS_Outbound (OUTBOUND path) ═══ */
+    /* ═══ Forward TCP data to ICS_Inbound (INBOUND path) ═══ */
 
     #if DEBUG_MESSAGE_FLOW
     uint32_t msg_id = ++message_id_counter;
@@ -1073,18 +1560,17 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
     #endif
 
     /* CRITICAL: Check if dataport is properly mapped by CAmkES */
-    if (outbound_dp == NULL) {
-        printf("%s: ❌ FATAL: outbound_dp is NULL! CAmkES dataport not mapped\n", COMPONENT_NAME);
+    if (inbound_dp == NULL) {
+        printf("%s: ❌ FATAL: inbound_dp is NULL! CAmkES dataport not mapped\n", COMPONENT_NAME);
         printf("%s:    This indicates seL4 capability/memory allocation failure\n", COMPONENT_NAME);
-        printf("%s:    Check CAmkES assembly connections and memory regions\n", COMPONENT_NAME);
         pbuf_free(p);
         return ERR_MEM;
     }
 
-    printf("%s: ✓ Dataport check: outbound_dp=%p (valid)\n", COMPONENT_NAME, (void*)outbound_dp);
+    printf("%s: ✓ Dataport check: inbound_dp=%p (valid)\n", COMPONENT_NAME, (void*)inbound_dp);
 
     /* Step 1: Create ICS message with metadata */
-    ICS_Message *ics_msg = (ICS_Message *)outbound_dp;
+    ICS_Message *ics_msg = (ICS_Message *)inbound_dp;
 
     /* Step 2: Populate FrameMetadata (Phase 1: basic info, Phase 2: full header parsing) */
     printf("%s: About to memset ics_msg->metadata at %p (size=%zu)\n",
@@ -1110,7 +1596,7 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
     ics_msg->payload_length = ics_msg->metadata.payload_length;
     memcpy(ics_msg->payload, p->payload, ics_msg->payload_length);
 
-    printf("%s: OUTBOUND: Forwarding %u bytes to ICS_Outbound (proto=TCP, src_port=%u, dst_port=%u)\n",
+    printf("%s: INBOUND: Forwarding %u bytes to ICS_Inbound (proto=TCP, src_port=%u, dst_port=%u)\n",
            COMPONENT_NAME, ics_msg->payload_length,
            ics_msg->metadata.src_port, ics_msg->metadata.dst_port);
 
@@ -1128,15 +1614,15 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
     printf("\"\n");
 
     #if DEBUG_MESSAGE_FLOW
-    printf("   ✓ ICS message prepared in shared memory (outbound_dp)\n");
-    printf("   Action: Signaling ICS_Outbound component via outbound_ready_emit()\n");
+    printf("   ✓ ICS message prepared in shared memory (inbound_dp)\n");
+    printf("   Action: Signaling ICS_Inbound component via outbound_ready_emit()\n");
     #endif
 
-    /* Step 4: Signal ICS_Outbound that message is ready */
+    /* Step 4: Signal ICS_Inbound that message is ready */
     outbound_ready_emit();
 
     #if DEBUG_MESSAGE_FLOW
-    printf("   ✓ Signal sent to ICS_Outbound - message handoff complete\n");
+    printf("   ✓ Signal sent to ICS_Inbound - message handoff complete\n");
     printf("   [MSG #%u now in ICS pipeline - waiting for processing]\n\n", msg_id);
     #endif
 
@@ -1149,6 +1635,9 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
 
 static err_t tcp_echo_accept(void *arg, struct tcp_pcb *newpcb, err_t err)
 {
+    printf("%s: 🔔 tcp_echo_accept() CALLED! arg=%p, newpcb=%p, err=%d\n",
+           COMPONENT_NAME, arg, newpcb, err);
+
     if (err != ERR_OK || newpcb == NULL) {
         printf("%s: ❌ TCP accept FAILED - err=%d (%s), newpcb=%p\n",
                COMPONENT_NAME, err,
@@ -1215,14 +1704,10 @@ static void setup_tcp_echo_server(void)
 
 #if DEBUG_VERBOSE
     printf("%s: [DEBUG] ✓ TCP PCB created successfully at %p\n", COMPONENT_NAME, (void*)pcb);
-    printf("%s: [DEBUG] About to call tcp_bind(pcb, IP_ANY_TYPE, %d)...\n", COMPONENT_NAME, TCP_ECHO_PORT);
+    printf("%s: [DEBUG] About to call tcp_bind(pcb, IP_ADDR_ANY, %d)...\n", COMPONENT_NAME, TCP_ECHO_PORT);
     fflush(stdout);
 #endif
 
-    /* CRITICAL: Bind to 0.0.0.0 (IP_ADDR_ANY) to accept connections to ANY destination IP
-     * This allows Net1 to accept packets destined for metadata.dst_ip (e.g., 192.168.95.2)
-     * even though the interface itself is configured as 10.3.0.2
-     */
     err_t err = tcp_bind(pcb, IP_ADDR_ANY, TCP_ECHO_PORT);
 
 #if DEBUG_VERBOSE
@@ -1268,18 +1753,11 @@ static void setup_tcp_echo_server(void)
     fflush(stdout);
 #endif
 
-    /* ═══════════════════════════════════════════════════════════
-     * TCP SERVER CONFIGURATION CHECK
-     * ═══════════════════════════════════════════════════════════
-     * Print the actual PCB local_ip to verify we're bound to 0.0.0.0
-     * This diagnostic ensures TCP will accept ANY destination IP
-     */
-
     /* CRITICAL DEBUG: Print actual PCB local_ip to diagnose TCP matching */
     struct tcp_pcb_listen *lpcb = (struct tcp_pcb_listen *)pcb;
     printf("\n");
     printf("%s: ═══════════════════════════════════════════════════════════\n", COMPONENT_NAME);
-    printf("%s: ✓ TCP SERVER CONFIGURATION (Net1 - PLC-facing)\n", COMPONENT_NAME);
+    printf("%s: ✓ TCP SERVER CONFIGURATION\n", COMPONENT_NAME);
     printf("%s: ═══════════════════════════════════════════════════════════\n", COMPONENT_NAME);
     printf("%s: Port:           %d\n", COMPONENT_NAME, TCP_ECHO_PORT);
     printf("%s: PCB local_ip:   %u.%u.%u.%u\n", COMPONENT_NAME,
@@ -1294,30 +1772,25 @@ static void setup_tcp_echo_server(void)
 
     if (is_wildcard) {
         printf("%s: Status:         ✅ WILDCARD (0.0.0.0) - accepts ANY destination IP\n", COMPONENT_NAME);
-        printf("%s: Will accept:    Packets to 10.3.0.2 (interface IP) or metadata.dst_ip (e.g., 192.168.95.2)\n", COMPONENT_NAME);
-        printf("%s: Purpose:        Allows TCP client to connect using metadata.dst_ip from ICS pipeline\n", COMPONENT_NAME);
+        printf("%s: Will accept:    Packets to 10.2.0.2, 192.168.95.2, or any IP\n", COMPONENT_NAME);
     } else {
         printf("%s: Status:         ⚠️  SPECIFIC IP - only accepts packets to this IP\n", COMPONENT_NAME);
         printf("%s: Will accept:    Packets to %u.%u.%u.%u ONLY\n", COMPONENT_NAME,
                ip4_addr1(&lpcb->local_ip), ip4_addr2(&lpcb->local_ip),
                ip4_addr3(&lpcb->local_ip), ip4_addr4(&lpcb->local_ip));
-        printf("%s: Will REJECT:    Packets to metadata.dst_ip if different (e.g., 192.168.95.2)\n", COMPONENT_NAME);
-        printf("%s: ⚠️  WARNING:     ICS pipeline forwarding will FAIL if dst_ip doesn't match!\n", COMPONENT_NAME);
+        printf("%s: Will REJECT:    Packets to 192.168.95.2 (if not matching above)\n", COMPONENT_NAME);
     }
-
     printf("%s: ═══════════════════════════════════════════════════════════\n", COMPONENT_NAME);
     printf("\n");
-
-    printf("%s: TCP echo server created (will bind after DHCP)\n", COMPONENT_NAME);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * INBOUND PATH: ICS_Inbound → Internal Network (TCP Client)
+ * OUTBOUND PATH: ICS_Outbound → Internal Network (TCP Client)
  * ═══════════════════════════════════════════════════════════════════════════
  */
 
-/* TCP client connection state for INBOUND forwarding */
-struct tcp_client_state {
+/* TCP client connection state for OUTBOUND forwarding */
+struct tcp_outbound_client_state {
     struct tcp_pcb *pcb;
     uint8_t *payload_data;
     uint16_t payload_len;
@@ -1325,22 +1798,22 @@ struct tcp_client_state {
     bool active;
 };
 
-static struct tcp_client_state inbound_tcp_client = {0};
+static struct tcp_outbound_client_state outbound_tcp_client = {0};
 
 /*
- * TCP client callbacks for INBOUND path
+ * TCP client callbacks for OUTBOUND path
  */
-static err_t inbound_tcp_sent_callback(void *arg, struct tcp_pcb *pcb, u16_t len)
+static err_t outbound_tcp_sent_callback(void *arg, struct tcp_pcb *pcb, u16_t len)
 {
-    struct tcp_client_state *state = (struct tcp_client_state *)arg;
+    struct tcp_outbound_client_state *state = (struct tcp_outbound_client_state *)arg;
 
-    printf("%s: INBOUND: Sent %u bytes to internal network\n", COMPONENT_NAME, len);
+    printf("%s: OUTBOUND: Sent %u bytes to external network\n", COMPONENT_NAME, len);
 
     state->bytes_sent += len;
 
     /* Check if all data sent */
     if (state->bytes_sent >= state->payload_len) {
-        printf("%s: INBOUND: Complete - sent %u/%u bytes\n",
+        printf("%s: OUTBOUND: Complete - sent %u/%u bytes\n",
                COMPONENT_NAME, state->bytes_sent, state->payload_len);
 
         /* Close connection after successful transmission */
@@ -1360,35 +1833,35 @@ static err_t inbound_tcp_sent_callback(void *arg, struct tcp_pcb *pcb, u16_t len
         if (err == ERR_OK) {
             tcp_output(pcb);
         } else {
-            printf("%s: INBOUND: tcp_write failed: %d\n", COMPONENT_NAME, err);
+            printf("%s: OUTBOUND: tcp_write failed: %d\n", COMPONENT_NAME, err);
         }
     }
 
     return ERR_OK;
 }
 
-static err_t inbound_tcp_connected_callback(void *arg, struct tcp_pcb *pcb, err_t err)
+static err_t outbound_tcp_connected_callback(void *arg, struct tcp_pcb *pcb, err_t err)
 {
-    struct tcp_client_state *state = (struct tcp_client_state *)arg;
+    struct tcp_outbound_client_state *state = (struct tcp_outbound_client_state *)arg;
 
     if (err != ERR_OK) {
-        printf("%s: INBOUND: Connection failed: %d\n", COMPONENT_NAME, err);
+        printf("%s: OUTBOUND: Connection failed: %d\n", COMPONENT_NAME, err);
         state->active = false;
         state->pcb = NULL;
         return err;
     }
 
-    printf("%s: INBOUND: Connected to internal network\n", COMPONENT_NAME);
+    printf("%s: OUTBOUND: Connected to external network\n", COMPONENT_NAME);
 
     /* Set sent callback */
-    tcp_sent(pcb, inbound_tcp_sent_callback);
+    tcp_sent(pcb, outbound_tcp_sent_callback);
 
     /* Send the payload */
     uint16_t to_send = (state->payload_len > tcp_sndbuf(pcb)) ? tcp_sndbuf(pcb) : state->payload_len;
 
     err = tcp_write(pcb, state->payload_data, to_send, TCP_WRITE_FLAG_COPY);
     if (err != ERR_OK) {
-        printf("%s: INBOUND: tcp_write failed: %d\n", COMPONENT_NAME, err);
+        printf("%s: OUTBOUND: tcp_write failed: %d\n", COMPONENT_NAME, err);
         tcp_close(pcb);
         state->active = false;
         state->pcb = NULL;
@@ -1400,42 +1873,43 @@ static err_t inbound_tcp_connected_callback(void *arg, struct tcp_pcb *pcb, err_
     /* Trigger transmission */
     tcp_output(pcb);
 
-    printf("%s: INBOUND: Sent initial %u bytes\n", COMPONENT_NAME, to_send);
+    printf("%s: OUTBOUND: Sent initial %u bytes\n", COMPONENT_NAME, to_send);
 
     return ERR_OK;
 }
 
 /*
- * INBOUND notification handler - called when ICS_Inbound has validated data
- * Creates TCP client connection to forward data to internal network
+ * OUTBOUND notification handler - called when ICS_Outbound has validated data
+ * Creates TCP client connection to forward data to external network
  */
-void inbound_ready_handle(void)
+void outbound_ready_handle(void)
 {
     #if DEBUG_MESSAGE_FLOW
     uint32_t msg_id = ++message_id_counter;
-    printf("\n🟡 [MSG #%u] ═══ ICS→NET: Received from ICS_Inbound ═══\n", msg_id);
+    printf("\n🟡 [MSG #%u] ═══ ICS→NET: Received from ICS_Outbound ═══\n", msg_id);
     printf("   Source: ICS pipeline validation complete\n");
-    printf("   Action: Creating TCP client to forward to internal network\n");
+    printf("   Action: Creating TCP client to forward to external network\n");
     #endif
 
     printf("%s: ╔═══════════════════════════════════════════════════════════╗\n", COMPONENT_NAME);
-    printf("%s: ║  INBOUND: Received message from ICS_Inbound              ║\n", COMPONENT_NAME);
-    printf("%s: ╚═══════════════════════════════════════════════════════════╝\n", COMPONENT_NAME);
+    printf("%s: ║  OUTBOUND: Received message from ICS_Outbound            ║\n", COMPONENT_NAME);
 
     /* CRITICAL: Check if dataport is properly mapped by CAmkES */
-    if (inbound_dp == NULL) {
-        printf("%s: ❌ FATAL: inbound_dp is NULL! CAmkES dataport not mapped\n", COMPONENT_NAME);
+    if (outbound_dp == NULL) {
+        printf("%s: ❌ FATAL: outbound_dp is NULL! CAmkES dataport not mapped\n", COMPONENT_NAME);
         printf("%s:    This indicates seL4 capability/memory allocation failure\n", COMPONENT_NAME);
+        printf("%s: ╚═══════════════════════════════════════════════════════════╝\n", COMPONENT_NAME);
         return;
     }
 
-    printf("%s: ✓ Dataport check: inbound_dp=%p (valid)\n", COMPONENT_NAME, (void*)inbound_dp);
+    printf("%s: ✓ Dataport check: outbound_dp=%p (valid)\n", COMPONENT_NAME, (void*)outbound_dp);
 
-    ICS_Message *ics_msg = (ICS_Message *)inbound_dp;
+    ICS_Message *ics_msg = (ICS_Message *)outbound_dp;
+    printf("%s: ╚═══════════════════════════════════════════════════════════╝\n", COMPONENT_NAME);
 
     /* Validate message */
     if (ics_msg->payload_length > MAX_PAYLOAD_SIZE) {
-        printf("%s: INBOUND: Invalid payload length %u (max %u)\n",
+        printf("%s: OUTBOUND: Invalid payload length %u (max %u)\n",
                COMPONENT_NAME, ics_msg->payload_length, MAX_PAYLOAD_SIZE);
         #if DEBUG_MESSAGE_FLOW
         printf("   ✗ [MSG #%u] DROPPED - invalid payload size\n\n", msg_id);
@@ -1444,13 +1918,13 @@ void inbound_ready_handle(void)
     }
 
     /* Check if we already have an active connection - if so, close it and create new one */
-    if (inbound_tcp_client.active) {
-        printf("%s: INBOUND: Previous connection still active, closing it to handle new message\n", COMPONENT_NAME);
-        if (inbound_tcp_client.pcb != NULL) {
-            tcp_close(inbound_tcp_client.pcb);
+    if (outbound_tcp_client.active) {
+        printf("%s: OUTBOUND: Previous connection still active, closing it to handle new message\n", COMPONENT_NAME);
+        if (outbound_tcp_client.pcb != NULL) {
+            tcp_close(outbound_tcp_client.pcb);
         }
-        inbound_tcp_client.active = false;
-        inbound_tcp_client.pcb = NULL;
+        outbound_tcp_client.active = false;
+        outbound_tcp_client.pcb = NULL;
     }
 
     #if DEBUG_MESSAGE_FLOW
@@ -1476,7 +1950,7 @@ void inbound_ready_handle(void)
     #endif
 
     /* Print metadata */
-    printf("%s: INBOUND: Protocol=%s, Src=%u.%u.%u.%u:%u, Dst=%u.%u.%u.%u:%u, Payload=%u bytes\n",
+    printf("%s: OUTBOUND: Protocol=%s, Src=%u.%u.%u.%u:%u, Dst=%u.%u.%u.%u:%u, Payload=%u bytes\n",
            COMPONENT_NAME,
            ics_msg->metadata.is_tcp ? "TCP" : (ics_msg->metadata.is_udp ? "UDP" : "Other"),
            (ics_msg->metadata.src_ip >> 24) & 0xFF, (ics_msg->metadata.src_ip >> 16) & 0xFF,
@@ -1490,84 +1964,49 @@ void inbound_ready_handle(void)
     /* Create TCP client connection */
     struct tcp_pcb *pcb = tcp_new_ip_type(IPADDR_TYPE_V4);
     if (pcb == NULL) {
-        printf("%s: INBOUND: Failed to create TCP PCB\n", COMPONENT_NAME);
+        printf("%s: OUTBOUND: Failed to create TCP PCB\n", COMPONENT_NAME);
         return;
     }
 
     /* Set up client state */
-    inbound_tcp_client.pcb = pcb;
-    inbound_tcp_client.payload_data = ics_msg->payload;
-    inbound_tcp_client.payload_len = ics_msg->payload_length;
-    inbound_tcp_client.bytes_sent = 0;
-    inbound_tcp_client.active = true;
+    outbound_tcp_client.pcb = pcb;
+    outbound_tcp_client.payload_data = ics_msg->payload;
+    outbound_tcp_client.payload_len = ics_msg->payload_length;
+    outbound_tcp_client.bytes_sent = 0;
+    outbound_tcp_client.active = true;
 
-    /* Extract source and destination from metadata
-     * This preserves end-to-end IP addresses through the gateway
-     * Example: SCADA (192.168.90.5) → PLC (192.168.95.2)
-     *   Net0 receives: src=192.168.90.5, dst=192.168.95.2
-     *   Net1 binds to: 192.168.90.5 (appears as SCADA to PLC)
-     *   Net1 connects to: 192.168.95.2 (real PLC)
-     */
-    ip_addr_t src_ip, dest_ip;
-    IP4_ADDR(&src_ip,
-             (ics_msg->metadata.src_ip >> 24) & 0xFF,
-             (ics_msg->metadata.src_ip >> 16) & 0xFF,
-             (ics_msg->metadata.src_ip >> 8) & 0xFF,
-             ics_msg->metadata.src_ip & 0xFF);
-
-    IP4_ADDR(&dest_ip,
-             (ics_msg->metadata.dst_ip >> 24) & 0xFF,
-             (ics_msg->metadata.dst_ip >> 16) & 0xFF,
-             (ics_msg->metadata.dst_ip >> 8) & 0xFF,
-             ics_msg->metadata.dst_ip & 0xFF);
-
-    /* NOTE: Cannot use tcp_bind() with external IP (192.168.90.5) because lwIP
-     * only allows binding to IPs configured on the local interface (10.3.0.2)
-     *
-     * WORKAROUND: We'll bind to IP_ADDR_ANY and let lwIP use 10.3.0.2 as source.
-     * The host will perform SNAT to translate 10.3.0.2 → original src IP via iptables.
-     *
-     * Alternative future solution: Use raw sockets or modify lwIP to allow arbitrary source IPs
-     */
-    err_t bind_err = tcp_bind(pcb, IP_ADDR_ANY, 0);  /* Bind to any, port 0 = ephemeral */
-    if (bind_err != ERR_OK) {
-        printf("%s: INBOUND: tcp_bind failed: %d\n", COMPONENT_NAME, bind_err);
-        tcp_close(pcb);
-        inbound_tcp_client.active = false;
-        inbound_tcp_client.pcb = NULL;
-        return;
-    }
+    /* Set up destination IP address - use QEMU gateway to reach host */
+    ip_addr_t dest_ip;
+    ipaddr_aton(OUTBOUND_FORWARD_IP, &dest_ip);  /* 10.0.2.2 - QEMU gateway */
 
     /* CRITICAL: Set callback argument BEFORE tcp_connect()
-     * This prevents null pointer dereference in inbound_tcp_sent_callback
+     * This prevents null pointer dereference in outbound_tcp_sent_callback
      */
-    tcp_arg(pcb, &inbound_tcp_client);
+    tcp_arg(pcb, &outbound_tcp_client);
 
-    /* Use original destination port from metadata */
-    uint16_t dest_port = ics_msg->metadata.dst_port;
+    /* CROSS-DOMAIN PORT MAPPING:
+     * Internal port 7000 (Net1) → maps to → Host port 19000 (via QEMU gateway)
+     * This creates the protocol break diode architecture
+     */
+    uint16_t mapped_port = OUTBOUND_FORWARD_PORT;  /* Configurable destination port */
 
-    printf("%s: INBOUND: Binding to %u.%u.%u.%u and connecting to %u.%u.%u.%u:%u\n",
-           COMPONENT_NAME,
-           (ics_msg->metadata.src_ip >> 24) & 0xFF,
-           (ics_msg->metadata.src_ip >> 16) & 0xFF,
-           (ics_msg->metadata.src_ip >> 8) & 0xFF,
-           ics_msg->metadata.src_ip & 0xFF,
-           (ics_msg->metadata.dst_ip >> 24) & 0xFF,
-           (ics_msg->metadata.dst_ip >> 16) & 0xFF,
-           (ics_msg->metadata.dst_ip >> 8) & 0xFF,
-           ics_msg->metadata.dst_ip & 0xFF,
-           dest_port);
+    printf("%s: OUTBOUND: Port mapping: internal:%u → host:%s:%u (via QEMU gateway)\n",
+           COMPONENT_NAME, ics_msg->metadata.dst_port, OUTBOUND_FORWARD_IP, mapped_port);
 
-    err_t err = tcp_connect(pcb, &dest_ip, dest_port, inbound_tcp_connected_callback);
+    /* Connect to host via QEMU gateway */
+    printf("%s: OUTBOUND: Connecting to host via %s:%u...\n",
+           COMPONENT_NAME, OUTBOUND_FORWARD_IP, mapped_port);
+
+    err_t err = tcp_connect(pcb, &dest_ip, mapped_port, outbound_tcp_connected_callback);
     if (err != ERR_OK) {
-        printf("%s: INBOUND: tcp_connect failed: %d\n", COMPONENT_NAME, err);
+        printf("%s: OUTBOUND: tcp_connect failed: %d\n", COMPONENT_NAME, err);
         tcp_close(pcb);
-        inbound_tcp_client.active = false;
-        inbound_tcp_client.pcb = NULL;
+        outbound_tcp_client.active = false;
+        outbound_tcp_client.pcb = NULL;
         return;
     }
 
-    printf("%s: INBOUND: Connection initiated (end-to-end IP preservation)\n", COMPONENT_NAME);
+    printf("%s: OUTBOUND: Connection initiated\n", COMPONENT_NAME);
 }
 
 /*
@@ -1608,9 +2047,66 @@ static int virtio_net_init(void)
     printf("╚══════════════════════════════════════════════════════════╝\n");
     printf("\n");
 
-    /* Access VirtIO device at SLOT 30 (offset 0xc00 from page base 0xa003000) */
-    /* This is the SECOND virtio-net-device added to QEMU */
+    /* ═══════════════════════════════════════════════════════════════ */
+    /* COMPREHENSIVE VIRTIO SLOT SCANNER                                */
+    /* Scan all 32 VirtIO MMIO slots to find which ones have devices   */
+    /* ═══════════════════════════════════════════════════════════════ */
+    printf("\n╔═══════════════════════════════════════════════════════════════╗\n");
+    printf("║  [DISABLED] SCANNING MAPPED VIRTIO MMIO SLOTS FOR ACTIVE DEVICES         ║\n");
+    printf("║  Base: 0x0a000000, Each slot: 0x200 bytes apart               ║\n");
+    printf("║  Scanning slots 24-31 only (one 4KB page mapped)                ║\n");
+    printf("╚═══════════════════════════════════════════════════════════════╝\n\n");
+
+    /* Only scan slots within the mapped 4KB page (8 slots of 0x200 bytes each) */
+//     for (int slot = 24; slot < 32; slot++) {
+//         /* Calculate offset for this slot */
+//         uint32_t offset = slot * 0x200;
+//         volatile uint32_t *slot_base = (volatile uint32_t *)((uintptr_t)virtio_mmio_regs + offset);
+// 
+//         /* Read device identification registers with memory barriers (like VREG_READ) */
+//         DMB();  /* Ensure all prior memory operations complete before reading */
+//         /* Read device identification registers */
+//         uint32_t slot_magic = slot_base[VIRTIO_MMIO_MAGIC_VALUE / 4];
+//         uint32_t slot_version = slot_base[VIRTIO_MMIO_VERSION / 4];
+//         uint32_t slot_device_id = slot_base[VIRTIO_MMIO_DEVICE_ID / 4];
+//         DMB();  /* Ensure reads complete before using values */
+//         uint32_t slot_vendor_id = slot_base[VIRTIO_MMIO_VENDOR_ID / 4];
+// 
+//         /* Only print slots with valid VirtIO magic */
+//         if (slot_magic == 0x74726976) {
+//             printf("Slot %2d @ 0x%08lx (offset +0x%03x): Magic=0x%08x Version=%u DeviceID=%u Vendor=0x%08x",
+//                    slot, 0x0a000000 + offset, offset,
+//                    slot_magic, slot_version, slot_device_id, slot_vendor_id);
+// 
+//             /* Identify device type */
+//             if (slot_device_id == 1) {
+//                 printf(" [NETWORK]\n");
+//             } else if (slot_device_id == 0) {
+//                 printf(" [NO DEVICE]\n");
+//             } else {
+//                 printf(" [UNKNOWN TYPE]\n");
+//             }
+//         }
+//     }
+
+    printf("\n");
+
+    /* CRITICAL: Check if CAmkES dataport is properly mapped */
+    if (virtio_mmio_regs == NULL) {
+        printf("%s: ❌ FATAL: virtio_mmio_regs dataport is NULL!\n", COMPONENT_NAME);
+        printf("%s:    CAmkES failed to map hardware component net0_hw\n", COMPONENT_NAME);
+        printf("%s:    Check ics_dual_nic.camkes configuration\n", COMPONENT_NAME);
+        return -1;
+    }
+
+    printf("%s: virtio_mmio_regs dataport mapped at %p\n", COMPONENT_NAME, (void *)virtio_mmio_regs);
+
+    /* Access VirtIO device at SLOT 31 (offset 0xc00 from page base 0xa003000) */
+    /* QEMU assigns FIRST -device virtio-net-device to slot 30 - matches vm_ethernet_echo */
     virtio_regs_base = (volatile uint32_t *)((uintptr_t)virtio_mmio_regs + 0xc00);
+
+    printf("%s: virtio_regs_base (slot 30) = %p (base + 0xc00)\n",
+           COMPONENT_NAME, (void *)virtio_regs_base);
 
     /* Verify we have the network device using pointer arithmetic */
     uint32_t magic = VREG_READ(VIRTIO_MMIO_MAGIC_VALUE);
@@ -1886,6 +2382,38 @@ static int virtio_net_init(void)
     /* Device ready - activate the device */
     VREG_WRITE(VIRTIO_MMIO_STATUS, VREG_READ(VIRTIO_MMIO_STATUS) | VIRTIO_STATUS_DRIVER_OK);
     printf("%s: ✓ VirtIO device initialized and activated\n", COMPONENT_NAME);
+    /* ═══ CRITICAL: Test if MMIO writes work ═══ */
+    printf("\n%s: Testing MMIO write capability...\n", COMPONENT_NAME);
+
+    /* Select queue 0 (RX queue) */
+    VREG_WRITE(VIRTIO_MMIO_QUEUE_SEL, 0);
+
+    /* Read current QueueReady state */
+    uint32_t original_ready = VREG_READ(VIRTIO_MMIO_QUEUE_READY);
+    printf("%s:   Queue 0 original ready state = 0x%x\n", COMPONENT_NAME, original_ready);
+
+    /* Test write by toggling QueueReady */
+    VREG_WRITE(VIRTIO_MMIO_QUEUE_READY, 0x0);
+    uint32_t read_back_0 = VREG_READ(VIRTIO_MMIO_QUEUE_READY);
+
+    VREG_WRITE(VIRTIO_MMIO_QUEUE_READY, 0x1);
+    uint32_t read_back_1 = VREG_READ(VIRTIO_MMIO_QUEUE_READY);
+
+    printf("%s:   Write 0x0, read back: 0x%x (expect 0x0)\n", COMPONENT_NAME, read_back_0);
+    printf("%s:   Write 0x1, read back: 0x%x (expect 0x1)\n", COMPONENT_NAME, read_back_1);
+
+    /* Restore original state */
+    VREG_WRITE(VIRTIO_MMIO_QUEUE_READY, original_ready);
+
+    if (read_back_0 != 0x0 || read_back_1 != 0x1) {
+        printf("\n%s: ❌❌❌ FATAL ERROR: MMIO WRITES DO NOT WORK! ❌❌❌\n", COMPONENT_NAME);
+        printf("%s: Device memory attributes are incorrect.\n", COMPONENT_NAME);
+        printf("%s: This will cause infinite IRQ loops and duplicate packets.\n", COMPONENT_NAME);
+        printf("%s: Cannot continue - terminating initialization.\n\n", COMPONENT_NAME);
+        return -1;
+    }
+
+    printf("%s:   ✅ MMIO writes work correctly!\n\n", COMPONENT_NAME);
 
     return 0;
 }
@@ -1896,8 +2424,13 @@ static int virtio_net_init(void)
 void post_init(void)
 {
     printf("%s: Component started\n", COMPONENT_NAME);
-    printf("%s: 🔖 SOFTWARE VERSION: v2.15-bridge-architecture (2025-10-11)\n", COMPONENT_NAME);
-    printf("%s: 🔧 Features: Pure L2 bridge - NO NAT, real gateway IPs (192.168.95.1)\n\n", COMPONENT_NAME);
+    printf("%s: 🔖 SOFTWARE VERSION: v2.24-debug-checksums (2025-10-11)\n", COMPONENT_NAME);
+    printf("%s: 🔧 Features: Fixed IP/TCP checksums with lwIP functions, added checksum debug output\n\n", COMPONENT_NAME);
+
+    /* Initialize connection tracking table */
+    memset(connection_table, 0, sizeof(connection_table));
+    connection_count = 0;
+    printf("%s: ✓ Connection tracking table initialized (%d slots)\n", COMPONENT_NAME, MAX_CONNECTIONS);
 
     /* Initialize VirtIO device */
     if (virtio_net_init() != 0) {
@@ -1905,7 +2438,7 @@ void post_init(void)
         return;
     }
 
-    /* Allocate packet buffers from DMA memory (matching sDDF approach) */
+    /* Allocate packet buffers from DMA memory */
     printf("%s: Allocating %d DMA packet buffers (%d bytes each)...\n",
            COMPONENT_NAME, MAX_PACKETS, PACKET_BUFFER_SIZE);
     for (int i = 0; i < MAX_PACKETS; i++) {
@@ -1919,16 +2452,14 @@ void post_init(void)
     printf("%s: ✓ Allocated DMA packet buffers (vaddr=%p, paddr=0x%lx)\n",
            COMPONENT_NAME, packet_buffers[0], packet_buffers_paddr[0]);
 
-    /* Allocate TX headers array (one header per possible TX descriptor) */
+    /* Allocate TX headers array */
     size_t tx_headers_size = MAX_PACKETS * sizeof(virtio_net_hdr_t);
-    tx_headers = camkes_dma_alloc(tx_headers_size, 16, false);  /* 16-byte aligned */
+    tx_headers = camkes_dma_alloc(tx_headers_size, 16, false);
     if (!tx_headers) {
         printf("%s: ERROR: Failed to allocate TX headers DMA memory\n", COMPONENT_NAME);
         return;
     }
     tx_headers_paddr = camkes_dma_get_paddr(tx_headers);
-
-    /* Initialize all TX headers (zero-fill = no offloads) */
     memset(tx_headers, 0, tx_headers_size);
     printf("%s: ✓ Allocated TX headers array (vaddr=%p, paddr=0x%lx)\n",
            COMPONENT_NAME, tx_headers, tx_headers_paddr);
@@ -1941,38 +2472,43 @@ void post_init(void)
     printf("%s: Initializing lwIP TCP/IP stack...\n", COMPONENT_NAME);
     lwip_init();
 
+    /* CRITICAL: Setup TCP server BEFORE netif_add() so PCB stays bound to 0.0.0.0
+     * This is the key to accepting packets for ANY destination IP (both 10.2.0.2 and 192.168.95.2)
+     * If we do netif_add() first, lwIP might bind the PCB to the interface IP
+     */
+    printf("%s: Setting up TCP server on port %d (binding to 0.0.0.0 for promiscuous accept)...\n", COMPONENT_NAME, TCP_ECHO_PORT);
+    setup_tcp_echo_server();
+
     /* Add network interface - BRIDGE ARCHITECTURE
-     * nic1 IS the internal gateway (192.168.95.1) that PLC uses as its gateway
+     * nic0 IS the external gateway (192.168.95.1) that pfSense routes through
      * No gateway needed - we ARE the gateway!
+     * TCP server listens on 192.168.95.1:502
      */
     struct ip4_addr ipaddr, netmask, gw;
-    IP4_ADDR(&ipaddr, 192, 168, 95, 1);    /* Static IP: 192.168.95.1 (internal gateway) */
+    IP4_ADDR(&ipaddr, 192, 168, 96, 2);    /* Static IP: 192.168.95.1 */
     IP4_ADDR(&netmask, 255, 255, 255, 0);  /* Netmask: 255.255.255.0 */
-    IP4_ADDR(&gw, 0, 0, 0, 0);             /* No gateway - WE are the gateway! */
+    IP4_ADDR(&gw, 192, 168, 96, 1);        /* Gateway: pfSense (to reach 192.168.90.x network) */
 
     printf("%s: Configuring network interface:\n", COMPONENT_NAME);
-    printf("%s:   IP:      192.168.95.1 (internal gateway - PLC routes here)\n", COMPONENT_NAME);
+    printf("%s:   IP:      192.168.95.1 (security gateway on 192.168.96.0/24)\n", COMPONENT_NAME);
     printf("%s:   Netmask: 255.255.255.0\n", COMPONENT_NAME);
-    printf("%s:   Gateway: None (this interface IS the gateway)\n", COMPONENT_NAME);
+    printf("%s:   Gateway: 192.168.96.1 (pfSense - routes to SCADA network)\n", COMPONENT_NAME);
+    printf("%s:   TCP server: 192.168.95.1:%d\n", COMPONENT_NAME, TCP_ECHO_PORT);
 
-    netif_add(&netif_data, &ipaddr, &netmask, &gw, NULL, custom_netif_init, ethernet_input);
+    netif_add(&netif_data, &ipaddr, &netmask, &gw, NULL, custom_netif_init, custom_input_promiscuous);
     netif_set_default(&netif_data);
     netif_set_status_callback(&netif_data, netif_status_callback);
     netif_set_up(&netif_data);
 
-    /* Skip DHCP - use static IP */
-    printf("%s: Network interface UP with static IP\n", COMPONENT_NAME);
-
-    /* ═══════════════════════════════════════════════════════════
-     * NETWORK INTERFACE CONFIGURATION CHECK
-     * ═══════════════════════════════════════════════════════════
-     * Verify the interface has the correct IP configuration
-     * This diagnostic ensures proper ARP resolution with tap1
+    /* Static ARP entry NOT needed with bridge architecture!
+     * With bridges, all devices are on the same Layer 2 network
+     * ARP works naturally without any hacks
      */
 
+    /* Verify interface configuration */
     printf("\n");
     printf("%s: ═══════════════════════════════════════════════════════════\n", COMPONENT_NAME);
-    printf("%s: ✓ NETWORK INTERFACE CONFIGURATION (Net1 - PLC-facing)\n", COMPONENT_NAME);
+    printf("%s: ✓ NETWORK INTERFACE CONFIGURATION\n", COMPONENT_NAME);
     printf("%s: ═══════════════════════════════════════════════════════════\n", COMPONENT_NAME);
     printf("%s: Interface IP:   %u.%u.%u.%u\n", COMPONENT_NAME,
            ip4_addr1(netif_ip4_addr(&netif_data)),
@@ -1989,9 +2525,10 @@ void post_init(void)
            ip4_addr2(netif_ip4_gw(&netif_data)),
            ip4_addr3(netif_ip4_gw(&netif_data)),
            ip4_addr4(netif_ip4_gw(&netif_data)));
-    printf("%s: MAC:            %02x:%02x:%02x:%02x:%02x:%02x\n", COMPONENT_NAME,
-           netif_data.hwaddr[0], netif_data.hwaddr[1], netif_data.hwaddr[2],
-           netif_data.hwaddr[3], netif_data.hwaddr[4], netif_data.hwaddr[5]);
+    printf("%s: Status:         %s\n", COMPONENT_NAME, netif_is_up(&netif_data) ? "UP" : "DOWN");
+    printf("%s: Role:           Internal gateway (transparent security gateway)\n", COMPONENT_NAME);
+    printf("%s: ═══════════════════════════════════════════════════════════\n", COMPONENT_NAME);
+    printf("\n");
 
     /* Validation check */
     uint8_t if_ip1 = ip4_addr1(netif_ip4_addr(&netif_data));
@@ -1999,270 +2536,27 @@ void post_init(void)
     uint8_t if_ip3 = ip4_addr3(netif_ip4_addr(&netif_data));
     uint8_t if_ip4 = ip4_addr4(netif_ip4_addr(&netif_data));
 
-    if (if_ip1 == 10 && if_ip2 == 3 && if_ip3 == 0 && if_ip4 == 2) {
-        printf("%s: ✅ CONFIGURATION VALID: Interface IP matches expected tap1 subnet (10.3.0.2)\n", COMPONENT_NAME);
-        printf("%s: ✅ Host can ARP for this IP and establish communication\n", COMPONENT_NAME);
-        printf("%s: ✅ TCP client will use this IP as source when connecting to metadata.dst_ip\n", COMPONENT_NAME);
+    if (if_ip1 == 192 && if_ip2 == 168 && if_ip3 == 96 && if_ip4 == 2) {
+        printf("%s: ✅ CONFIGURATION VALID: Internal gateway IP = 192.168.95.1\n", COMPONENT_NAME);
+        printf("%s: ✅ pfSense routes 192.168.95.0/24 traffic through this gateway\n", COMPONENT_NAME);
+        printf("%s: ✅ Bridge br0 forwards all traffic to/from ens224\n", COMPONENT_NAME);
     } else {
-        printf("%s: ⚠️  WARNING: Interface IP (%u.%u.%u.%u) does NOT match tap1 subnet (expected 10.3.0.2)\n",
+        printf("%s: ⚠️  WARNING: Interface IP (%u.%u.%u.%u) does NOT match expected (192.168.95.1)\n",
                COMPONENT_NAME, if_ip1, if_ip2, if_ip3, if_ip4);
-        printf("%s: ⚠️  Host will ARP for 10.3.0.2 but won't get a response - communication will FAIL!\n", COMPONENT_NAME);
-        printf("%s: ⚠️  TCP connections to PLC will not work without correct interface IP\n", COMPONENT_NAME);
+        printf("%s: ⚠️  pfSense routing will FAIL!\n", COMPONENT_NAME);
     }
-
-    printf("%s: ═══════════════════════════════════════════════════════════\n", COMPONENT_NAME);
     printf("\n");
 
-    /* TEMPORARY: Re-enable immediate TCP server creation to test verbose debug
-     * This WILL cause malloc fault at address 0x10, but allows us to capture
-     * detailed debug output to understand the failure.
-     */
-    printf("%s: ⚠️  TESTING: Creating TCP server immediately (will likely fault)\n", COMPONENT_NAME);
-    setup_tcp_echo_server();
-    tcp_server_initialized = true;  /* Set flag to prevent duplicate initialization */
+    tcp_server_initialized = true;
     printf("%s: ✓ Initialization complete\n", COMPONENT_NAME);
     printf("%s: Network ready\n\n", COMPONENT_NAME);
-
-    #if 0  /* Disable QueueSel diagnostic test - causes debug spam */
-    /* QueueSel Runtime Verification Test */
-    printf("\n╔══════════════════════════════════════════════════════════╗\n");
-    printf("║  RUNTIME QUEUESEL TEST (after full initialization)      ║\n");
-    printf("╚══════════════════════════════════════════════════════════╝\n");
-
-    printf("Testing QueueSel by reading configured queue properties...\n\n");
-
-    /* Test Queue 0 (RX) */
-    VREG_WRITE(VIRTIO_MMIO_QUEUE_SEL, 0);
-    uint32_t q0_num_rt = VREG_READ(VIRTIO_MMIO_QUEUE_NUM);
-    uint32_t q0_ready_rt = VREG_READ(VIRTIO_MMIO_QUEUE_READY);
-    uint32_t q0_nummax_rt = VREG_READ(VIRTIO_MMIO_QUEUE_NUM_MAX);
-    printf("Queue 0 (RX - configured during init):\n");
-    printf("  QueueNum    = %u (we set this to %u)\n", q0_num_rt, rx_virtq.num);
-    printf("  QueueReady  = %u (should be 1)\n", q0_ready_rt);
-    printf("  QueueNumMax = %u\n", q0_nummax_rt);
-
-    /* Test Queue 1 (TX) */
-    VREG_WRITE(VIRTIO_MMIO_QUEUE_SEL, 1);
-    uint32_t q1_num_rt = VREG_READ(VIRTIO_MMIO_QUEUE_NUM);
-    uint32_t q1_ready_rt = VREG_READ(VIRTIO_MMIO_QUEUE_READY);
-    uint32_t q1_nummax_rt = VREG_READ(VIRTIO_MMIO_QUEUE_NUM_MAX);
-    printf("\nQueue 1 (TX - configured during init):\n");
-    printf("  QueueNum    = %u (we set this to %u)\n", q1_num_rt, tx_virtq.num);
-    printf("  QueueReady  = %u (should be 1)\n", q1_ready_rt);
-    printf("  QueueNumMax = %u\n", q1_nummax_rt);
-
-    /* Test Queue 2 (should not exist) */
-    VREG_WRITE(VIRTIO_MMIO_QUEUE_SEL, 2);
-    uint32_t q2_num_rt = VREG_READ(VIRTIO_MMIO_QUEUE_NUM);
-    uint32_t q2_ready_rt = VREG_READ(VIRTIO_MMIO_QUEUE_READY);
-    uint32_t q2_nummax_rt = VREG_READ(VIRTIO_MMIO_QUEUE_NUM_MAX);
-    printf("\nQueue 2 (should NOT exist):\n");
-    printf("  QueueNum    = %u (should be 0 - not configured)\n", q2_num_rt);
-    printf("  QueueReady  = %u (should be 0)\n", q2_ready_rt);
-    printf("  QueueNumMax = %u (should be 0 - queue doesn't exist)\n", q2_nummax_rt);
-
-    /* Analysis */
-    printf("\n═══════════════════════════════════════════════════════════\n");
-    printf("ANALYSIS:\n");
-
-    bool nums_match_config = (q0_num_rt == rx_virtq.num && q1_num_rt == tx_virtq.num);
-    bool ready_correct = (q0_ready_rt == 1 && q1_ready_rt == 1 && q2_ready_rt == 0);
-    bool q2_is_zero = (q2_num_rt == 0 && q2_nummax_rt == 0);
-    bool stuck_at_q0 = (q0_num_rt == q1_num_rt && q1_num_rt == q2_num_rt && q2_num_rt != 0);
-
-    if (stuck_at_q0) {
-        printf("❌ FAIL: STUCK AT QUEUE 0!\n");
-        printf("   All queues return same values - QueueSel doesn't switch context\n");
-        printf("   Q0/Q1/Q2 QueueNum all = %u (expected Q0=%u, Q1=%u, Q2=0)\n",
-               q0_num_rt, rx_virtq.num, tx_virtq.num);
-    } else if (nums_match_config && ready_correct && q2_is_zero) {
-        printf("✅ PASS: QueueSel works correctly!\n");
-        printf("   Q0 and Q1 have different configured values\n");
-        printf("   Q2 returns zeros (queue doesn't exist)\n");
-        printf("   QueueSel successfully switches between queue contexts\n");
-    } else {
-        printf("⚠️  MIXED RESULTS:\n");
-        printf("   Config match: %s (Q0=%u/%u, Q1=%u/%u)\n",
-               nums_match_config ? "YES" : "NO",
-               q0_num_rt, rx_virtq.num, q1_num_rt, tx_virtq.num);
-        printf("   Ready correct: %s (Q0=%u, Q1=%u, Q2=%u)\n",
-               ready_correct ? "YES" : "NO",
-               q0_ready_rt, q1_ready_rt, q2_ready_rt);
-        printf("   Q2 is zero: %s\n", q2_is_zero ? "YES" : "NO");
-    }
-    printf("═══════════════════════════════════════════════════════════\n\n");
-
-    /* CRITICAL TEST: Check actual queue ring activity */
-    printf("╔══════════════════════════════════════════════════════════╗\n");
-    printf("║  QUEUE ACTIVITY CHECK (checking actual ring indices)    ║\n");
-    printf("╚══════════════════════════════════════════════════════════╝\n\n");
-
-    printf("RX Queue (Queue 0) - Direct memory inspection:\n");
-    printf("  rx_virtq.avail->idx = %u (driver added %u buffers)\n",
-           rx_virtq.avail->idx, rx_virtq.avail->idx);
-    printf("  rx_virtq.used->idx  = %u (QEMU consumed %u buffers)\n",
-           rx_virtq.used->idx, rx_virtq.used->idx);
-
-    printf("\nTX Queue (Queue 1) - Direct memory inspection:\n");
-    printf("  tx_virtq.avail->idx = %u (driver added %u buffers)\n",
-           tx_virtq.avail->idx, tx_virtq.avail->idx);
-    printf("  tx_virtq.used->idx  = %u (QEMU consumed %u buffers)\n",
-           tx_virtq.used->idx, tx_virtq.used->idx);
-
-    printf("\nExpected values:\n");
-    printf("  RX: avail->idx=32, used->idx=0 (we added 32 RX buffers, none consumed yet)\n");
-    printf("  TX: avail->idx=0,  used->idx=1 (we sent 1 packet, QEMU consumed it)\n");
-
-    bool rx_correct = (rx_virtq.avail->idx == 32 && rx_virtq.used->idx == 0);
-    bool tx_correct = (tx_virtq.avail->idx == 0 && tx_virtq.used->idx == 1);
-
-    printf("\nRESULT:\n");
-    if (rx_correct && tx_correct) {
-        printf("✅ BOTH queues have correct activity - they are SEPARATE!\n");
-        printf("   RX and TX queues have different idx values\n");
-        printf("   This proves we're NOT stuck on a single queue\n");
-    } else if (rx_virtq.avail->idx == tx_virtq.avail->idx &&
-               rx_virtq.used->idx == tx_virtq.used->idx) {
-        printf("❌ RX and TX show IDENTICAL indices - STUCK ON SAME QUEUE!\n");
-        printf("   Both queues have same avail->idx and used->idx\n");
-        printf("   This proves QueueSel doesn't switch between queues\n");
-    } else {
-        printf("⚠️  UNEXPECTED: Indices don't match expected pattern\n");
-        printf("   RX correct: %s, TX correct: %s\n",
-               rx_correct ? "YES" : "NO", tx_correct ? "YES" : "NO");
-    }
-    printf("═══════════════════════════════════════════════════════════\n\n");
-
-    /* DEFINITIVE QUEUESEL TEST: Wait for RX packets, then check if Queue 2 shows same activity */
-    printf("╔══════════════════════════════════════════════════════════╗\n");
-    printf("║  DEFINITIVE QUEUESEL TEST (packet injection method)     ║\n");
-    printf("╚══════════════════════════════════════════════════════════╝\n");
-    printf("\nWaiting 15 seconds for you to send packets via netcat...\n");
-    printf("Command: echo 'test123' | nc localhost 7000\n");
-    printf("(Port 7000 is forwarded to guest port 7000 - Internal network)\n\n");
-
-    #if DEBUG_VERBOSE
-    /* Wait and process packets */
-    for (int i = 0; i < 15; i++) {
-        printf(".");
-        fflush(stdout);
-        for (int j = 0; j < 100; j++) {
-            sys_check_timeouts();
-            process_rx_packets();
-            seL4_Yield();
-        }
-    }
-    printf("\n\n");
-
-    /* Now check RX queue activity directly from memory */
-    uint16_t rx_used_idx_mem = rx_virtq.used->idx;
-    printf("RX Queue activity (from memory):\n");
-    printf("  rx_virtq.used->idx = %u (packets received by QEMU)\n\n", rx_used_idx_mem);
-
-    /* Key test: Check Queue 0 vs Queue 2 via MMIO reads */
-    printf("Now checking via MMIO registers with QueueSel:\n\n");
-
-    /* Test 1: Select Queue 0 (RX) - should show activity if packets arrived */
-    VREG_WRITE(VIRTIO_MMIO_QUEUE_SEL, 0);
-    #else
-    /* Process packets briefly without verbose output */
-    for (int i = 0; i < 15; i++) {
-        for (int j = 0; j < 100; j++) {
-            sys_check_timeouts();
-            process_rx_packets();
-            seL4_Yield();
-        }
-    }
-    #endif
-
-    #if DEBUG_VERBOSE
-    /* Test 1: Select Queue 0 (RX) - should show activity if packets arrived */
-    /* VirtIO spec doesn't have a register to read used->idx via MMIO,
-       but we can check QueueReady and QueueNumMax */
-    uint32_t q0_ready_final = VREG_READ(VIRTIO_MMIO_QUEUE_READY);
-    uint32_t q0_nummax_final = VREG_READ(VIRTIO_MMIO_QUEUE_NUM_MAX);
-    printf("Queue 0 (RX) via MMIO:\n");
-    printf("  QueueReady  = %u\n", q0_ready_final);
-    printf("  QueueNumMax = %u\n", q0_nummax_final);
-    printf("  (RX queue should be ready=1, nummax=1024)\n\n");
-
-    /* Test 2: Select Queue 1 (TX) */
-    VREG_WRITE(VIRTIO_MMIO_QUEUE_SEL, 1);
-    uint32_t q1_ready_final = VREG_READ(VIRTIO_MMIO_QUEUE_READY);
-    uint32_t q1_nummax_final = VREG_READ(VIRTIO_MMIO_QUEUE_NUM_MAX);
-    printf("Queue 1 (TX) via MMIO:\n");
-    printf("  QueueReady  = %u\n", q1_ready_final);
-    printf("  QueueNumMax = %u\n", q1_nummax_final);
-    printf("  (TX queue should be ready=1, nummax=1024)\n\n");
-
-    /* Test 3: Select Queue 2 (doesn't exist - NO CTRL_VQ feature) */
-    VREG_WRITE(VIRTIO_MMIO_QUEUE_SEL, 2);
-    uint32_t q2_ready_final = VREG_READ(VIRTIO_MMIO_QUEUE_READY);
-    uint32_t q2_nummax_final = VREG_READ(VIRTIO_MMIO_QUEUE_NUM_MAX);
-    printf("Queue 2 (NON-EXISTENT - no CTRL_VQ) via MMIO:\n");
-    printf("  QueueReady  = %u\n", q2_ready_final);
-    printf("  QueueNumMax = %u\n", q2_nummax_final);
-    printf("  (Should be ready=0, nummax=0 if QueueSel works)\n");
-    printf("  (If same as Q0, proves QueueSel stuck!)\n\n");
-
-    /* Analysis */
-    printf("═══════════════════════════════════════════════════════════\n");
-    printf("FINAL VERDICT:\n");
-
-    if (q2_nummax_final == 0 && q2_ready_final == 0) {
-        printf("✅ QueueSel WORKS!\n");
-        printf("   Queue 2 returns zeros (non-existent queue)\n");
-        printf("   Different from Queue 0/1 values\n");
-    } else if (q2_nummax_final == q0_nummax_final && q2_ready_final == q0_ready_final) {
-        printf("❌ QueueSel BROKEN - STUCK AT QUEUE 0!\n");
-        printf("   Queue 2 returns same values as Queue 0\n");
-        printf("   QueueNumMax: Q0=%u, Q2=%u (identical!)\n", q0_nummax_final, q2_nummax_final);
-        printf("   QueueReady:  Q0=%u, Q2=%u (identical!)\n", q0_ready_final, q2_ready_final);
-        printf("   This proves QueueSel writes don't reach QEMU\n");
-    } else {
-        printf("⚠️  UNCLEAR: Unexpected pattern\n");
-        printf("   Q0: ready=%u, nummax=%u\n", q0_ready_final, q0_nummax_final);
-        printf("   Q1: ready=%u, nummax=%u\n", q1_ready_final, q1_nummax_final);
-        printf("   Q2: ready=%u, nummax=%u\n", q2_ready_final, q2_nummax_final);
-    }
-
-    if (rx_used_idx_mem > 0) {
-        printf("\n📊 RX Activity: %u packets received (proves RX queue works!)\n", rx_used_idx_mem);
-    } else {
-        printf("\n⚠️  No RX packets detected - try sending: echo 'test' | nc localhost 7000\n");
-    }
-
-    printf("═══════════════════════════════════════════════════════════\n\n");
-
-    /* Restore to Q0 */
-    VREG_WRITE(VIRTIO_MMIO_QUEUE_SEL, 0);
-
-    printf("Test complete. System continuing...\n\n");
-    #endif
-    #endif  /* End of QueueSel diagnostic test */
-
-    /* VirtIO_Net1_Driver: Handles INTERNAL network (PLC/protected device side) */
-    printf("\n");
-    printf("╔══════════════════════════════════════════════════════════╗\n");
-    printf("║  [Net1] INTERNAL NETWORK READY (PLC/Protected Device)   ║\n");
-    printf("╚══════════════════════════════════════════════════════════╝\n");
-    printf("%s: ✅ RX path: TCP:%d → ICS_Outbound pipeline (Internal → External)\n", COMPONENT_NAME, TCP_SERVER_PORT);
-    printf("%s: ✅ TX path: ICS_Outbound_Resp → TCP:%d client (External → Internal)\n", COMPONENT_NAME, TCP_SERVER_PORT);
-    printf("%s: Ready to receive PLC traffic and forward filtered responses\n", COMPONENT_NAME);
 
     /* Mark initialization as successful */
     initialization_successful = true;
 
-    /* post_init() MUST return to allow other components to start! */
-    printf("%s: post_init() complete - returning to allow ICS pipeline to start\n", COMPONENT_NAME);
+    printf("%s: post_init() complete - returning to allow pipeline to start\n", COMPONENT_NAME);
 }
 
-/*
- * Component main loop (handle lwIP timers, RX packets, and CAmkES notifications)
- *
- * CRITICAL: This is called AFTER all components have initialized.
- * Moving the infinite event loop HERE (from post_init) allows EchoComponent's run() to execute.
- */
 int run(void)
 {
     /* Validate initialization completed successfully */
@@ -2290,14 +2584,18 @@ int run(void)
     /* Main event loop - process lwIP timers, RX packets, and ICS notifications */
     /* Note: TCP server is now initialized in RX path after first packet */
     while (1) {
-        /* Check for INBOUND notifications from ICS_Inbound (non-blocking) */
+        /* Check for OUTBOUND notifications from ICS_Outbound (non-blocking) */
         if (inbound_ready_poll()) {
-            inbound_ready_handle();
+            outbound_ready_handle();
         }
 
         /* Process lwIP timers and RX packets */
         sys_check_timeouts();
         process_rx_packets();
+
+        /* Refill RX buffers OUTSIDE IRQ context to avoid IRQ storm
+         * This happens in main loop after processing completes */
+        refill_rx_queue();
 
         seL4_Yield();
     }

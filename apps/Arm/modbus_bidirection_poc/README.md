@@ -240,18 +240,20 @@ The gateway uses a sophisticated **connection tracking system** with **IP rewrit
    ```c
    // lwIP only accepts packets for its interface IP (192.168.96.2)
    1. Rewrite dest IP: 192.168.95.2 → 192.168.96.2
-   2. Recalculate IP checksum
+   2. Recalculate IP checksum using inet_chksum(ip, ip->ihl * 4)
    3. lwIP accepts and processes packet
    4. TCP connection terminates (protocol-break architecture)
    ```
 
-4. **IP Restoration in TX Path**:
+4. **IP Restoration in TX Path** (v2.24):
    ```c
    // When sending TCP response to SCADA
    1. Lookup connection metadata by ports
    2. Restore original PLC IP as source: 192.168.96.2 → 192.168.95.2
-   3. Result: SCADA sees response from 192.168.95.2 (PLC's real IP)
-   4. Complete transparency maintained
+   3. Recalculate IP checksum with lwIP inet_chksum()
+   4. Recalculate TCP checksum with RFC 793 pseudo-header (includes src/dest IPs)
+   5. Result: SCADA sees response from 192.168.95.2 with VALID checksums
+   6. Complete transparency maintained
    ```
 
 5. **Why This Works**:

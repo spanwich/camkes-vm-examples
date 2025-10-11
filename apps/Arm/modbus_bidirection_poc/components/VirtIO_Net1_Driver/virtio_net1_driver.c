@@ -2107,6 +2107,25 @@ void inbound_ready_handle(void)
         return;
     }
 
+    /* CRITICAL: Store connection metadata BEFORE connecting
+     * This metadata is needed in netif_output() to restore original IPs
+     * when sending responses back through the gateway
+     */
+    struct connection_metadata *meta = connection_add(
+        ics_msg->metadata.src_ip,   /* Original SCADA IP (e.g., 192.168.90.5) */
+        ics_msg->metadata.dst_ip,   /* Original PLC IP (e.g., 192.168.95.2) */
+        ics_msg->metadata.src_port, /* SCADA port */
+        ics_msg->metadata.dst_port  /* PLC port (502) */
+    );
+
+    if (meta == NULL) {
+        printf("%s: INBOUND: Failed to store connection metadata (table full)\n", COMPONENT_NAME);
+        tcp_close(pcb);
+        inbound_tcp_client.active = false;
+        inbound_tcp_client.pcb = NULL;
+        return;
+    }
+
     /* CRITICAL: Set callback argument BEFORE tcp_connect()
      * This prevents null pointer dereference in inbound_tcp_sent_callback
      */
@@ -2681,8 +2700,8 @@ static int virtio_net_init(void)
 void post_init(void)
 {
     printf("%s: Component started\n", COMPONENT_NAME);
-    printf("%s: 🔖 NET1 SOFTWARE VERSION: v2.29-packet-burst-limit (2025-10-11)\n", COMPONENT_NAME);
-    printf("%s: 🔧 Features: Packet burst limiting (max 8/call), fair ICS notification processing\n", COMPONENT_NAME);
+    printf("%s: 🔖 NET1 SOFTWARE VERSION: v2.30-store-connection-metadata (2025-10-11)\n", COMPONENT_NAME);
+    printf("%s: 🔧 Features: Connection metadata storage for IP restoration in responses\n", COMPONENT_NAME);
     printf("%s: 🔧 Features: Internal gateway (no upstream GW), IP 192.168.95.1, inbound handler active\n\n", COMPONENT_NAME);
 
     /* Initialize connection tracking table */

@@ -1583,9 +1583,27 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
     ics_msg->metadata.is_ip = 1;
     ics_msg->metadata.is_tcp = 1;
 
-    /* Extract IP addresses from lwIP pcb (network byte order -> host byte order) */
+    /* Extract IP addresses - need ORIGINAL destination IP from connection tracking */
     ics_msg->metadata.src_ip = ntohl(ip4_addr_get_u32(&pcb->remote_ip));
-    ics_msg->metadata.dst_ip = ntohl(ip4_addr_get_u32(&pcb->local_ip));
+
+    /* CRITICAL: Look up original destination IP from connection tracking table
+     * pcb->local_ip is the REWRITTEN IP (192.168.96.2) used by lwIP
+     * We need the ORIGINAL PLC IP (e.g., 192.168.95.2) for Net1 to connect to */
+    struct connection_metadata *meta = connection_lookup_by_pcb(pcb);
+    if (meta != NULL && meta->active) {
+        /* Use original destination IP from packet metadata */
+        ics_msg->metadata.dst_ip = meta->original_dest_ip;
+        printf("%s: 🔍 Lookup: Found metadata - using original dest IP %u.%u.%u.%u\n",
+               COMPONENT_NAME,
+               (meta->original_dest_ip >> 24) & 0xFF,
+               (meta->original_dest_ip >> 16) & 0xFF,
+               (meta->original_dest_ip >> 8) & 0xFF,
+               meta->original_dest_ip & 0xFF);
+    } else {
+        /* Fallback: use rewritten IP if lookup fails */
+        ics_msg->metadata.dst_ip = ntohl(ip4_addr_get_u32(&pcb->local_ip));
+        printf("%s: ⚠️  Lookup: No metadata found - using rewritten IP (WRONG!)\n", COMPONENT_NAME);
+    }
 
     ics_msg->metadata.src_port = pcb->remote_port;
     ics_msg->metadata.dst_port = pcb->local_port;

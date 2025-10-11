@@ -2073,8 +2073,8 @@ static int virtio_net_init(void)
 void post_init(void)
 {
     printf("%s: Component started\n", COMPONENT_NAME);
-    printf("%s: 🔖 SOFTWARE VERSION: v2.15-bridge-architecture (2025-10-11)\n", COMPONENT_NAME);
-    printf("%s: 🔧 Features: Pure L2 bridge - NO NAT, real gateway IPs (192.168.96.2)\n\n", COMPONENT_NAME);
+    printf("%s: 🔖 SOFTWARE VERSION: v2.16-add-pfsense-gateway (2025-10-11)\n", COMPONENT_NAME);
+    printf("%s: 🔧 Features: Bridge architecture with pfSense gateway for SCADA routing\n\n", COMPONENT_NAME);
 
     /* Initialize VirtIO device */
     if (virtio_net_init() != 0) {
@@ -2129,14 +2129,14 @@ void post_init(void)
      * TCP server listens on 192.168.96.2:502
      */
     struct ip4_addr ipaddr, netmask, gw;
-    IP4_ADDR(&ipaddr, 192, 168, 96, 2);    /* Static IP: 192.168.96.2 (external gateway) */
+    IP4_ADDR(&ipaddr, 192, 168, 96, 2);    /* Static IP: 192.168.96.2 */
     IP4_ADDR(&netmask, 255, 255, 255, 0);  /* Netmask: 255.255.255.0 */
-    IP4_ADDR(&gw, 0, 0, 0, 0);             /* No gateway - WE are the gateway! */
+    IP4_ADDR(&gw, 192, 168, 96, 1);        /* Gateway: pfSense (to reach 192.168.90.x network) */
 
     printf("%s: Configuring network interface:\n", COMPONENT_NAME);
-    printf("%s:   IP:      192.168.96.2 (external gateway - pfSense routes here)\n", COMPONENT_NAME);
+    printf("%s:   IP:      192.168.96.2 (security gateway on 192.168.96.0/24)\n", COMPONENT_NAME);
     printf("%s:   Netmask: 255.255.255.0\n", COMPONENT_NAME);
-    printf("%s:   Gateway: None (this interface IS the gateway)\n", COMPONENT_NAME);
+    printf("%s:   Gateway: 192.168.96.1 (pfSense - routes to SCADA network)\n", COMPONENT_NAME);
     printf("%s:   TCP server: 192.168.96.2:%d\n", COMPONENT_NAME, TCP_ECHO_PORT);
 
     netif_add(&netif_data, &ipaddr, &netmask, &gw, NULL, custom_netif_init, custom_input_promiscuous);

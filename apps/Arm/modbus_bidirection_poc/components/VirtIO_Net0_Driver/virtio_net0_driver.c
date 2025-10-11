@@ -1110,9 +1110,14 @@ static void process_rx_packets(void)
     /* Process packets using correct wraparound arithmetic
      * CRITICAL: Re-read used->idx on EVERY iteration to avoid reading stale data
      * when we skip corrupted packets
+     *
+     * PACKET BURST LIMIT: Process at most 8 packets per call, then return to main loop
+     * This ensures we check for ICS notifications regularly and don't starve other tasks
      */
     uint32_t loop_count = 0;
-    while (1) {
+    const uint32_t MAX_PACKETS_PER_CALL = 8;
+
+    while (loop_count < MAX_PACKETS_PER_CALL) {
         /* VirtIO Spec 2.4.5: Read used->idx with ACQUIRE semantics
          * This ensures we see all ring entry writes BEFORE we read the ring data.
          * Must re-read on every iteration to avoid advancing past valid entries.
@@ -2419,8 +2424,8 @@ static int virtio_net_init(void)
 void post_init(void)
 {
     printf("%s: Component started\n", COMPONENT_NAME);
-    printf("%s: 🔖 NET0 SOFTWARE VERSION: v2.31-bidirectional-response (2025-10-11)\n", COMPONENT_NAME);
-    printf("%s: 🔧 Features: Bidirectional TCP, PLC response forwarding via existing connections\n\n", COMPONENT_NAME);
+    printf("%s: 🔖 NET0 SOFTWARE VERSION: v2.32-packet-burst-limit (2025-10-11)\n", COMPONENT_NAME);
+    printf("%s: 🔧 Features: Packet burst limiting (max 8/call), fair ICS notification processing\n\n", COMPONENT_NAME);
 
     /* Initialize connection tracking table */
     memset(connection_table, 0, sizeof(connection_table));

@@ -1,20 +1,71 @@
 /*
  * ICS Bidirectional Cross-Domain Security Gateway
  *
- * Architecture (matches README):
- *   VirtIO_Net0_Driver (External, port 6000) ⟷ ICS_Inbound ⟷ VirtIO_Net1_Driver (Internal, port 7000)
- *                                             ⟷ ICS_Outbound ⟷
+ * ════════════════════════════════════════════════════════════════════════════
+ * TRAFFIC FLOW LEGEND
+ * ════════════════════════════════════════════════════════════════════════════
  *
- * Data Flow:
- *   INBOUND (External → Internal):
- *     1. VirtIO_Net0_Driver: TCP server port 6000, receives data, extracts metadata+payload
- *     2. ICS_Inbound: Validates using FrameMetadata context (NO lwIP)
- *     3. VirtIO_Net1_Driver: Creates new TCP session, transmits to port 7000
+ * INBOUND  = External Network → Internal Network (SCADA → PLC)
+ * OUTBOUND = Internal Network → External Network (PLC → SCADA)
  *
- *   OUTBOUND (Internal → External):
- *     1. VirtIO_Net1_Driver: TCP server port 7000, receives data, extracts metadata+payload
- *     2. ICS_Outbound: Validates using FrameMetadata context (NO lwIP)
- *     3. VirtIO_Net0_Driver: Creates new TCP session, transmits to port 6000
+ * External Network: SCADA systems, HMIs, engineering workstations (untrusted)
+ * Internal Network: PLCs, RTUs, field devices (trusted)
+ *
+ * ════════════════════════════════════════════════════════════════════════════
+ * BIDIRECTIONAL ARCHITECTURE
+ * ════════════════════════════════════════════════════════════════════════════
+ *
+ * REQUEST PATH (INBOUND: SCADA → PLC):
+ *   ┌─────────┐         ┌─────────────┐         ┌─────────┐
+ *   │  SCADA  │────────▶│   Net0_Drv  │────────▶│ICS_In   │────────▶
+ *   │(Ext Net)│  TCP    │ (External)  │ dataport│(Validate)│
+ *   └─────────┘         └─────────────┘         └─────────┘
+ *                                                      │
+ *                                                      ▼
+ *   ┌─────────┐         ┌─────────────┐         ┌─────────┐
+ *   │   PLC   │◀────────│   Net1_Drv  │◀────────│ICS_In   │
+ *   │(Int Net)│  TCP    │ (Internal)  │ dataport│(Validate)│
+ *   └─────────┘         └─────────────┘         └─────────┘
+ *
+ * RESPONSE PATH (OUTBOUND: PLC → SCADA):
+ *   ┌─────────┐         ┌─────────────┐         ┌─────────┐
+ *   │   PLC   │────────▶│   Net1_Drv  │────────▶│ICS_Out  │────────▶
+ *   │(Int Net)│  TCP    │ (Internal)  │ dataport│(Validate)│
+ *   └─────────┘         └─────────────┘         └─────────┘
+ *                                                      │
+ *                                                      ▼
+ *   ┌─────────┐         ┌─────────────┐         ┌─────────┐
+ *   │  SCADA  │◀────────│   Net0_Drv  │◀────────│ICS_Out  │
+ *   │(Ext Net)│  TCP    │ (External)  │ dataport│(Validate)│
+ *   └─────────┘         └─────────────┘         └─────────┘
+ *
+ * ════════════════════════════════════════════════════════════════════════════
+ * COMPONENT DESCRIPTIONS
+ * ════════════════════════════════════════════════════════════════════════════
+ *
+ * VirtIO_Net0_Driver (External Network Interface):
+ *   - Connects to SCADA systems on external network (192.168.96.x)
+ *   - TCP server on port 502 (Modbus)
+ *   - Receives SCADA requests → forwards to ICS_Inbound
+ *   - Receives PLC responses from ICS_Outbound → sends to SCADA
+ *
+ * VirtIO_Net1_Driver (Internal Network Interface):
+ *   - Connects to PLCs on internal network (192.168.95.x)
+ *   - TCP client to PLC port 502
+ *   - Receives validated requests from ICS_Inbound → forwards to PLC
+ *   - Receives PLC responses → forwards to ICS_Outbound
+ *
+ * ICS_Inbound (SCADA→PLC Validator):
+ *   - Validates SCADA requests before forwarding to internal network
+ *   - Metadata-based validation (NO lwIP, stateless)
+ *   - Protocol detection: Modbus TCP, DNP3, EtherNet/IP
+ *
+ * ICS_Outbound (PLC→SCADA Validator):
+ *   - Validates PLC responses before forwarding to external network
+ *   - Metadata-based validation (NO lwIP, stateless)
+ *   - Ensures only legitimate PLC responses return to SCADA
+ *
+ * ════════════════════════════════════════════════════════════════════════════
  *
  * SPDX-License-Identifier: BSD-2-Clause
  */

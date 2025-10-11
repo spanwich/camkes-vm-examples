@@ -1664,6 +1664,12 @@ static err_t tcp_echo_accept(void *arg, struct tcp_pcb *newpcb, err_t err)
            COMPONENT_NAME, active_connections, total_connections_created, total_connections_closed);
 
     tcp_setprio(newpcb, TCP_PRIO_MIN);
+
+    /* CRITICAL: Set callback argument to NULL before registering callbacks
+     * This prevents NULL pointer dereference in tcp_echo_recv/tcp_echo_err
+     * We don't need per-connection state for the echo server, so NULL is fine */
+    tcp_arg(newpcb, NULL);
+
     tcp_recv(newpcb, tcp_echo_recv);
     tcp_err(newpcb, tcp_echo_err);  /* Register error callback for connection cleanup */
 

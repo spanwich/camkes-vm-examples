@@ -2424,7 +2424,7 @@ static int virtio_net_init(void)
 void post_init(void)
 {
     printf("%s: Component started\n", COMPONENT_NAME);
-    printf("%s: 🔖 SOFTWARE VERSION: v2.24-debug-checksums (2025-10-11)\n", COMPONENT_NAME);
+    printf("%s: 🔖 NET0 SOFTWARE VERSION: v2.24-debug-checksums (2025-10-11)\n", COMPONENT_NAME);
     printf("%s: 🔧 Features: Fixed IP/TCP checksums with lwIP functions, added checksum debug output\n\n", COMPONENT_NAME);
 
     /* Initialize connection tracking table */

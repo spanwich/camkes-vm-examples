@@ -620,9 +620,9 @@ static err_t netif_output(struct netif *netif, struct pbuf *p)
                                    (meta->original_dest_ip >> 24) & 0xFF, (meta->original_dest_ip >> 16) & 0xFF,
                                    (meta->original_dest_ip >> 8) & 0xFF, meta->original_dest_ip & 0xFF);
 
-                            /* Recalculate IP checksum */
+                            /* Recalculate IP checksum using lwIP's inet_chksum */
                             ip->check = 0;
-                            ip->check = ip_fast_csum((unsigned char *)ip, ip->ihl);
+                            ip->check = inet_chksum(ip, ip->ihl * 4);
 
                             /* Recalculate TCP checksum with pseudo-header */
                             tcp->check = 0;

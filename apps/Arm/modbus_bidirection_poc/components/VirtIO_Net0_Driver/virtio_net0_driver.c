@@ -48,6 +48,21 @@
 #define COMPONENT_NAME "VirtIO_Net0_Driver"
 #define TCP_SERVER_PORT 502  /* INBOUND: Modbus port - pretends to be PLC */
 
+/* Connection tracking for metadata preservation */
+#define MAX_CONNECTIONS 64
+
+struct connection_metadata {
+    struct tcp_pcb *pcb;           /* lwIP connection pointer (key) */
+    uint32_t original_src_ip;      /* Original source IP (e.g., 192.168.90.5 SCADA) */
+    uint32_t original_dest_ip;     /* Original destination IP (e.g., 192.168.95.2 PLC) */
+    uint16_t src_port;             /* Source port */
+    uint16_t dest_port;            /* Destination port */
+    bool active;                   /* Is this slot in use? */
+};
+
+static struct connection_metadata connection_table[MAX_CONNECTIONS];
+static int connection_count = 0;
+
 /*
  * VLAN-BASED DEPLOYMENT CONFIGURATION
  *
@@ -545,6 +560,65 @@ static err_t netif_output(struct netif *netif, struct pbuf *p)
         return ERR_BUF;
     }
 
+    /*
+     * CRITICAL: Restore original IPs for protocol-break architecture
+     *
+     * lwIP generated response with interface IP as source (192.168.96.2)
+     * But SCADA expects response from PLC IP (192.168.95.2)
+     * Restore: 192.168.96.2 → 192.168.95.2 (source IP)
+     * Keep: 192.168.90.5 (destination IP to SCADA)
+     */
+    uint8_t *tx_data = packet_buffers[tx_buf_idx];
+    if (p->tot_len >= sizeof(struct ethhdr) + sizeof(struct iphdr)) {
+        struct ethhdr *eth = (struct ethhdr *)tx_data;
+        if (ntohs(eth->h_proto) == 0x0800) {  /* IPv4 */
+            struct iphdr *ip = (struct iphdr *)(tx_data + sizeof(struct ethhdr));
+
+            if (ip->protocol == 6) {  /* TCP */
+                /* Extract current IPs and ports */
+                uint32_t current_src = ntohl(ip->saddr);  /* 192.168.96.2 from lwIP */
+                uint32_t current_dest = ntohl(ip->daddr); /* 192.168.90.5 to SCADA */
+
+                size_t ip_hdr_len = (ip->ihl) * 4;
+                if (p->tot_len >= sizeof(struct ethhdr) + ip_hdr_len + sizeof(struct tcphdr)) {
+                    struct tcphdr *tcp = (struct tcphdr *)(tx_data + sizeof(struct ethhdr) + ip_hdr_len);
+                    uint16_t src_port = ntohs(tcp->source);  /* 502 */
+                    uint16_t dest_port = ntohs(tcp->dest);   /* SCADA's port */
+
+                    /* Lookup original metadata by destination (SCADA) port */
+                    struct connection_metadata *meta = NULL;
+                    for (int i = 0; i < MAX_CONNECTIONS; i++) {
+                        if (connection_table[i].active &&
+                            connection_table[i].dest_port == src_port &&  /* Our port 502 */
+                            connection_table[i].src_port == dest_port) {  /* SCADA's port */
+                            meta = &connection_table[i];
+                            break;
+                        }
+                    }
+
+                    if (meta) {
+                        /* Restore original destination IP (PLC IP) as source */
+                        ip->saddr = htonl(meta->original_dest_ip);  /* 192.168.95.2 */
+
+                        printf("%s: 🔄 TX: Restored source IP: %u.%u.%u.%u → %u.%u.%u.%u\n",
+                               COMPONENT_NAME,
+                               (current_src >> 24) & 0xFF, (current_src >> 16) & 0xFF,
+                               (current_src >> 8) & 0xFF, current_src & 0xFF,
+                               (meta->original_dest_ip >> 24) & 0xFF, (meta->original_dest_ip >> 16) & 0xFF,
+                               (meta->original_dest_ip >> 8) & 0xFF, meta->original_dest_ip & 0xFF);
+
+                        /* Recalculate IP checksum */
+                        ip->check = 0;
+                        ip->check = ip_fast_csum((unsigned char *)ip, ip->ihl);
+
+                        /* Recalculate TCP checksum */
+                        tcp->check = 0;
+                        /* TODO: Proper TCP checksum calculation with pseudo-header */
+                    }
+                }
+            }
+        }
+    }
 
     /* Detailed TX packet inspection for first 10 packets */
     if (tx_count <= 10) {
@@ -664,19 +738,146 @@ static err_t netif_output(struct netif *netif, struct pbuf *p)
 }
 
 /*
- * Custom input function for bridge architecture
- * NO Virtual NAT needed - packets arrive with real destination IPs!
- *
- * With bridges, SCADA sends to 192.168.95.2 (PLC IP) and packets arrive
- * at our interface (192.168.96.2) with original IPs intact.
- * lwIP processes them normally.
+ * ═══════════════════════════════════════════════════════════════
+ * HELPER FUNCTIONS
+ * ═══════════════════════════════════════════════════════════════
  */
+
+/* Fast IP checksum calculation */
+static inline uint16_t ip_fast_csum(const void *iph, unsigned int ihl)
+{
+    const uint16_t *ptr = (const uint16_t *)iph;
+    uint32_t sum = 0;
+
+    while (ihl > 1) {
+        sum += *ptr++;
+        if (sum & 0x80000000)
+            sum = (sum & 0xFFFF) + (sum >> 16);
+        ihl -= 2;
+    }
+
+    if (ihl > 0)
+        sum += *(uint8_t *)ptr;
+
+    while (sum >> 16)
+        sum = (sum & 0xFFFF) + (sum >> 16);
+
+    return (uint16_t)~sum;
+}
+
 /*
- * Custom input function for protocol-break architecture
+ * ═══════════════════════════════════════════════════════════════
+ * CONNECTION TRACKING FOR METADATA PRESERVATION
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * Problem: ICS validation needs original source/dest IPs
+ * - Packets arrive: 192.168.90.5 (SCADA) → 192.168.95.2 (PLC)
+ * - We rewrite: 192.168.90.5 → 192.168.96.2 (for lwIP acceptance)
+ * - ICS pipeline needs to know original dest was 192.168.95.2
+ * - TCP responses must restore: 192.168.95.2 → 192.168.90.5
+ *
+ * Solution: Connection tracking table
+ * - Store original IPs when packet arrives
+ * - Link to TCP PCB when connection established
+ * - Lookup metadata when sending responses
+ * - Restore original IPs before transmission
+ */
+
+/* Store metadata for a new connection */
+static struct connection_metadata* connection_add(uint32_t orig_src, uint32_t orig_dest,
+                                                   uint16_t sport, uint16_t dport)
+{
+    for (int i = 0; i < MAX_CONNECTIONS; i++) {
+        if (!connection_table[i].active) {
+            connection_table[i].active = true;
+            connection_table[i].pcb = NULL;  /* Will be set when TCP accept happens */
+            connection_table[i].original_src_ip = orig_src;
+            connection_table[i].original_dest_ip = orig_dest;
+            connection_table[i].src_port = sport;
+            connection_table[i].dest_port = dport;
+            connection_count++;
+
+            printf("%s: 📝 Stored metadata [%d]: %u.%u.%u.%u:%u → %u.%u.%u.%u:%u\n",
+                   COMPONENT_NAME, i,
+                   (orig_src >> 24) & 0xFF, (orig_src >> 16) & 0xFF,
+                   (orig_src >> 8) & 0xFF, orig_src & 0xFF, sport,
+                   (orig_dest >> 24) & 0xFF, (orig_dest >> 16) & 0xFF,
+                   (orig_dest >> 8) & 0xFF, orig_dest & 0xFF, dport);
+
+            return &connection_table[i];
+        }
+    }
+    printf("%s: ⚠️  Connection table full! Dropping metadata.\n", COMPONENT_NAME);
+    return NULL;
+}
+
+/* Link PCB to existing metadata entry */
+static void connection_link_pcb(struct tcp_pcb *pcb, uint16_t sport, uint16_t dport)
+{
+    for (int i = 0; i < MAX_CONNECTIONS; i++) {
+        if (connection_table[i].active &&
+            connection_table[i].src_port == sport &&
+            connection_table[i].dest_port == dport &&
+            connection_table[i].pcb == NULL) {
+            connection_table[i].pcb = pcb;
+            printf("%s: 🔗 Linked PCB to metadata [%d]\n", COMPONENT_NAME, i);
+            return;
+        }
+    }
+    printf("%s: ⚠️  No metadata found for %u → %u\n", COMPONENT_NAME, sport, dport);
+}
+
+/* Lookup metadata by PCB */
+static struct connection_metadata* connection_lookup_by_pcb(struct tcp_pcb *pcb)
+{
+    for (int i = 0; i < MAX_CONNECTIONS; i++) {
+        if (connection_table[i].active && connection_table[i].pcb == pcb) {
+            return &connection_table[i];
+        }
+    }
+    return NULL;
+}
+
+/* Lookup metadata by 5-tuple (for SYN packets before PCB exists) */
+static struct connection_metadata* connection_lookup_by_tuple(uint32_t src_ip, uint32_t dest_ip,
+                                                               uint16_t sport, uint16_t dport)
+{
+    for (int i = 0; i < MAX_CONNECTIONS; i++) {
+        if (connection_table[i].active &&
+            connection_table[i].original_src_ip == src_ip &&
+            connection_table[i].src_port == sport &&
+            connection_table[i].dest_port == dport) {
+            return &connection_table[i];
+        }
+    }
+    return NULL;
+}
+
+/* Remove connection metadata */
+static void connection_remove(struct tcp_pcb *pcb)
+{
+    for (int i = 0; i < MAX_CONNECTIONS; i++) {
+        if (connection_table[i].active && connection_table[i].pcb == pcb) {
+            printf("%s: 🗑️  Removing metadata [%d]\n", COMPONENT_NAME, i);
+            connection_table[i].active = false;
+            connection_table[i].pcb = NULL;
+            connection_count--;
+            return;
+        }
+    }
+}
+
+/*
+ * Custom input function for protocol-break architecture WITH metadata preservation
  *
  * CRITICAL: Packets arrive with dest IP = 192.168.95.2 (PLC) but interface IP = 192.168.96.2
  * lwIP's ip_input() rejects packets not destined for interface IP
- * Solution: Rewrite destination IP to match interface IP before passing to lwIP
+ *
+ * Solution:
+ * 1. Store original src/dest IPs in connection table
+ * 2. Rewrite destination IP to match interface IP
+ * 3. Pass to lwIP for processing
+ * 4. Later restore original IPs when sending responses
  */
 static err_t custom_input_promiscuous(struct pbuf *p, struct netif *inp)
 {
@@ -689,9 +890,18 @@ static err_t custom_input_promiscuous(struct pbuf *p, struct netif *inp)
     if (p->len >= 20) {  /* Minimum IPv4 header size */
         struct ip_hdr *iphdr = (struct ip_hdr *)p->payload;
 
-        /* Extract destination IP */
+        /* Extract source and destination IPs */
+        uint32_t pkt_src_ip = ntohl(iphdr->src.addr);
         uint32_t pkt_dest_ip = ntohl(iphdr->dest.addr);
         uint32_t interface_ip = ntohl(inp->ip_addr.addr);
+
+        /* Extract ports if this is TCP */
+        uint16_t src_port = 0, dest_port = 0;
+        if (IPH_PROTO(iphdr) == IP_PROTO_TCP && p->len >= 20 + 20) {  /* IP + TCP headers */
+            struct tcp_hdr *tcphdr = (struct tcp_hdr *)((uint8_t *)iphdr + (IPH_HL(iphdr) * 4));
+            src_port = ntohs(tcphdr->src);
+            dest_port = ntohs(tcphdr->dest);
+        }
 
         /* If packet is not destined for our interface IP, rewrite it */
         if (pkt_dest_ip != interface_ip) {
@@ -701,6 +911,18 @@ static err_t custom_input_promiscuous(struct pbuf *p, struct netif *inp)
                    (pkt_dest_ip >> 8) & 0xFF, pkt_dest_ip & 0xFF,
                    (interface_ip >> 24) & 0xFF, (interface_ip >> 16) & 0xFF,
                    (interface_ip >> 8) & 0xFF, interface_ip & 0xFF);
+
+            /* CRITICAL: Store original IPs BEFORE rewriting */
+            if (IPH_PROTO(iphdr) == IP_PROTO_TCP && src_port != 0 && dest_port != 0) {
+                /* Check if we already have metadata for this connection */
+                struct connection_metadata *meta = connection_lookup_by_tuple(
+                    pkt_src_ip, pkt_dest_ip, src_port, dest_port);
+
+                if (!meta) {
+                    /* New connection - store metadata */
+                    connection_add(pkt_src_ip, pkt_dest_ip, src_port, dest_port);
+                }
+            }
 
             /* Rewrite destination IP to interface IP */
             iphdr->dest.addr = inp->ip_addr.addr;
@@ -2103,8 +2325,8 @@ static int virtio_net_init(void)
 void post_init(void)
 {
     printf("%s: Component started\n", COMPONENT_NAME);
-    printf("%s: 🔖 SOFTWARE VERSION: v2.17-fix-dest-ip-rewrite (2025-10-11)\n", COMPONENT_NAME);
-    printf("%s: 🔧 Features: Rewrites dest IP (192.168.95.2→192.168.96.2) so lwIP accepts packets\n\n", COMPONENT_NAME);
+    printf("%s: 🔖 SOFTWARE VERSION: v2.18-metadata-preservation (2025-10-11)\n", COMPONENT_NAME);
+    printf("%s: 🔧 Features: Connection tracking preserves & restores original IPs for ICS validation\n\n", COMPONENT_NAME);
 
     /* Initialize VirtIO device */
     if (virtio_net_init() != 0) {

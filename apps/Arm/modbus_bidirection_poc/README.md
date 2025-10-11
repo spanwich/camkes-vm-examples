@@ -82,75 +82,204 @@ cd ../projects/vm-examples/apps/Arm/modbus_bidirection_poc
 
 ## Network Architecture
 
-### Critical Requirement: Policy-Based Routing
+### Bridge Architecture (Layer 2)
 
-⚠️ **IMPORTANT**: This deployment requires **policy-based routing with separate routing tables** to prevent the Linux kernel from bypassing the QEMU security gateway through local routing.
+⚠️ **ARCHITECTURE CHANGE**: This deployment now uses **Linux bridges (br0, br1)** for pure Layer 2 forwarding instead of TAP devices with NAT.
 
-Without this configuration, traffic will route directly between physical NICs and completely bypass security inspection.
+**Key Benefits**:
+- Eliminates NAT complexity and metadata loss
+- QEMU owns actual gateway IPs (192.168.96.2, 192.168.95.1)
+- Connection tracking preserves original source/dest IPs for ICS validation
+- Protocol-break architecture maintains security isolation
 
 ### Network Topology
 
+**Critical Requirement**: SCADA and PLC have **hardcoded IPs** that cannot be changed. The gateway must transparently intercept traffic between them using cross-domain security architecture.
+
 ```
-[External Network: 192.168.96.0/24]
+┌───────────────────────────────────────────────────────────────────────────┐
+│                         Complete Network Topology                         │
+│                      (Bridge Architecture - Layer 2)                      │
+└───────────────────────────────────────────────────────────────────────────┘
+
+[SCADA: 192.168.90.5]
+    ↓ (hardcoded to connect to PLC at 192.168.95.2)
     ↓
-[ens224: 192.168.96.2] ← External-facing NIC
-    ↓ (Policy routing: iif ens224 → table to_qemu_net0)
-[tap0: 10.2.0.1] ← TAP bridge to QEMU
+[192.168.90.0/24 Network]
     ↓
-┌─────────────────────────────────────────┐
-│   QEMU Guest (seL4/CAmkES)              │
-│                                         │
-│   [nic0: 10.2.0.2:502]                 │
-│       ↓                                 │
-│   [ICS_Inbound Validator]              │
-│       ↓                                 │
-│   [ICS_Outbound Validator]             │
-│       ↓                                 │
-│   [nic1: 10.3.0.2:502]                 │
-│                                         │
-└─────────────────────────────────────────┘
+[pfSense Router: 192.168.90.100 / 192.168.96.1]
+    ↓ (routes 192.168.95.0/24 via 192.168.96.2)
     ↓
-[tap1: 10.3.0.1] ← TAP bridge from QEMU
-    ↓ (Policy routing: iif ens256 → table to_qemu_net1)
-[ens256: 192.168.95.1] ← Internal-facing NIC
+[192.168.96.0/24 Network] ← External/SCADA-facing network
     ↓
-[Internal Network: 192.168.95.0/24]
+[Gateway Server - ens224] ← Bridged to br0 (no IP)
+    ↓
+[br0 Bridge] ← Pure Layer 2 bridge (no IP, no NAT)
+    ↓
+[tap0] ← TAP interface to QEMU (no IP)
+    ↓
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    QEMU Guest (seL4/CAmkES)                             │
+│                   Cross-Domain Security Gateway                         │
+│                                                                         │
+│   [VirtIO_Net0_Driver: 192.168.96.2] ← OWNS gateway IP                │
+│       ↓ Receives: 192.168.90.5 → 192.168.95.2 (real IPs!)             │
+│       ↓ Connection tracking: Store original src/dest IPs               │
+│       ↓ IP rewriting: 192.168.95.2 → 192.168.96.2 (for lwIP)          │
+│       ↓ TCP termination (protocol-break architecture)                  │
+│       ↓ Extracts Modbus payload                                        │
+│       ↓                                                                 │
+│   [ICS_Inbound Component]                                              │
+│       ↓ Validates Modbus protocol with ORIGINAL IPs                    │
+│       ↓ Policy enforcement (preserves metadata)                        │
+│       ↓ Passes metadata only (isolated)                                │
+│       ↓                                                                 │
+│   [ICS_Outbound Component]                                             │
+│       ↓ Reconstructs valid traffic                                     │
+│       ↓                                                                 │
+│   [VirtIO_Net1_Driver: 192.168.95.1] ← OWNS gateway IP                │
+│       ↓ TCP reconstruction (connects to real PLC at 192.168.95.2)     │
+│       ↓ TX path: Restore original IPs (192.168.95.2 → 192.168.90.5)   │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+    ↓
+[tap1] ← TAP interface from QEMU (no IP)
+    ↓
+[br1 Bridge] ← Pure Layer 2 bridge (no IP, no NAT)
+    ↓
+[Gateway Server - ens256] ← Bridged to br1 (no IP)
+    ↓
+[192.168.95.0/24 Network] ← Internal/PLC-facing network
+    ↓
+[PLC: 192.168.95.2]
+    ↑ (hardcoded IP - receives connections from SCADA)
+
+
+═══════════════════════════════════════════════════════════════════════════
+                        TRAFFIC FLOW EXPLANATION
+═══════════════════════════════════════════════════════════════════════════
+
+SCADA → PLC (Modbus Request):
+────────────────────────────────
+1. SCADA (192.168.90.5) sends TCP SYN to 192.168.95.2:502 (PLC's hardcoded IP)
+2. pfSense routes 192.168.90.5 → 192.168.96.2 (gateway ens224)
+3. Bridge br0: ens224 → tap0 (pure Layer 2, no NAT, preserves real IPs)
+4. Packet arrives at VirtIO_Net0_Driver: 192.168.90.5 → 192.168.95.2 (REAL IPs!)
+5. Connection tracking: Store original src/dest IPs (192.168.90.5, 192.168.95.2)
+6. IP rewriting for lwIP: 192.168.95.2 → 192.168.96.2 (interface IP)
+7. VirtIO_Net0_Driver TCP termination (protocol-break architecture)
+   - lwIP accepts packet destined for 192.168.96.2
+   - Terminates TCP connection
+   - Extracts Modbus payload
+8. ICS_Inbound validates Modbus request → ALLOW/DENY
+9. VirtIO_Net1_Driver reconstructs NEW TCP connection to real PLC
+10. Bridge br1: tap1 → ens256 → 192.168.95.2
+11. PLC receives connection from gateway (192.168.95.1)
+
+PLC → SCADA (Modbus Response):
+────────────────────────────────
+12. PLC (192.168.95.2) sends TCP response
+13. VirtIO_Net1_Driver extracts payload
+14. ICS_Outbound validates response
+15. VirtIO_Net0_Driver sends response to SCADA
+    - Lookup connection metadata by ports
+    - Restore original PLC IP as source: 192.168.96.2 → 192.168.95.2
+    - Result: SCADA sees response from 192.168.95.2 (PLC IP)
+16. Bridge br0: tap0 → ens224 → pfSense → SCADA
+
+═══════════════════════════════════════════════════════════════════════════
 ```
 
 ### IP Address Configuration
 
 | Component | IP Address | Network | Role |
 |-----------|------------|---------|------|
-| **Physical NICs** |
-| ens224 | 192.168.96.2/24 | External | Receives SCADA traffic |
-| ens256 | 192.168.95.1/24 | Internal | Receives PLC traffic |
+| **End Devices (Hardcoded)** |
+| SCADA | 192.168.90.5 | 192.168.90.0/24 | Client - connects to 192.168.95.2 |
+| PLC | 192.168.95.2 | 192.168.95.0/24 | Server - expects connections |
+| **Network Infrastructure** |
+| pfSense Router | 192.168.90.100 (WAN)<br>192.168.96.1 (LAN) | Routes SCADA → Gateway |
+| **Gateway Server NICs** |
+| ens224 | No IP (bridged) | External | Bridged to br0 |
+| ens256 | No IP (bridged) | Internal | Bridged to br1 |
+| **Linux Bridges** |
+| br0 | No IP (Layer 2) | External | Pure L2 bridge: ens224 ↔ tap0 |
+| br1 | No IP (Layer 2) | Internal | Pure L2 bridge: ens256 ↔ tap1 |
 | **TAP Interfaces** |
-| tap0 | 10.2.0.1/24 | Private | Bridge to QEMU nic0 |
-| tap1 | 10.3.0.1/24 | Private | Bridge to QEMU nic1 |
-| **QEMU Guest** |
-| nic0 | 10.2.0.2/24 | Private | Security gateway (external side) |
-| nic1 | 10.3.0.2/24 | Private | Security gateway (internal side) |
+| tap0 | No IP (bridged) | External | Bridge member to QEMU nic0 |
+| tap1 | No IP (bridged) | Internal | Bridge member to QEMU nic1 |
+| **QEMU Guest (seL4/CAmkES)** |
+| nic0 (VirtIO_Net0) | 192.168.96.2/24 | External | OWNS gateway IP - accepts TCP with IP rewriting |
+| nic1 (VirtIO_Net1) | 192.168.95.1/24 | Internal | OWNS gateway IP - connects to real PLC |
 
-### Why Separate Routing Tables Are Required
+### The Hardcoded IP Challenge
 
-**Problem without policy routing:**
+**Problem**: Industrial control systems have **hardcoded IP addresses** that cannot be changed:
+- SCADA is programmed to connect to **192.168.95.2** (PLC's IP)
+- PLC expects connections on **192.168.95.2**
+- Gateway owns **192.168.96.2** but must accept packets for **192.168.95.2**
 
-Linux kernel sees both physical NICs on the main routing table and routes traffic directly between them (local routing), completely bypassing the QEMU gateway.
+**Solution - Connection Tracking + IP Rewriting**:
+
+The gateway uses a sophisticated **connection tracking system** with **IP rewriting**:
+
+1. **Bridge Architecture Preserves Real IPs**:
+   - Pure Layer 2 bridges (br0, br1) forward packets without modification
+   - Packets arrive with REAL IPs: 192.168.90.5 → 192.168.95.2
+   - No NAT means metadata preservation is possible
+
+2. **Connection Tracking** (implemented in `virtio_net0_driver.c`):
+   ```c
+   // When TCP SYN arrives: 192.168.90.5 → 192.168.95.2
+   1. Store original src/dest IPs in connection_table[]
+   2. Link metadata to TCP connection by ports
+   3. Metadata available for ICS validation pipeline
+   ```
+
+3. **IP Rewriting for lwIP Compatibility**:
+   ```c
+   // lwIP only accepts packets for its interface IP (192.168.96.2)
+   1. Rewrite dest IP: 192.168.95.2 → 192.168.96.2
+   2. Recalculate IP checksum
+   3. lwIP accepts and processes packet
+   4. TCP connection terminates (protocol-break architecture)
+   ```
+
+4. **IP Restoration in TX Path**:
+   ```c
+   // When sending TCP response to SCADA
+   1. Lookup connection metadata by ports
+   2. Restore original PLC IP as source: 192.168.96.2 → 192.168.95.2
+   3. Result: SCADA sees response from 192.168.95.2 (PLC's real IP)
+   4. Complete transparency maintained
+   ```
+
+5. **Why This Works**:
+   - **Metadata Preservation**: Original IPs stored before rewriting
+   - **lwIP Compatibility**: IP rewriting allows lwIP to accept packets
+   - **Transparency**: SCADA sees responses from PLC's real IP (192.168.95.2)
+   - **ICS Validation**: Original IPs available for policy enforcement
+   - **Isolation**: Protocol-break architecture maintains security
+
+This allows **complete transparency with security** - SCADA and PLC see normal communication while the gateway performs deep packet inspection with original IP metadata preserved for ICS validation rules.
+
+### Why Bridge Architecture is Required
+
+**Bridge Architecture Benefits:**
+
+Pure Layer 2 bridging provides transparency and metadata preservation:
 
 ```
-❌ Traffic path WITHOUT policy routing:
-ens224 → [kernel routes directly] → ens256
-(QEMU gateway bypassed - no security inspection!)
+✅ Traffic path WITH bridges:
+ens224 → br0 → tap0 → nic0 → [security validation] → nic1 → tap1 → br1 → ens256
 ```
 
-**Solution with policy routing:**
-
-Custom routing tables force all traffic through the QEMU gateway:
-
-```
-✅ Traffic path WITH policy routing:
-ens224 → table to_qemu_net0 → tap0 → nic0 → [security validation] → nic1 → tap1 → table to_qemu_net1 → ens256
-```
+**Key Advantages:**
+- **No NAT**: Real IPs preserved (192.168.90.5 → 192.168.95.2)
+- **No IP rewriting on host**: Host doesn't modify packets
+- **QEMU owns gateway IPs**: 192.168.96.2 and 192.168.95.1
+- **Connection tracking**: Preserves metadata for ICS validation
+- **Transparency**: SCADA and PLC see normal communication
 
 ---
 
@@ -160,131 +289,149 @@ ens224 → table to_qemu_net0 → tap0 → nic0 → [security validation] → ni
 
 See [Quick Start - Build](#build) section above.
 
-### Step 2: Setup TAP Networking with Policy-Based Routing
+### Step 2: Setup Bridge Networking (Layer 2)
 
 #### Create TAP Interfaces
 
 ```bash
-sudo ./setup-tap-networking.sh
+# Create TAP interfaces for QEMU
+sudo ip tuntap add dev tap0 mode tap user $(whoami)
+sudo ip tuntap add dev tap1 mode tap user $(whoami)
+sudo ip link set dev tap0 up
+sudo ip link set dev tap1 up
 ```
 
-This creates:
-- `tap0`: 10.2.0.1/24 (Gateway to QEMU nic0)
-- `tap1`: 10.3.0.1/24 (Gateway to QEMU nic1)
+#### Create Linux Bridges
 
-Verify:
 ```bash
-ip addr show tap0 tap1
+# Create bridge for external network (SCADA side)
+sudo ip link add name br0 type bridge
+sudo ip link set dev br0 up
+
+# Create bridge for internal network (PLC side)
+sudo ip link add name br1 type bridge
+sudo ip link set dev br1 up
 ```
 
-#### Configure Policy-Based Routing Tables
-
-Create two custom routing tables:
+#### Attach Interfaces to Bridges
 
 ```bash
-# Add custom routing tables (if not already present)
-echo "100 to_qemu_net0" | sudo tee -a /etc/iproute2/rt_tables
-echo "101 to_qemu_net1" | sudo tee -a /etc/iproute2/rt_tables
+# External bridge (br0): ens224 ↔ tap0
+sudo ip link set dev ens224 master br0
+sudo ip link set dev tap0 master br0
 
-# Configure routing table for traffic to nic0 (via tap0)
-sudo ip route add default via 10.2.0.2 dev tap0 table to_qemu_net0
-sudo ip route add 192.168.95.0/24 via 10.2.0.2 dev tap0 table to_qemu_net0
+# Internal bridge (br1): ens256 ↔ tap1
+sudo ip link set dev ens256 master br1
+sudo ip link set dev tap1 master br1
 
-# Configure routing table for traffic to nic1 (via tap1)
-sudo ip route add default via 10.3.0.2 dev tap1 table to_qemu_net1
-sudo ip route add 192.168.96.0/24 via 10.3.0.2 dev tap1 table to_qemu_net1
+# Remove IPs from physical NICs (they're now Layer 2 bridge members)
+sudo ip addr flush dev ens224
+sudo ip addr flush dev ens256
 ```
 
-**QEMU gateway addresses:**
-- `10.2.0.2` - QEMU nic0 gateway (handles external traffic)
-- `10.3.0.2` - QEMU nic1 gateway (handles internal traffic)
+**Bridge Architecture:**
+- `br0` - External bridge: ens224 ↔ tap0 (SCADA → Gateway)
+- `br1` - Internal bridge: ens256 ↔ tap1 (Gateway → PLC)
+- **QEMU owns gateway IPs**: 192.168.96.2 (nic0), 192.168.95.1 (nic1)
+- **No host IPs**: Pure Layer 2 forwarding, no NAT
 
-#### Apply Policy Routing Rules
-
-Direct incoming traffic from physical NICs to the appropriate routing table:
+#### Verify Bridge Configuration
 
 ```bash
-# Traffic from ens224 (external network) → use to_qemu_net0 table
-sudo ip rule add iif ens224 lookup to_qemu_net0 priority 100
+# Show bridge members
+bridge link show br0
+bridge link show br1
 
-# Traffic from ens256 (internal network) → use to_qemu_net1 table
-sudo ip rule add iif ens256 lookup to_qemu_net1 priority 101
+# Verify no IPs on physical NICs or TAP interfaces
+ip addr show ens224 ens256 tap0 tap1
+
+# Test connectivity (from QEMU)
+# QEMU nic0 should respond to: ping 192.168.96.2
+# QEMU nic1 should respond to: ping 192.168.95.1
 ```
 
-#### Configure NAT and Forwarding Rules
+#### Configure Forwarding (Optional - usually not needed)
 
 ```bash
-# Enable IP forwarding
+# Enable IP forwarding (only if needed for other routing)
 sudo sysctl -w net.ipv4.ip_forward=1
-
-# NAT: Translate QEMU traffic to appear from physical NIC IPs
-sudo iptables -t nat -A PREROUTING -d 192.168.96.2 -i ens224 -p tcp --dport 502 -j DNAT --to-destination 10.2.0.2:502
-sudo iptables -t nat -A PREROUTING -d 192.168.95.1 -i ens256 -p tcp --dport 502 -j DNAT --to-destination 10.3.0.2:502
-sudo iptables -t nat -A POSTROUTING -s 10.2.0.0/24 -o ens224 -j SNAT --to-source 192.168.96.2
-sudo iptables -t nat -A POSTROUTING -s 10.3.0.0/24 -o ens256 -j SNAT --to-source 192.168.95.1
-
-# Forwarding rules: Allow TAP ↔ NIC, but block direct NIC-to-NIC routing
-sudo iptables -A FORWARD -i tap0 -o ens224 -j ACCEPT
-sudo iptables -A FORWARD -i tap1 -o ens256 -j ACCEPT
-sudo iptables -A FORWARD -i ens224 -o tap0 -j ACCEPT
-sudo iptables -A FORWARD -i ens256 -o tap1 -j ACCEPT
-sudo iptables -A FORWARD -i ens224 -o ens256 -j DROP
-sudo iptables -A FORWARD -i ens256 -o ens224 -j DROP
 ```
 
-**Critical forwarding rules**: The `DROP` rules prevent direct routing between physical NICs. All traffic MUST flow through the QEMU gateway for inspection.
+**Bridge Forwarding**: Linux bridges forward Layer 2 frames automatically. No iptables NAT or routing rules are required for basic bridge operation.
 
 #### Verify Configuration
 
 ```bash
-# Check routing rules
-ip rule list
-# Expected:
-# 0:      from all lookup local
-# 100:    from all iif ens224 lookup to_qemu_net0
-# 101:    from all iif ens256 lookup to_qemu_net1
-# 32766:  from all lookup main
-# 32767:  from all lookup default
+# Check bridge configuration
+bridge link show
 
-# Check custom routing tables
-ip route show table to_qemu_net0
-ip route show table to_qemu_net1
+# Expected output:
+# 2: ens224: <BROADCAST,MULTICAST,UP,LOWER_UP> master br0
+# 3: tap0: <BROADCAST,MULTICAST,UP,LOWER_UP> master br0
+# 4: ens256: <BROADCAST,MULTICAST,UP,LOWER_UP> master br1
+# 5: tap1: <BROADCAST,MULTICAST,UP,LOWER_UP> master br1
 
-# Check NAT/forwarding rules
-sudo iptables -t nat -L -n -v
-sudo iptables -L FORWARD -n -v
+# Verify no IPs on bridge members
+ip addr show ens224 ens256 tap0 tap1
+# Should show: "inet" entries only on br0/br1 (if any)
+
+# Test Layer 2 connectivity
+# From SCADA: ping 192.168.96.2 (should reach QEMU nic0)
+# From QEMU: ping 192.168.95.2 (should reach PLC)
 ```
 
 #### Make Configuration Persistent (Optional)
 
+Create a systemd service for bridge setup:
+
 ```bash
-# Save iptables rules
-sudo iptables-save | sudo tee /etc/iptables/rules.v4
-
-# Create startup script for policy routing
-sudo tee /etc/network/if-up.d/qemu-gateway-routing <<'EOF'
+# Create bridge setup script
+sudo tee /usr/local/bin/setup-bridges.sh <<'EOF'
 #!/bin/bash
-# Add custom routing tables (idempotent)
-grep -q "to_qemu_net0" /etc/iproute2/rt_tables || echo "100 to_qemu_net0" >> /etc/iproute2/rt_tables
-grep -q "to_qemu_net1" /etc/iproute2/rt_tables || echo "101 to_qemu_net1" >> /etc/iproute2/rt_tables
+# Create TAP interfaces
+ip tuntap add dev tap0 mode tap user qemu
+ip tuntap add dev tap1 mode tap user qemu
+ip link set dev tap0 up
+ip link set dev tap1 up
 
-# Policy routing rules
-ip rule del iif ens224 lookup to_qemu_net0 2>/dev/null
-ip rule add iif ens224 lookup to_qemu_net0 priority 100
-ip rule del iif ens256 lookup to_qemu_net1 2>/dev/null
-ip rule add iif ens256 lookup to_qemu_net1 priority 101
+# Create bridges
+ip link add name br0 type bridge
+ip link add name br1 type bridge
+ip link set dev br0 up
+ip link set dev br1 up
 
-# Custom routing table entries
-ip route add default via 10.2.0.2 dev tap0 table to_qemu_net0 2>/dev/null || true
-ip route add 192.168.95.0/24 via 10.2.0.2 dev tap0 table to_qemu_net0 2>/dev/null || true
-ip route add default via 10.3.0.2 dev tap1 table to_qemu_net1 2>/dev/null || true
-ip route add 192.168.96.0/24 via 10.3.0.2 dev tap1 table to_qemu_net1 2>/dev/null || true
+# Attach interfaces
+ip link set dev ens224 master br0
+ip link set dev tap0 master br0
+ip link set dev ens256 master br1
+ip link set dev tap1 master br1
+
+# Remove IPs from physical NICs
+ip addr flush dev ens224
+ip addr flush dev ens256
 EOF
 
-sudo chmod +x /etc/network/if-up.d/qemu-gateway-routing
+sudo chmod +x /usr/local/bin/setup-bridges.sh
 
-# Restore iptables on boot (Ubuntu/Debian)
-sudo apt-get install iptables-persistent
+# Create systemd service
+sudo tee /etc/systemd/system/qemu-bridges.service <<'EOF'
+[Unit]
+Description=QEMU Bridge Network Setup
+After=network-pre.target
+Before=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/setup-bridges.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# Enable service
+sudo systemctl daemon-reload
+sudo systemctl enable qemu-bridges.service
 ```
 
 ### Step 3: Start Security Gateway
@@ -299,21 +446,21 @@ sudo apt-get install iptables-persistent
 Starting GRFICS ICS Security Gateway
 ========================================
 
-TAP Interface Status:
-  tap0: 10.2.0.1/24
-  tap1: 10.3.0.1/24
+Bridge Status:
+  br0: ens224 ↔ tap0 (External network)
+  br1: ens256 ↔ tap1 (Internal network)
 
 QEMU Configuration:
   Network 0 (External):
-    - TAP: tap0
+    - Bridge: br0 → tap0
     - MAC: 52:54:00:12:34:56
-    - Guest IP: 10.2.0.2
+    - Guest IP: 192.168.96.2/24 (OWNS gateway IP)
     - Listens on: Modbus port 502
 
   Network 1 (Internal):
-    - TAP: tap1
+    - Bridge: br1 → tap1
     - MAC: 52:54:00:12:34:57
-    - Guest IP: 10.3.0.2
+    - Guest IP: 192.168.95.1/24 (OWNS gateway IP)
     - Listens on: Modbus port 502
 
 Starting QEMU...
@@ -325,13 +472,14 @@ Watch for these messages in QEMU console:
 
 ```
 ✅ VirtIO_Net0_Driver: Using STATIC IP configuration:
-✅   IP:      10.2.0.2/24
-✅   Gateway: 10.2.0.1
+✅   IP:      192.168.96.2/24
+✅   Gateway: 192.168.96.1 (pfSense)
 ✅ VirtIO_Net0_Driver: TCP Echo Server listening on port 502
+✅ Connection tracking: Metadata preservation enabled
 
 ✅ VirtIO_Net1_Driver: Using STATIC IP configuration:
-✅   IP:      10.3.0.2/24
-✅   Gateway: 10.3.0.1
+✅   IP:      192.168.95.1/24
+✅   Gateway: N/A (direct L2 to PLC network)
 ✅ VirtIO_Net1_Driver: TCP Echo Server listening on port 502
 
 ✅ ICS_Inbound: Ready to validate external→internal traffic
@@ -342,36 +490,42 @@ Watch for these messages in QEMU console:
 
 ## Configuration Reference
 
-### Traffic Flow with NAT and Policy Routing
+### Traffic Flow with Bridge Architecture
 
 **External → Internal (e.g., SCADA command to PLC):**
 ```
-1. External device sends to: 192.168.96.2:502 (ens224 IP)
-2. DNAT translates to: 10.2.0.2:502 (nic0 in QEMU)
-3. Policy routing: ens224 → table to_qemu_net0 → tap0 → nic0
-4. QEMU nic0 receives traffic, validates via ICS_Inbound
-5. QEMU forwards validated traffic from nic1
-6. Routing: nic1 → tap1 → ens256 → internal network
-7. SNAT translates from: 10.3.0.x to 192.168.95.1 (ens256 IP)
+1. SCADA (192.168.90.5) sends to: 192.168.95.2:502 (PLC's hardcoded IP)
+2. pfSense routes to: 192.168.96.2 (gateway ens224)
+3. Bridge br0: ens224 → tap0 (Layer 2, preserves real IPs)
+4. VirtIO_Net0_Driver receives: 192.168.90.5 → 192.168.95.2 (REAL IPs!)
+5. Connection tracking: Store original src/dest IPs
+6. IP rewriting: 192.168.95.2 → 192.168.96.2 (for lwIP acceptance)
+7. TCP termination: lwIP accepts packet, terminates TCP connection
+8. ICS_Inbound validates payload with original IP metadata
+9. VirtIO_Net1_Driver reconstructs NEW TCP connection to PLC
+10. Bridge br1: tap1 → ens256 → PLC (192.168.95.2)
+11. PLC receives connection from gateway IP (192.168.95.1)
 ```
 
 **Internal → External (e.g., PLC response to SCADA):**
 ```
-1. Internal device sends to: 192.168.95.1:502 (ens256 IP)
-2. DNAT translates to: 10.3.0.2:502 (nic1 in QEMU)
-3. Policy routing: ens256 → table to_qemu_net1 → tap1 → nic1
-4. QEMU nic1 receives traffic, validates via ICS_Outbound
-5. QEMU forwards validated traffic from nic0
-6. Routing: nic0 → tap0 → ens224 → external network
-7. SNAT translates from: 10.2.0.x to 192.168.96.2 (ens224 IP)
+1. PLC (192.168.95.2) sends response
+2. Bridge br1: ens256 → tap1 → VirtIO_Net1_Driver
+3. VirtIO_Net1_Driver extracts payload
+4. ICS_Outbound validates response
+5. VirtIO_Net0_Driver sends response to SCADA
+6. Lookup connection metadata by ports
+7. Restore original PLC IP as source: 192.168.96.2 → 192.168.95.2
+8. Bridge br0: tap0 → ens224 → pfSense → SCADA
+9. SCADA receives response from PLC IP (192.168.95.2)
 ```
 
 ### Complete Traffic Flow Table
 
-| Source Network | Host Receives On | DNAT To | QEMU Receives On | Validates | QEMU Sends From | SNAT To | Destination Network |
-|----------------|------------------|---------|------------------|-----------|-----------------|---------|---------------------|
-| 192.168.96.0/24 | ens224:502 | 10.2.0.2:502 | nic0:502 | ICS_Inbound | nic1 | 192.168.95.1 | 192.168.95.0/24 |
-| 192.168.95.0/24 | ens256:502 | 10.3.0.2:502 | nic1:502 | ICS_Outbound | nic0 | 192.168.96.2 | 192.168.96.0/24 |
+| Direction | Source IP | Dest IP | Bridge | QEMU Component | Validates | Connection Tracking | Final Dest |
+|-----------|-----------|---------|--------|----------------|-----------|---------------------|------------|
+| SCADA → PLC | 192.168.90.5 | 192.168.95.2 | br0 → tap0 | VirtIO_Net0 | ICS_Inbound | Store metadata | VirtIO_Net1 → PLC |
+| PLC → SCADA | 192.168.95.2 | 192.168.90.5 | br1 → tap1 | VirtIO_Net1 | ICS_Outbound | Restore IPs | VirtIO_Net0 → SCADA |
 
 ---
 
@@ -379,33 +533,51 @@ Watch for these messages in QEMU console:
 
 ### Test Connectivity
 
-**From gateway server:**
+**From external network (SCADA/pfSense):**
 ```bash
-# Test QEMU guest connectivity
-ping 10.2.0.2  # Should reach QEMU nic0
-ping 10.3.0.2  # Should reach QEMU nic1
+# Test QEMU nic0 (external interface)
+ping 192.168.96.2  # Should reach VirtIO_Net0_Driver
 ```
 
-**From external network:**
+**From internal network (PLC side):**
 ```bash
-# Test gateway external interface
-ping 192.168.96.2  # Should reach ens224
+# Test QEMU nic1 (internal interface)
+ping 192.168.95.1  # Should reach VirtIO_Net1_Driver
 ```
 
-**From internal network:**
+**From gateway server (monitoring):**
 ```bash
-# Test gateway internal interface
-ping 192.168.95.1  # Should reach ens256
+# Monitor bridge traffic
+sudo tcpdump -i br0 -n
+sudo tcpdump -i br1 -n
+
+# Monitor TAP interfaces
+sudo tcpdump -i tap0 -n
+sudo tcpdump -i tap1 -n
+```
+
+**Test TCP connectivity:**
+```bash
+# From SCADA network: Test Modbus TCP connection
+nc -zv 192.168.95.2 502  # Should connect through gateway
+
+# Expected: Connection through gateway with metadata preservation
+# SCADA sees: 192.168.95.2 (PLC IP)
+# PLC sees: 192.168.95.1 (Gateway IP)
 ```
 
 ### Monitor Traffic
 
 ```bash
-# Watch traffic on TAP interfaces (should see Modbus traffic)
-sudo tcpdump -i tap0 -n port 502 -v
-sudo tcpdump -i tap1 -n port 502 -v
+# Monitor bridge traffic (should see real IPs preserved)
+sudo tcpdump -i br0 -n port 502 -v
+sudo tcpdump -i br1 -n port 502 -v
 
-# Watch traffic on physical NICs
+# Monitor TAP interfaces (should see gateway IPs)
+sudo tcpdump -i tap0 -n -v
+sudo tcpdump -i tap1 -n -v
+
+# Monitor physical NICs (should see real SCADA/PLC IPs)
 sudo tcpdump -i ens224 -n port 502 -v
 sudo tcpdump -i ens256 -n port 502 -v
 ```
@@ -418,28 +590,39 @@ From SCADA machine, connect to PLC normally. The gateway transparently intercept
 
 ```
 INBOUND PATH (External → Internal):
-VirtIO_Net0_Driver: TCP connection accepted from <SCADA_IP>
+VirtIO_Net0_Driver: RX: 192.168.90.5 → 192.168.95.2 (REAL IPs!)
+VirtIO_Net0_Driver: 🔄 Connection tracking: Store metadata
+VirtIO_Net0_Driver: 🔄 Rewriting dest IP: 192.168.95.2 → 192.168.96.2
+VirtIO_Net0_Driver: TCP connection accepted from 192.168.90.5
 VirtIO_Net0_Driver: INBOUND: Forwarding X bytes to ICS_Inbound
-ICS_Inbound: Validating Modbus request...
+ICS_Inbound: Validating Modbus request (original IPs: 192.168.90.5 → 192.168.95.2)
 ICS_Inbound: ALLOW - Forwarding to internal network
-VirtIO_Net1_Driver: Sent X bytes to destination
+VirtIO_Net1_Driver: NEW TCP connection to PLC 192.168.95.2
+VirtIO_Net1_Driver: Sent X bytes to PLC
 
 OUTBOUND PATH (Internal → External):
-VirtIO_Net1_Driver: TCP connection accepted from <PLC_IP>
+VirtIO_Net1_Driver: TCP response from PLC 192.168.95.2
 VirtIO_Net1_Driver: OUTBOUND: Forwarding X bytes to ICS_Outbound
 ICS_Outbound: Validating Modbus response...
 ICS_Outbound: ALLOW - Forwarding to external network
-VirtIO_Net0_Driver: Sent X bytes to destination
+VirtIO_Net0_Driver: 🔄 TX: Lookup connection metadata
+VirtIO_Net0_Driver: 🔄 TX: Restored source IP: 192.168.96.2 → 192.168.95.2
+VirtIO_Net0_Driver: Sent X bytes to SCADA (appears from 192.168.95.2)
 ```
 
 ### Testing Checklist
 
-- [ ] TAP interfaces created successfully (tap0, tap1)
-- [ ] Policy routing rules active (`ip rule list`)
-- [ ] Custom routing tables populated
-- [ ] NAT rules configured (`sudo iptables -t nat -L -n -v`)
+- [ ] Bridge interfaces created successfully (br0, br1)
+- [ ] TAP interfaces attached to bridges
+- [ ] Physical NICs have no IPs (bridged mode)
 - [ ] QEMU starts without errors
-- [ ] Both VirtIO drivers initialize with correct IPs
+- [ ] VirtIO_Net0_Driver initializes with 192.168.96.2/24
+- [ ] VirtIO_Net1_Driver initializes with 192.168.95.1/24
+- [ ] Connection tracking metadata storage working
+- [ ] IP rewriting for lwIP acceptance working
+- [ ] IP restoration in TX path working
+- [ ] SCADA can connect to PLC IP (192.168.95.2)
+- [ ] SCADA sees responses from PLC IP (192.168.95.2)
 - [ ] TCP servers listening on port 502
 - [ ] ICS_Inbound and ICS_Outbound ready
 - [ ] Traffic appears in QEMU logs

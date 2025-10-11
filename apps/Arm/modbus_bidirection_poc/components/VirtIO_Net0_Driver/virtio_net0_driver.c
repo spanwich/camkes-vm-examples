@@ -40,6 +40,7 @@
 #include "lwip/inet_chksum.h"
 #include "lwip/prot/tcp.h"
 #include "lwip/prot/udp.h"
+#include "lwip/prot/ip.h"
 #include "netif/ethernet.h"
 
 /* ICS common definitions */
@@ -440,6 +441,7 @@ static err_t custom_netif_init(struct netif *netif);
 static void netif_status_callback(struct netif *netif);
 static void setup_tcp_echo_server(void);
 static inline uint16_t ip_fast_csum(const void *iph, unsigned int ihl);
+static uint16_t tcp_checksum(struct iphdr *ip, struct tcphdr *tcp, uint16_t tcp_len);
 
 /*
  * Get free RX buffer index
@@ -589,6 +591,12 @@ static err_t netif_output(struct netif *netif, struct pbuf *p)
                     /* Lookup original metadata by destination (SCADA) port */
                     struct connection_metadata *meta = NULL;
                     for (int i = 0; i < MAX_CONNECTIONS; i++) {
+                        /* Defensive check: ensure index is valid */
+                        if (i >= MAX_CONNECTIONS) {
+                            printf("%s: ⚠️  TX: Invalid connection table index %d\n", COMPONENT_NAME, i);
+                            break;
+                        }
+
                         if (connection_table[i].active &&
                             connection_table[i].dest_port == src_port &&  /* Our port 502 */
                             connection_table[i].src_port == dest_port) {  /* SCADA's port */
@@ -597,24 +605,33 @@ static err_t netif_output(struct netif *netif, struct pbuf *p)
                         }
                     }
 
-                    if (meta) {
-                        /* Restore original destination IP (PLC IP) as source */
-                        ip->saddr = htonl(meta->original_dest_ip);  /* 192.168.95.2 */
+                    if (meta != NULL && meta->active) {
+                        /* Double-check metadata is valid before using */
+                        if (meta->original_dest_ip == 0) {
+                            printf("%s: ⚠️  TX: Invalid metadata - original_dest_ip is 0\n", COMPONENT_NAME);
+                        } else {
+                            /* Restore original destination IP (PLC IP) as source */
+                            ip->saddr = htonl(meta->original_dest_ip);  /* 192.168.95.2 */
 
-                        printf("%s: 🔄 TX: Restored source IP: %u.%u.%u.%u → %u.%u.%u.%u\n",
-                               COMPONENT_NAME,
-                               (current_src >> 24) & 0xFF, (current_src >> 16) & 0xFF,
-                               (current_src >> 8) & 0xFF, current_src & 0xFF,
-                               (meta->original_dest_ip >> 24) & 0xFF, (meta->original_dest_ip >> 16) & 0xFF,
-                               (meta->original_dest_ip >> 8) & 0xFF, meta->original_dest_ip & 0xFF);
+                            printf("%s: 🔄 TX: Restored source IP: %u.%u.%u.%u → %u.%u.%u.%u\n",
+                                   COMPONENT_NAME,
+                                   (current_src >> 24) & 0xFF, (current_src >> 16) & 0xFF,
+                                   (current_src >> 8) & 0xFF, current_src & 0xFF,
+                                   (meta->original_dest_ip >> 24) & 0xFF, (meta->original_dest_ip >> 16) & 0xFF,
+                                   (meta->original_dest_ip >> 8) & 0xFF, meta->original_dest_ip & 0xFF);
 
-                        /* Recalculate IP checksum */
-                        ip->check = 0;
-                        ip->check = ip_fast_csum((unsigned char *)ip, ip->ihl);
+                            /* Recalculate IP checksum */
+                            ip->check = 0;
+                            ip->check = ip_fast_csum((unsigned char *)ip, ip->ihl);
 
-                        /* Recalculate TCP checksum */
-                        tcp->check = 0;
-                        /* TODO: Proper TCP checksum calculation with pseudo-header */
+                            /* Recalculate TCP checksum with pseudo-header */
+                            tcp->check = 0;
+                            uint16_t tcp_len = ntohs(ip->tot_len) - (ip->ihl * 4);
+                            tcp->check = tcp_checksum(ip, tcp, tcp_len);
+                        }
+                    } else {
+                        printf("%s: ⚠️  TX: No metadata found for TCP port %u → %u\n",
+                               COMPONENT_NAME, src_port, dest_port);
                     }
                 }
             }
@@ -766,6 +783,44 @@ static inline uint16_t ip_fast_csum(const void *iph, unsigned int ihl)
     return (uint16_t)~sum;
 }
 
+/* TCP checksum calculation with pseudo-header */
+static uint16_t tcp_checksum(struct iphdr *ip, struct tcphdr *tcp, uint16_t tcp_len)
+{
+    uint32_t sum = 0;
+    uint16_t *ptr;
+    int i;
+
+    /* Pseudo-header (source IP) */
+    sum += (ip->saddr >> 16) & 0xFFFF;
+    sum += ip->saddr & 0xFFFF;
+
+    /* Pseudo-header (dest IP) */
+    sum += (ip->daddr >> 16) & 0xFFFF;
+    sum += ip->daddr & 0xFFFF;
+
+    /* Pseudo-header (protocol and TCP length) */
+    sum += htons(IP_PROTO_TCP);
+    sum += htons(tcp_len);
+
+    /* TCP header and data */
+    ptr = (uint16_t *)tcp;
+    for (i = 0; i < tcp_len / 2; i++) {
+        sum += ptr[i];
+    }
+
+    /* Handle odd byte */
+    if (tcp_len & 1) {
+        sum += ((uint8_t *)tcp)[tcp_len - 1];
+    }
+
+    /* Fold 32-bit sum to 16 bits */
+    while (sum >> 16) {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+
+    return (uint16_t)~sum;
+}
+
 /*
  * ═══════════════════════════════════════════════════════════════
  * CONNECTION TRACKING FOR METADATA PRESERVATION
@@ -882,59 +937,92 @@ static void connection_remove(struct tcp_pcb *pcb)
  */
 static err_t custom_input_promiscuous(struct pbuf *p, struct netif *inp)
 {
-    /* Remove Ethernet header first */
-    if (pbuf_remove_header(p, sizeof(struct eth_hdr)) != 0) {
+    struct eth_hdr *ethhdr;
+    u16_t type;
+
+    /* Check Ethernet header */
+    if (p->len < sizeof(struct eth_hdr)) {
+        return ERR_ARG;
+    }
+
+    ethhdr = (struct eth_hdr *)p->payload;
+    type = ntohs(ethhdr->type);
+
+    /* Handle ARP packets normally - pass to lwIP's ARP handler */
+    if (type == ETHTYPE_ARP) {
+        /* Remove Ethernet header and pass to ethernet_input for ARP processing */
+        if (pbuf_remove_header(p, sizeof(struct eth_hdr)) == 0) {
+            etharp_input(p, inp);
+            return ERR_OK;
+        }
+        return ERR_ARG;
+    }
+
+    /* Handle IPv6 - pass to ethernet_input */
+    if (type == ETHTYPE_IPV6) {
         return ethernet_input(p, inp);
     }
 
-    /* Check if this is an IPv4 packet */
-    if (p->len >= 20) {  /* Minimum IPv4 header size */
-        struct ip_hdr *iphdr = (struct ip_hdr *)p->payload;
-
-        /* Extract source and destination IPs */
-        uint32_t pkt_src_ip = ntohl(iphdr->src.addr);
-        uint32_t pkt_dest_ip = ntohl(iphdr->dest.addr);
-        uint32_t interface_ip = ntohl(inp->ip_addr.addr);
-
-        /* Extract ports if this is TCP */
-        uint16_t src_port = 0, dest_port = 0;
-        if (IPH_PROTO(iphdr) == IP_PROTO_TCP && p->len >= 20 + 20) {  /* IP + TCP headers */
-            struct tcp_hdr *tcphdr = (struct tcp_hdr *)((uint8_t *)iphdr + (IPH_HL(iphdr) * 4));
-            src_port = ntohs(tcphdr->src);
-            dest_port = ntohs(tcphdr->dest);
+    /* Handle IPv4 with IP rewriting for protocol-break */
+    if (type == ETHTYPE_IP) {
+        /* Remove Ethernet header first */
+        if (pbuf_remove_header(p, sizeof(struct eth_hdr)) != 0) {
+            return ERR_ARG;
         }
 
-        /* If packet is not destined for our interface IP, rewrite it */
-        if (pkt_dest_ip != interface_ip) {
-            printf("%s: 🔄 Rewriting dest IP: %u.%u.%u.%u → %u.%u.%u.%u\n",
-                   COMPONENT_NAME,
-                   (pkt_dest_ip >> 24) & 0xFF, (pkt_dest_ip >> 16) & 0xFF,
-                   (pkt_dest_ip >> 8) & 0xFF, pkt_dest_ip & 0xFF,
-                   (interface_ip >> 24) & 0xFF, (interface_ip >> 16) & 0xFF,
-                   (interface_ip >> 8) & 0xFF, interface_ip & 0xFF);
+        /* Check if this is an IPv4 packet */
+        if (p->len >= 20) {  /* Minimum IPv4 header size */
+            struct ip_hdr *iphdr = (struct ip_hdr *)p->payload;
 
-            /* CRITICAL: Store original IPs BEFORE rewriting */
-            if (IPH_PROTO(iphdr) == IP_PROTO_TCP && src_port != 0 && dest_port != 0) {
-                /* Check if we already have metadata for this connection */
-                struct connection_metadata *meta = connection_lookup_by_tuple(
-                    pkt_src_ip, pkt_dest_ip, src_port, dest_port);
+            /* Extract source and destination IPs */
+            uint32_t pkt_src_ip = ntohl(iphdr->src.addr);
+            uint32_t pkt_dest_ip = ntohl(iphdr->dest.addr);
+            uint32_t interface_ip = ntohl(inp->ip_addr.addr);
 
-                if (!meta) {
-                    /* New connection - store metadata */
-                    connection_add(pkt_src_ip, pkt_dest_ip, src_port, dest_port);
-                }
+            /* Extract ports if this is TCP */
+            uint16_t src_port = 0, dest_port = 0;
+            if (IPH_PROTO(iphdr) == IP_PROTO_TCP && p->len >= 20 + 20) {  /* IP + TCP headers */
+                struct tcp_hdr *tcphdr = (struct tcp_hdr *)((uint8_t *)iphdr + (IPH_HL(iphdr) * 4));
+                src_port = ntohs(tcphdr->src);
+                dest_port = ntohs(tcphdr->dest);
             }
 
-            /* Rewrite destination IP to interface IP */
-            iphdr->dest.addr = inp->ip_addr.addr;
+            /* If packet is not destined for our interface IP, rewrite it */
+            if (pkt_dest_ip != interface_ip) {
+                printf("%s: 🔄 Rewriting dest IP: %u.%u.%u.%u → %u.%u.%u.%u\n",
+                       COMPONENT_NAME,
+                       (pkt_dest_ip >> 24) & 0xFF, (pkt_dest_ip >> 16) & 0xFF,
+                       (pkt_dest_ip >> 8) & 0xFF, pkt_dest_ip & 0xFF,
+                       (interface_ip >> 24) & 0xFF, (interface_ip >> 16) & 0xFF,
+                       (interface_ip >> 8) & 0xFF, interface_ip & 0xFF);
 
-            /* Recalculate IP checksum */
-            iphdr->_chksum = 0;
-            iphdr->_chksum = inet_chksum(iphdr, IPH_HL(iphdr) * 4);
+                /* CRITICAL: Store original IPs BEFORE rewriting */
+                if (IPH_PROTO(iphdr) == IP_PROTO_TCP && src_port != 0 && dest_port != 0) {
+                    /* Check if we already have metadata for this connection */
+                    struct connection_metadata *meta = connection_lookup_by_tuple(
+                        pkt_src_ip, pkt_dest_ip, src_port, dest_port);
+
+                    if (!meta) {
+                        /* New connection - store metadata */
+                        connection_add(pkt_src_ip, pkt_dest_ip, src_port, dest_port);
+                    }
+                }
+
+                /* Rewrite destination IP to interface IP */
+                iphdr->dest.addr = inp->ip_addr.addr;
+
+                /* Recalculate IP checksum */
+                iphdr->_chksum = 0;
+                iphdr->_chksum = inet_chksum(iphdr, IPH_HL(iphdr) * 4);
+            }
         }
+
+        return ip_input(p, inp);
     }
 
-    return ip_input(p, inp);
+    /* Unknown protocol - drop */
+    pbuf_free(p);
+    return ERR_OK;
 }
 
 /*
@@ -2326,8 +2414,13 @@ static int virtio_net_init(void)
 void post_init(void)
 {
     printf("%s: Component started\n", COMPONENT_NAME);
-    printf("%s: 🔖 SOFTWARE VERSION: v2.19-disable-tcp-checksum (2025-10-11)\n", COMPONENT_NAME);
-    printf("%s: 🔧 Features: Disabled TCP RX checksum - rewriting dest IP invalidates it\n\n", COMPONENT_NAME);
+    printf("%s: 🔖 SOFTWARE VERSION: v2.22-add-safety-checks (2025-10-11)\n", COMPONENT_NAME);
+    printf("%s: 🔧 Features: Added TX safety checks, fixed ARP, lwIP debug disabled\n\n", COMPONENT_NAME);
+
+    /* Initialize connection tracking table */
+    memset(connection_table, 0, sizeof(connection_table));
+    connection_count = 0;
+    printf("%s: ✓ Connection tracking table initialized (%d slots)\n", COMPONENT_NAME, MAX_CONNECTIONS);
 
     /* Initialize VirtIO device */
     if (virtio_net_init() != 0) {

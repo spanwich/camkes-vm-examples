@@ -64,20 +64,20 @@
 #define CHECKSUM_CHECK_UDP              1
 #define CHECKSUM_CHECK_TCP              0  /* Disabled - we rewrite dest IP */
 
-/* Debugging options - TCP-focused with minimal noise */
-#define LWIP_DEBUG                      1
-#define LWIP_DBG_MIN_LEVEL              LWIP_DBG_LEVEL_ALL  /* Show all levels for TCP */
-#define LWIP_DBG_TYPES_ON               LWIP_DBG_ON
+/* Debugging options - Disabled for production */
+#define LWIP_DEBUG                      0                 /* Disable all lwIP debug output */
+#define LWIP_DBG_MIN_LEVEL              LWIP_DBG_LEVEL_OFF
+#define LWIP_DBG_TYPES_ON               LWIP_DBG_OFF
 
-/* Enable TCP debugging with specific control */
-#define TCP_DEBUG                       (LWIP_DBG_ON | LWIP_DBG_LEVEL_WARNING)  /* TCP errors/warnings only */
-#define TCP_INPUT_DEBUG                 LWIP_DBG_ON       /* TCP input processing - CRITICAL */
-#define TCP_OUTPUT_DEBUG                LWIP_DBG_ON       /* TCP output processing */
-#define TCPIP_DEBUG                     LWIP_DBG_OFF      /* Disable generic TCPIP */
-#define IP_DEBUG                        LWIP_DBG_OFF      /* Disable IP header dumps */
-#define ETHARP_DEBUG                    LWIP_DBG_OFF      /* Disable ARP debug */
-#define PBUF_DEBUG                      LWIP_DBG_OFF      /* Disable pbuf debug */
-#define NETIF_DEBUG                     LWIP_DBG_OFF      /* Disable netif debug */
+/* Disable all TCP debugging */
+#define TCP_DEBUG                       LWIP_DBG_OFF
+#define TCP_INPUT_DEBUG                 LWIP_DBG_OFF
+#define TCP_OUTPUT_DEBUG                LWIP_DBG_OFF
+#define TCPIP_DEBUG                     LWIP_DBG_OFF
+#define IP_DEBUG                        LWIP_DBG_OFF
+#define ETHARP_DEBUG                    LWIP_DBG_OFF
+#define PBUF_DEBUG                      LWIP_DBG_OFF
+#define NETIF_DEBUG                     LWIP_DBG_OFF
 
 /* Statistics */
 #define LWIP_STATS                      1

@@ -59,10 +59,13 @@
 #define CHECKSUM_CHECK_UDP              1
 #define CHECKSUM_CHECK_TCP              1
 
-/* Debugging options (disable for production) */
+/* Debugging options - Disabled for production */
 #define LWIP_DEBUG                      0
-#define LWIP_DBG_MIN_LEVEL              LWIP_DBG_LEVEL_ALL
-#define LWIP_DBG_TYPES_ON               LWIP_DBG_ON
+#define LWIP_DBG_MIN_LEVEL              LWIP_DBG_LEVEL_OFF
+#define LWIP_DBG_TYPES_ON               LWIP_DBG_OFF
+#define TCP_DEBUG                       LWIP_DBG_OFF
+#define TCP_INPUT_DEBUG                 LWIP_DBG_OFF
+#define TCP_OUTPUT_DEBUG                LWIP_DBG_OFF
 
 /* Statistics */
 #define LWIP_STATS                      1

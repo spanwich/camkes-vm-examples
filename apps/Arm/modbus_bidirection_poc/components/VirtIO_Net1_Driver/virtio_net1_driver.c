@@ -1789,6 +1789,95 @@ static void setup_tcp_echo_server(void)
  * ═══════════════════════════════════════════════════════════════════════════
  */
 
+/* TCP client connection state for INBOUND forwarding */
+struct tcp_inbound_client_state {
+    struct tcp_pcb *pcb;
+    uint8_t *payload_data;
+    uint16_t payload_len;
+    uint16_t bytes_sent;
+    bool active;
+};
+
+static struct tcp_inbound_client_state inbound_tcp_client = {0};
+
+/*
+ * TCP client callbacks for INBOUND path
+ */
+static err_t inbound_tcp_sent_callback(void *arg, struct tcp_pcb *pcb, u16_t len)
+{
+    struct tcp_inbound_client_state *state = (struct tcp_inbound_client_state *)arg;
+
+    printf("%s: INBOUND: Sent %u bytes to internal network\n", COMPONENT_NAME, len);
+
+    state->bytes_sent += len;
+
+    /* Check if all data sent */
+    if (state->bytes_sent >= state->payload_len) {
+        printf("%s: INBOUND: Complete - sent %u/%u bytes\n",
+               COMPONENT_NAME, state->bytes_sent, state->payload_len);
+
+        /* Close connection after successful transmission */
+        tcp_close(pcb);
+        state->active = false;
+        state->pcb = NULL;
+
+        return ERR_OK;
+    }
+
+    /* Send remaining data if needed */
+    uint16_t remaining = state->payload_len - state->bytes_sent;
+    uint16_t to_send = (remaining > tcp_sndbuf(pcb)) ? tcp_sndbuf(pcb) : remaining;
+
+    if (to_send > 0) {
+        err_t err = tcp_write(pcb, state->payload_data + state->bytes_sent, to_send, TCP_WRITE_FLAG_COPY);
+        if (err == ERR_OK) {
+            tcp_output(pcb);
+        } else {
+            printf("%s: INBOUND: tcp_write failed: %d\n", COMPONENT_NAME, err);
+        }
+    }
+
+    return ERR_OK;
+}
+
+static err_t inbound_tcp_connected_callback(void *arg, struct tcp_pcb *pcb, err_t err)
+{
+    struct tcp_inbound_client_state *state = (struct tcp_inbound_client_state *)arg;
+
+    if (err != ERR_OK) {
+        printf("%s: INBOUND: Connection failed: %d\n", COMPONENT_NAME, err);
+        state->active = false;
+        state->pcb = NULL;
+        return err;
+    }
+
+    printf("%s: INBOUND: Connected to internal network\n", COMPONENT_NAME);
+
+    /* Set sent callback */
+    tcp_sent(pcb, inbound_tcp_sent_callback);
+
+    /* Send the payload */
+    uint16_t to_send = (state->payload_len > tcp_sndbuf(pcb)) ? tcp_sndbuf(pcb) : state->payload_len;
+
+    err = tcp_write(pcb, state->payload_data, to_send, TCP_WRITE_FLAG_COPY);
+    if (err != ERR_OK) {
+        printf("%s: INBOUND: tcp_write failed: %d\n", COMPONENT_NAME, err);
+        tcp_close(pcb);
+        state->active = false;
+        state->pcb = NULL;
+        return err;
+    }
+
+    state->bytes_sent = to_send;
+
+    /* Trigger transmission */
+    tcp_output(pcb);
+
+    printf("%s: INBOUND: Sent initial %u bytes\n", COMPONENT_NAME, to_send);
+
+    return ERR_OK;
+}
+
 /* TCP client connection state for OUTBOUND forwarding */
 struct tcp_outbound_client_state {
     struct tcp_pcb *pcb;
@@ -1876,6 +1965,168 @@ static err_t outbound_tcp_connected_callback(void *arg, struct tcp_pcb *pcb, err
     printf("%s: OUTBOUND: Sent initial %u bytes\n", COMPONENT_NAME, to_send);
 
     return ERR_OK;
+}
+
+/*
+ * INBOUND notification handler - called when ICS_Inbound has validated data
+ * Creates TCP client connection to forward data to internal network (PLC)
+ */
+void inbound_ready_handle(void)
+{
+    #if DEBUG_MESSAGE_FLOW
+    uint32_t msg_id = ++message_id_counter;
+    printf("\n🟡 [MSG #%u] ═══ ICS→NET: Received from ICS_Inbound ═══\n", msg_id);
+    printf("   Source: ICS pipeline validation complete\n");
+    printf("   Action: Creating TCP client to forward to internal network\n");
+    #endif
+
+    printf("%s: ╔═══════════════════════════════════════════════════════════╗\n", COMPONENT_NAME);
+    printf("%s: ║  INBOUND: Received message from ICS_Inbound              ║\n", COMPONENT_NAME);
+    printf("%s: ╚═══════════════════════════════════════════════════════════╝\n", COMPONENT_NAME);
+
+    /* CRITICAL: Check if dataport is properly mapped by CAmkES */
+    if (inbound_dp == NULL) {
+        printf("%s: ❌ FATAL: inbound_dp is NULL! CAmkES dataport not mapped\n", COMPONENT_NAME);
+        printf("%s:    This indicates seL4 capability/memory allocation failure\n", COMPONENT_NAME);
+        return;
+    }
+
+    printf("%s: ✓ Dataport check: inbound_dp=%p (valid)\n", COMPONENT_NAME, (void*)inbound_dp);
+
+    ICS_Message *ics_msg = (ICS_Message *)inbound_dp;
+
+    /* Validate message */
+    if (ics_msg->payload_length > MAX_PAYLOAD_SIZE) {
+        printf("%s: INBOUND: Invalid payload length %u (max %u)\n",
+               COMPONENT_NAME, ics_msg->payload_length, MAX_PAYLOAD_SIZE);
+        #if DEBUG_MESSAGE_FLOW
+        printf("   ✗ [MSG #%u] DROPPED - invalid payload size\n\n", msg_id);
+        #endif
+        return;
+    }
+
+    /* Check if we already have an active connection - if so, close it and create new one */
+    if (inbound_tcp_client.active) {
+        printf("%s: INBOUND: Previous connection still active, closing it to handle new message\n", COMPONENT_NAME);
+        if (inbound_tcp_client.pcb != NULL) {
+            tcp_close(inbound_tcp_client.pcb);
+        }
+        inbound_tcp_client.active = false;
+        inbound_tcp_client.pcb = NULL;
+    }
+
+    #if DEBUG_MESSAGE_FLOW
+    printf("   Payload size: %u bytes\n", ics_msg->payload_length);
+    printf("   Destination: %u.%u.%u.%u:%u\n",
+           (ics_msg->metadata.dst_ip >> 24) & 0xFF,
+           (ics_msg->metadata.dst_ip >> 16) & 0xFF,
+           (ics_msg->metadata.dst_ip >> 8) & 0xFF,
+           ics_msg->metadata.dst_ip & 0xFF,
+           ics_msg->metadata.dst_port);
+
+    /* Print ASCII payload preview */
+    printf("   Payload preview: \"");
+    for (uint16_t i = 0; i < (ics_msg->payload_length < 60 ? ics_msg->payload_length : 60); i++) {
+        char c = ics_msg->payload[i];
+        if (c >= 32 && c <= 126) printf("%c", c);
+        else if (c == '\n') printf("\\n");
+        else if (c == '\r') printf("\\r");
+        else printf(".");
+    }
+    if (ics_msg->payload_length > 60) printf("...");
+    printf("\"\n");
+    #endif
+
+    /* Print metadata */
+    printf("%s: INBOUND: Protocol=%s, Src=%u.%u.%u.%u:%u, Dst=%u.%u.%u.%u:%u, Payload=%u bytes\n",
+           COMPONENT_NAME,
+           ics_msg->metadata.is_tcp ? "TCP" : (ics_msg->metadata.is_udp ? "UDP" : "Other"),
+           (ics_msg->metadata.src_ip >> 24) & 0xFF, (ics_msg->metadata.src_ip >> 16) & 0xFF,
+           (ics_msg->metadata.src_ip >> 8) & 0xFF, ics_msg->metadata.src_ip & 0xFF,
+           ics_msg->metadata.src_port,
+           (ics_msg->metadata.dst_ip >> 24) & 0xFF, (ics_msg->metadata.dst_ip >> 16) & 0xFF,
+           (ics_msg->metadata.dst_ip >> 8) & 0xFF, ics_msg->metadata.dst_ip & 0xFF,
+           ics_msg->metadata.dst_port,
+           ics_msg->payload_length);
+
+    /* Create TCP client connection */
+    struct tcp_pcb *pcb = tcp_new_ip_type(IPADDR_TYPE_V4);
+    if (pcb == NULL) {
+        printf("%s: INBOUND: Failed to create TCP PCB\n", COMPONENT_NAME);
+        return;
+    }
+
+    /* Set up client state */
+    inbound_tcp_client.pcb = pcb;
+    inbound_tcp_client.payload_data = ics_msg->payload;
+    inbound_tcp_client.payload_len = ics_msg->payload_length;
+    inbound_tcp_client.bytes_sent = 0;
+    inbound_tcp_client.active = true;
+
+    /* Extract source and destination from metadata
+     * This preserves end-to-end IP addresses through the gateway
+     * Example: SCADA (192.168.90.5) → PLC (192.168.95.2)
+     *   Net0 receives: src=192.168.90.5, dst=192.168.95.2
+     *   Net1 binds to: 192.168.90.5 (appears as SCADA to PLC)
+     *   Net1 connects to: 192.168.95.2 (real PLC)
+     */
+    ip_addr_t src_ip, dest_ip;
+    IP4_ADDR(&src_ip,
+             (ics_msg->metadata.src_ip >> 24) & 0xFF,
+             (ics_msg->metadata.src_ip >> 16) & 0xFF,
+             (ics_msg->metadata.src_ip >> 8) & 0xFF,
+             ics_msg->metadata.src_ip & 0xFF);
+
+    IP4_ADDR(&dest_ip,
+             (ics_msg->metadata.dst_ip >> 24) & 0xFF,
+             (ics_msg->metadata.dst_ip >> 16) & 0xFF,
+             (ics_msg->metadata.dst_ip >> 8) & 0xFF,
+             ics_msg->metadata.dst_ip & 0xFF);
+
+    /* NOTE: Cannot use tcp_bind() with external IP (192.168.90.5) because lwIP
+     * only allows binding to IPs configured on the local interface (192.168.95.1)
+     *
+     * WORKAROUND: We bind to IP_ADDR_ANY and let lwIP use 192.168.95.1 as source.
+     * This means the PLC will see the connection coming from the gateway (192.168.95.1),
+     * not from the original SCADA IP (192.168.90.5).
+     *
+     * Alternative future solution: Use raw sockets or modify lwIP to allow arbitrary source IPs
+     */
+    err_t bind_err = tcp_bind(pcb, IP_ADDR_ANY, 0);  /* Bind to any, port 0 = ephemeral */
+    if (bind_err != ERR_OK) {
+        printf("%s: INBOUND: tcp_bind failed: %d\n", COMPONENT_NAME, bind_err);
+        tcp_close(pcb);
+        inbound_tcp_client.active = false;
+        inbound_tcp_client.pcb = NULL;
+        return;
+    }
+
+    /* CRITICAL: Set callback argument BEFORE tcp_connect()
+     * This prevents null pointer dereference in inbound_tcp_sent_callback
+     */
+    tcp_arg(pcb, &inbound_tcp_client);
+
+    /* Use original destination port from metadata */
+    uint16_t dest_port = ics_msg->metadata.dst_port;
+
+    printf("%s: INBOUND: Binding to IP_ADDR_ANY and connecting to %u.%u.%u.%u:%u\n",
+           COMPONENT_NAME,
+           (ics_msg->metadata.dst_ip >> 24) & 0xFF,
+           (ics_msg->metadata.dst_ip >> 16) & 0xFF,
+           (ics_msg->metadata.dst_ip >> 8) & 0xFF,
+           ics_msg->metadata.dst_ip & 0xFF,
+           dest_port);
+
+    err_t err = tcp_connect(pcb, &dest_ip, dest_port, inbound_tcp_connected_callback);
+    if (err != ERR_OK) {
+        printf("%s: INBOUND: tcp_connect failed: %d\n", COMPONENT_NAME, err);
+        tcp_close(pcb);
+        inbound_tcp_client.active = false;
+        inbound_tcp_client.pcb = NULL;
+        return;
+    }
+
+    printf("%s: INBOUND: Connection initiated to PLC on internal network\n", COMPONENT_NAME);
 }
 
 /*
@@ -2584,9 +2835,9 @@ int run(void)
     /* Main event loop - process lwIP timers, RX packets, and ICS notifications */
     /* Note: TCP server is now initialized in RX path after first packet */
     while (1) {
-        /* Check for OUTBOUND notifications from ICS_Outbound (non-blocking) */
+        /* Check for INBOUND notifications from ICS_Inbound (non-blocking) */
         if (inbound_ready_poll()) {
-            outbound_ready_handle();
+            inbound_ready_handle();
         }
 
         /* Process lwIP timers and RX packets */

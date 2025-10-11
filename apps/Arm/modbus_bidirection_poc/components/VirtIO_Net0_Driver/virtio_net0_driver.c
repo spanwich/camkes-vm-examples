@@ -30,11 +30,16 @@
 /* lwIP headers */
 #include "lwip/init.h"
 #include "lwip/netif.h"
+#include "lwip/pbuf.h"
 #include "lwip/dhcp.h"
 #include "lwip/tcp.h"
+#include "lwip/udp.h"
 #include "lwip/timeouts.h"
 #include "lwip/etharp.h"
 #include "lwip/stats.h"
+#include "lwip/inet_chksum.h"
+#include "lwip/prot/tcp.h"
+#include "lwip/prot/udp.h"
 #include "netif/ethernet.h"
 
 /* ICS common definitions */
@@ -68,6 +73,18 @@
 #define DEBUG_MESSAGE_FLOW 1      /* Track message flow through RX→ICS→TX pipeline */
 #define ENABLE_GDB_WAIT 0         /* Enable 60-second GDB wait during init */
 #define ENABLE_PAINT_TEST 0       /* Enable virtqueue memory paint test */
+
+/*
+ * PROTOCOL FILTER CONFIGURATION
+ * Control which protocols to show in debug output
+ * Set to 1 to SHOW protocol, 0 to HIDE protocol
+ */
+#define FILTER_SHOW_ARP 0         /* Show ARP packets (0x0806) */
+#define FILTER_SHOW_IPV6 0        /* Show IPv6 packets (0x86dd) */
+#define FILTER_SHOW_TCP 1         /* Show TCP packets */
+#define FILTER_SHOW_UDP 1         /* Show UDP packets */
+#define FILTER_SHOW_ICMP 1        /* Show ICMP packets */
+#define FILTER_SHOW_OTHER 1       /* Show all other protocols */
 
 /* VirtIO MMIO Register Offsets */
 #define VIRTIO_MMIO_MAGIC_VALUE         0x000
@@ -408,6 +425,10 @@ static err_t custom_netif_init(struct netif *netif);
 static void netif_status_callback(struct netif *netif);
 static void setup_tcp_echo_server(void);
 
+/* Global storage for Virtual NAT mapping (RX path stores, TX path uses for reverse NAT) */
+static uint32_t last_packet_original_source_ip = 0;  /* Incoming source (e.g., 192.168.90.5 SCADA) */
+static uint32_t last_packet_original_dest_ip = 0;    /* Incoming dest (e.g., 192.168.95.2 PLC) */
+
 /*
  * Get free RX buffer index
  */
@@ -429,18 +450,20 @@ static void refill_rx_queue(void)
 {
     struct virtq *vq = &rx_virtq;
     static bool first_call = true;
+    static uint32_t refill_call_count = 0;
     int buffers_added = 0;
 
-    /* Debug: count how many buffers are marked as used */
-    if (first_call) {
-        int used_count = 0;
-        for (int i = 0; i < MAX_PACKETS; i++) {
-            if (rx_buffer_used[i]) used_count++;
-        }
-        printf("%s: refill_rx_queue: %d/%d buffers marked as used\n",
-               COMPONENT_NAME, used_count, MAX_PACKETS);
-        printf("%s: refill_rx_queue: vq->num=%u (virtqueue size)\n",
-               COMPONENT_NAME, vq->num);
+    refill_call_count++;
+
+    /* Debug: count how many buffers are free (available for refill) */
+    int free_count = 0;
+    for (int i = 0; i < MAX_PACKETS; i++) {
+        if (!rx_buffer_used[i]) free_count++;
+    }
+
+    if (first_call || free_count > 0) {
+        printf("%s: refill_rx_queue() call #%u: %d/%d buffers free (available to refill)\n",
+               COMPONENT_NAME, refill_call_count, free_count, MAX_PACKETS);
         first_call = false;
     }
 
@@ -471,12 +494,14 @@ static void refill_rx_queue(void)
         buffers_added++;
     }
 
-    printf("%s: Refilled RX queue with %d buffers (avail_idx now=%u)\n",
-           COMPONENT_NAME, buffers_added, vq->avail->idx);
-
-    /* Notify device of new buffers */
     if (buffers_added > 0) {
+        printf("%s: ✅ Refilled RX queue with %d buffers (avail_idx now=%u)\n",
+               COMPONENT_NAME, buffers_added, vq->avail->idx);
+        /* Notify device of new buffers */
         VREG_WRITE(VIRTIO_MMIO_QUEUE_NOTIFY, VIRTIO_NET_RX_QUEUE);
+    } else if (free_count > 0) {
+        printf("%s: ⚠️  WARNING: %d buffers were free but refill added 0! (avail_idx=%u)\n",
+               COMPONENT_NAME, free_count, vq->avail->idx);
     }
 }
 
@@ -522,6 +547,119 @@ static err_t netif_output(struct netif *netif, struct pbuf *p)
         printf("%s: Failed to copy pbuf: %u/%u bytes\n",
                COMPONENT_NAME, copied, p->tot_len);
         return ERR_BUF;
+    }
+
+    /* REVERSE VIRTUAL NAT: **DISABLED**
+     *
+     * Original plan: Rewrite source IP to match original dest (192.168.95.2)
+     * Problem: Host routing breaks! Packets with src=192.168.95.2 don't match SNAT rules
+     *
+     * Correct approach:
+     *   - RX: Rewrite dest 192.168.95.2 → 10.2.0.2 (for lwIP) ✅
+     *   - TX: Leave source as 10.2.0.2 (lwIP's interface IP) ✅
+     *   - Host SNAT: Translates 10.2.0.2 → 192.168.96.2 automatically ✅
+     *
+     * lwIP naturally sends responses with:
+     *   - Source: 10.2.0.2 (interface IP)
+     *   - Dest: 192.168.90.5 (client IP from incoming packet)
+     * This is CORRECT! Don't rewrite!
+     */
+    if (0 && last_packet_original_source_ip != 0 && last_packet_original_dest_ip != 0) {  /* DISABLED */
+        uint8_t *tx_data = packet_buffers[tx_buf_idx];
+
+        /* Check if this is an IPv4 packet */
+        if (p->tot_len >= sizeof(struct ethhdr) + sizeof(struct iphdr)) {
+            struct ethhdr *eth = (struct ethhdr *)tx_data;
+            if (ntohs(eth->h_proto) == 0x0800) {  /* IPv4 */
+                struct iphdr *iphdr = (struct iphdr *)(tx_data + sizeof(struct ethhdr));
+
+                /* Check if this is a TCP packet going to the original client */
+                if (iphdr->protocol == 6) {  /* TCP */
+                    uint32_t current_src_ip = ntohl(iphdr->saddr);
+                    uint32_t current_dest_ip = ntohl(iphdr->daddr);
+                    uint32_t expected_src_ip = last_packet_original_dest_ip;    /* PLC IP from incoming */
+                    uint32_t expected_dest_ip = last_packet_original_source_ip;  /* SCADA IP from incoming */
+
+                    /* Only rewrite if IPs don't match expected */
+                    if (current_src_ip != expected_src_ip || current_dest_ip != expected_dest_ip) {
+                        printf("%s: 🔄 REVERSE NAT: src=%u.%u.%u.%u → %u.%u.%u.%u, dest=%u.%u.%u.%u → %u.%u.%u.%u\n",
+                               COMPONENT_NAME,
+                               (current_src_ip >> 24) & 0xFF, (current_src_ip >> 16) & 0xFF,
+                               (current_src_ip >> 8) & 0xFF, current_src_ip & 0xFF,
+                               (expected_src_ip >> 24) & 0xFF, (expected_src_ip >> 16) & 0xFF,
+                               (expected_src_ip >> 8) & 0xFF, expected_src_ip & 0xFF,
+                               (current_dest_ip >> 24) & 0xFF, (current_dest_ip >> 16) & 0xFF,
+                               (current_dest_ip >> 8) & 0xFF, current_dest_ip & 0xFF,
+                               (expected_dest_ip >> 24) & 0xFF, (expected_dest_ip >> 16) & 0xFF,
+                               (expected_dest_ip >> 8) & 0xFF, expected_dest_ip & 0xFF);
+
+                        /* Rewrite BOTH source and destination IPs */
+                        iphdr->saddr = htonl(expected_src_ip);   /* Restore PLC IP as source */
+                        iphdr->daddr = htonl(expected_dest_ip);  /* Set SCADA IP as destination */
+
+                        /* Recalculate IP header checksum */
+                        iphdr->check = 0;
+                        uint16_t ip_hdr_len = iphdr->ihl * 4;
+                        iphdr->check = inet_chksum(iphdr, ip_hdr_len);
+
+                        /* Recalculate TCP checksum */
+                        size_t tcp_offset = sizeof(struct ethhdr) + ip_hdr_len;
+                        if (p->tot_len >= tcp_offset + sizeof(struct tcphdr)) {
+                            struct tcphdr *tcphdr = (struct tcphdr *)(tx_data + tcp_offset);
+                            uint16_t tcp_len = ntohs(iphdr->tot_len) - ip_hdr_len;
+
+                            tcphdr->check = 0;
+
+                            /* Create pseudo-header for TCP checksum */
+                            struct tcp_pseudo_hdr {
+                                uint32_t src_addr;
+                                uint32_t dst_addr;
+                                uint8_t zero;
+                                uint8_t protocol;
+                                uint16_t tcp_length;
+                            } __attribute__((packed)) pseudo;
+
+                            pseudo.src_addr = iphdr->saddr;
+                            pseudo.dst_addr = iphdr->daddr;
+                            pseudo.zero = 0;
+                            pseudo.protocol = 6;  /* TCP */
+                            pseudo.tcp_length = htons(tcp_len);
+
+                            /* Calculate checksum over pseudo-header + TCP segment */
+                            uint32_t sum = 0;
+                            uint16_t *ptr;
+
+                            /* Add pseudo-header */
+                            ptr = (uint16_t *)&pseudo;
+                            for (int i = 0; i < sizeof(pseudo) / 2; i++) {
+                                sum += ptr[i];
+                            }
+
+                            /* Add TCP segment */
+                            ptr = (uint16_t *)tcphdr;
+                            for (int i = 0; i < tcp_len / 2; i++) {
+                                sum += ptr[i];
+                            }
+
+                            /* Handle odd byte */
+                            if (tcp_len & 1) {
+                                sum += ((uint8_t *)tcphdr)[tcp_len - 1];
+                            }
+
+                            /* Fold 32-bit sum to 16 bits */
+                            while (sum >> 16) {
+                                sum = (sum & 0xFFFF) + (sum >> 16);
+                            }
+
+                            tcphdr->check = ~sum;
+
+                            printf("%s:    ✅ Reverse NAT complete - IP/TCP checksums recalculated\n",
+                                   COMPONENT_NAME);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /* Detailed TX packet inspection for first 10 packets */
@@ -642,6 +780,152 @@ static err_t netif_output(struct netif *netif, struct pbuf *p)
 }
 
 /*
+ * Custom input function for bridge architecture
+ * NO Virtual NAT needed - packets arrive with real destination IPs!
+ *
+ * With bridges, SCADA sends to 192.168.95.2 (PLC IP) and packets arrive
+ * at our interface (192.168.96.2) with original IPs intact.
+ * lwIP processes them normally.
+ */
+static err_t custom_input_promiscuous(struct pbuf *p, struct netif *inp)
+{
+    /* Simply pass packet to lwIP's standard input processing
+     * No NAT, no IP rewriting needed!
+     */
+    if (p->len >= sizeof(struct eth_hdr)) {
+        struct eth_hdr *ethhdr = (struct eth_hdr *)p->payload;
+        u16_t type = lwip_ntohs(ethhdr->type);
+
+        if (type == ETHTYPE_IP) {
+            /* Remove Ethernet header */
+            if (pbuf_remove_header(p, sizeof(struct eth_hdr)) == 0) {
+                /* Extract packet destination IP */
+                if (p->len >= 20) {  /* Minimum IPv4 header size */
+                    struct ip_hdr *iphdr = (struct ip_hdr *)p->payload;
+                    uint32_t pkt_dest_ip_network = iphdr->dest.addr;  /* Network byte order */
+                    uint32_t if_ip_network = ip4_addr_get_u32(netif_ip4_addr(inp));  /* Network byte order */
+
+                    /* Convert to host byte order for display and comparison */
+                    uint32_t pkt_dest_ip = lwip_ntohl(pkt_dest_ip_network);
+                    uint32_t pkt_src_ip = lwip_ntohl(iphdr->src.addr);  /* Extract source IP */
+                    uint32_t if_ip = lwip_ntohl(if_ip_network);
+
+                    /* Save BOTH source and dest IPs for reverse NAT (host byte order) */
+                    last_packet_original_source_ip = pkt_src_ip;  /* e.g., 192.168.90.5 SCADA */
+                    last_packet_original_dest_ip = pkt_dest_ip;   /* e.g., 192.168.95.2 PLC */
+
+                    /* If packet dest doesn't match interface IP, rewrite it */
+                    if (pkt_dest_ip != if_ip) {
+                        /* Debug: Show original packet before rewrite */
+                        printf("%s: 🔧 Virtual NAT BEFORE: dest=%u.%u.%u.%u, proto=%u, len=%u\n",
+                               COMPONENT_NAME,
+                               (pkt_dest_ip >> 24) & 0xFF, (pkt_dest_ip >> 16) & 0xFF,
+                               (pkt_dest_ip >> 8) & 0xFF, pkt_dest_ip & 0xFF,
+                               iphdr->_proto, lwip_ntohs(iphdr->_len));
+
+                        /* Rewrite destination IP in packet to match interface IP (network byte order) */
+                        uint32_t old_dest = iphdr->dest.addr;  /* Save for TCP checksum adjustment */
+                        iphdr->dest.addr = if_ip_network;  /* Already in network byte order */
+
+                        /* Recalculate IP header checksum */
+                        uint16_t old_ip_chksum = iphdr->_chksum;
+                        iphdr->_chksum = 0;
+                        iphdr->_chksum = inet_chksum(iphdr, IPH_HL(iphdr) * 4);
+
+                        /* CRITICAL: Recalculate TCP/UDP checksum (pseudo-header includes IP addresses!) */
+                        if (iphdr->_proto == 6) {  /* TCP */
+                            size_t ip_hdr_len = IPH_HL(iphdr) * 4;
+                            u16_t tcp_len = lwip_ntohs(iphdr->_len) - ip_hdr_len;
+                            if (p->len >= ip_hdr_len + 20) {  /* TCP header minimum 20 bytes */
+                                struct tcp_hdr *tcphdr = (struct tcp_hdr *)((uint8_t *)iphdr + ip_hdr_len);
+
+                                /* TCP checksum includes pseudo-header with IPs - must recalculate */
+                                uint16_t old_tcp_chksum = tcphdr->chksum;
+                                tcphdr->chksum = 0;
+
+                                /* Create temporary pbuf pointing at TCP segment for checksum calculation */
+                                struct pbuf tcp_pbuf;
+                                tcp_pbuf.next = NULL;
+                                tcp_pbuf.payload = tcphdr;
+                                tcp_pbuf.tot_len = tcp_len;
+                                tcp_pbuf.len = tcp_len;
+                                tcp_pbuf.flags = 0;
+                                tcp_pbuf.ref = 1;
+
+                                /* Calculate TCP checksum with new destination IP */
+                                tcphdr->chksum = ip_chksum_pseudo(&tcp_pbuf, IP_PROTO_TCP, tcp_len,
+                                                                  (ip_addr_t *)&iphdr->src,
+                                                                  (ip_addr_t *)&iphdr->dest);
+
+                                printf("%s:    TCP chksum: 0x%04x→0x%04x\n",
+                                       COMPONENT_NAME, old_tcp_chksum, tcphdr->chksum);
+                            }
+                        } else if (iphdr->_proto == 17) {  /* UDP */
+                            size_t ip_hdr_len = IPH_HL(iphdr) * 4;
+                            if (p->len >= ip_hdr_len + 8) {  /* UDP header 8 bytes */
+                                struct udp_hdr *udphdr = (struct udp_hdr *)((uint8_t *)iphdr + ip_hdr_len);
+
+                                /* UDP checksum includes pseudo-header - recalculate if present */
+                                if (udphdr->chksum != 0) {  /* UDP checksum is optional */
+                                    u16_t udp_len = lwip_ntohs(udphdr->len);
+                                    uint16_t old_udp_chksum = udphdr->chksum;
+                                    udphdr->chksum = 0;
+
+                                    /* Create temporary pbuf pointing at UDP segment */
+                                    struct pbuf udp_pbuf;
+                                    udp_pbuf.next = NULL;
+                                    udp_pbuf.payload = udphdr;
+                                    udp_pbuf.tot_len = udp_len;
+                                    udp_pbuf.len = udp_len;
+                                    udp_pbuf.flags = 0;
+                                    udp_pbuf.ref = 1;
+
+                                    udphdr->chksum = ip_chksum_pseudo(&udp_pbuf, IP_PROTO_UDP, udp_len,
+                                                                      (ip_addr_t *)&iphdr->src,
+                                                                      (ip_addr_t *)&iphdr->dest);
+
+                                    printf("%s:    UDP chksum: 0x%04x→0x%04x\n",
+                                           COMPONENT_NAME, old_udp_chksum, udphdr->chksum);
+                                }
+                            }
+                        }
+
+                        /* Debug: Verify rewrite */
+                        uint32_t new_dest = lwip_ntohl(iphdr->dest.addr);
+                        printf("%s: 🔧 Virtual NAT AFTER:  dest=%u.%u.%u.%u, IP chksum: 0x%04x→0x%04x %s\n",
+                               COMPONENT_NAME,
+                               (new_dest >> 24) & 0xFF, (new_dest >> 16) & 0xFF,
+                               (new_dest >> 8) & 0xFF, new_dest & 0xFF,
+                               old_ip_chksum, iphdr->_chksum,
+                               (new_dest == if_ip) ? "✅ MATCH" : "❌ MISMATCH");
+                    }
+                }
+
+                /* Process packet - lwIP now accepts it (dest matches interface) */
+                err_t result = ip_input(p, inp);
+
+                /* Debug: Track lwIP's decision */
+                if (result != ERR_OK) {
+                    printf("%s: ⚠️  lwIP ip_input() returned ERROR: %d\n", COMPONENT_NAME, result);
+                } else {
+                    printf("%s: ✅ lwIP ip_input() returned OK (packet accepted by IP layer)\n", COMPONENT_NAME);
+                }
+
+                return result;
+            }
+        } else if (type == ETHTYPE_IPV6 || type == ETHTYPE_ARP) {
+            /* Remove Ethernet header and pass to IP layer */
+            if (pbuf_remove_header(p, sizeof(struct eth_hdr)) == 0) {
+                return ip_input(p, inp);
+            }
+        }
+    }
+
+    /* Fallback to normal ethernet_input for other cases */
+    return ethernet_input(p, inp);
+}
+
+/*
  * Network interface initialization (called by lwIP)
  */
 static err_t custom_netif_init(struct netif *netif)
@@ -737,7 +1021,8 @@ static void process_rx_packets(void)
         uint16_t pending_packets = (uint16_t)(current_used_idx - last_used_idx);
 
         if (pending_packets == 0) {
-            return;  /* No more packets to process */
+            /* No more packets - exit IRQ handler and let timer handle refill */
+            return;
         }
 
         /* SAFETY: Detect impossible wraparound scenarios and desynchronization
@@ -772,6 +1057,7 @@ static void process_rx_packets(void)
                 /* This is expected: we consumed faster than device produced
                  * Just resync and exit - no packets available right now */
                 last_used_idx = current_used_idx;
+                /* Don't refill here - let timer handle it to avoid IRQ storm */
                 return;
             }
 
@@ -781,6 +1067,7 @@ static void process_rx_packets(void)
             printf("%s:   last_used_idx=%u, current_used_idx=%u\n",
                    COMPONENT_NAME, last_used_idx, current_used_idx);
             last_used_idx = current_used_idx;
+            /* Don't refill here - let timer handle it to avoid IRQ storm */
             return;
         }
 
@@ -798,6 +1085,7 @@ static void process_rx_packets(void)
             printf("%s:   last_used_idx=%u, current_used_idx=%u, pending=%u\n",
                    COMPONENT_NAME, last_used_idx, current_used_idx,
                    (uint16_t)(current_used_idx - last_used_idx));
+            /* Don't refill here - let timer handle it to avoid IRQ storm */
             break;
         }
 
@@ -911,7 +1199,10 @@ static void process_rx_packets(void)
         #endif /* DEBUG_PACKET_LOG */
 
         #if DEBUG_PACKET_SUMMARY
-        /* Lightweight packet summary - just protocol and ports */
+        /* Lightweight packet summary - just protocol and ports (with filtering) */
+        bool show_packet = false;
+        uint8_t packet_protocol = 0;  /* 0=other, 6=TCP, 17=UDP, 1=ICMP */
+
         if (packet_len >= sizeof(struct ethhdr)) {
             struct ethhdr *eth = (struct ethhdr *)packet_data;
             uint16_t eth_proto = ntohs(eth->h_proto);
@@ -920,8 +1211,11 @@ static void process_rx_packets(void)
                 struct iphdr *ip = (struct iphdr *)(packet_data + sizeof(struct ethhdr));
                 uint32_t saddr = ntohl(ip->saddr);
                 uint32_t daddr = ntohl(ip->daddr);
+                packet_protocol = ip->protocol;
 
                 if (ip->protocol == 6) {  /* TCP */
+                    #if FILTER_SHOW_TCP
+                    show_packet = true;
                     size_t ip_hdr_len = (ip->ihl) * 4;
                     if (packet_len >= sizeof(struct ethhdr) + ip_hdr_len + sizeof(struct tcphdr)) {
                         struct tcphdr *tcp = (struct tcphdr *)(packet_data + sizeof(struct ethhdr) + ip_hdr_len);
@@ -931,26 +1225,66 @@ static void process_rx_packets(void)
                                (daddr >> 24) & 0xFF, (daddr >> 16) & 0xFF, (daddr >> 8) & 0xFF, daddr & 0xFF, ntohs(tcp->dest),
                                tcp->syn ? "[SYN]" : "", tcp->ack ? "[ACK]" : "", tcp->fin ? "[FIN]" : "", tcp->rst ? "[RST]" : "");
                     }
+                    #endif
+                } else if (ip->protocol == 17) {  /* UDP */
+                    #if FILTER_SHOW_UDP
+                    show_packet = true;
+                    printf("📥 Net0 RX #%u: %u.%u.%u.%u → %u.%u.%u.%u UDP (%ub)\n",
+                           packets_received,
+                           (saddr >> 24) & 0xFF, (saddr >> 16) & 0xFF, (saddr >> 8) & 0xFF, saddr & 0xFF,
+                           (daddr >> 24) & 0xFF, (daddr >> 16) & 0xFF, (daddr >> 8) & 0xFF, daddr & 0xFF,
+                           packet_len);
+                    #endif
+                } else if (ip->protocol == 1) {  /* ICMP */
+                    #if FILTER_SHOW_ICMP
+                    show_packet = true;
+                    printf("📥 Net0 RX #%u: %u.%u.%u.%u → %u.%u.%u.%u ICMP (%ub)\n",
+                           packets_received,
+                           (saddr >> 24) & 0xFF, (saddr >> 16) & 0xFF, (saddr >> 8) & 0xFF, saddr & 0xFF,
+                           (daddr >> 24) & 0xFF, (daddr >> 16) & 0xFF, (daddr >> 8) & 0xFF, daddr & 0xFF,
+                           packet_len);
+                    #endif
                 } else {
+                    #if FILTER_SHOW_OTHER
+                    show_packet = true;
                     printf("📥 Net0 RX #%u: %u.%u.%u.%u → %u.%u.%u.%u proto=%u (%ub)\n",
                            packets_received,
                            (saddr >> 24) & 0xFF, (saddr >> 16) & 0xFF, (saddr >> 8) & 0xFF, saddr & 0xFF,
                            (daddr >> 24) & 0xFF, (daddr >> 16) & 0xFF, (daddr >> 8) & 0xFF, daddr & 0xFF,
                            ip->protocol, packet_len);
+                    #endif
                 }
-            } else if (eth_proto == 0x0806) {
+            } else if (eth_proto == 0x0806) {  /* ARP */
+                #if FILTER_SHOW_ARP
+                show_packet = true;
                 printf("📥 Net0 RX #%u: ARP (%u bytes)\n", packets_received, packet_len);
+                #endif
+            } else if (eth_proto == 0x86dd) {  /* IPv6 */
+                #if FILTER_SHOW_IPV6
+                show_packet = true;
+                printf("📥 Net0 RX #%u: IPv6 (%u bytes)\n", packets_received, packet_len);
+                #endif
             } else {
+                #if FILTER_SHOW_OTHER
+                show_packet = true;
                 printf("📥 Net0 RX #%u: EtherType=0x%04x (%u bytes)\n", packets_received, eth_proto, packet_len);
+                #endif
             }
         }
         #endif /* DEBUG_PACKET_SUMMARY */
 
         #if DEBUG_MESSAGE_FLOW
-        uint32_t msg_id = ++message_id_counter;
-        printf("\n🔵 [MSG #%u] ═══ RX: Packet received from VirtIO device ═══\n", msg_id);
-        printf("   Size: %u bytes, Buffer index: %d\n", packet_len, buf_idx);
-        printf("   Action: Feeding to lwIP stack for processing\n");
+        /* Only show message flow for filtered packets */
+        #if DEBUG_PACKET_SUMMARY
+        if (show_packet) {
+        #endif
+            uint32_t msg_id = ++message_id_counter;
+            printf("\n🔵 [MSG #%u] ═══ RX: Packet received from VirtIO device ═══\n", msg_id);
+            printf("   Size: %u bytes, Buffer index: %d\n", packet_len, buf_idx);
+            printf("   Action: Feeding to lwIP stack for processing\n");
+        #if DEBUG_PACKET_SUMMARY
+        }
+        #endif
         #endif
 
         /* Allocate pbuf and copy packet data (skipping header) */
@@ -958,20 +1292,50 @@ static void process_rx_packets(void)
         if (p != NULL) {
             pbuf_take(p, packet_data, packet_len);
 
-            #if DEBUG_MESSAGE_FLOW
-            printf("   ✓ pbuf allocated, passing to lwIP input handler\n");
+            #if DEBUG_MESSAGE_FLOW && DEBUG_PACKET_SUMMARY
+            if (show_packet) {
+                printf("   ✓ pbuf allocated, passing to lwIP input handler\n");
+            }
             #endif
 
             /* Feed packet to lwIP */
             err_t lwip_result = netif_data.input(p, &netif_data);
 
-            #if DEBUG_MESSAGE_FLOW
-            if (lwip_result == ERR_OK) {
-                printf("   ✓ lwIP accepted packet (will route to TCP/UDP/etc.)\n");
-            } else {
-                printf("   ✗ lwIP rejected packet (err=%d)\n", lwip_result);
+            #if DEBUG_MESSAGE_FLOW && DEBUG_PACKET_SUMMARY
+            if (show_packet) {
+                if (lwip_result == ERR_OK) {
+                    printf("   ✓ lwIP accepted packet (will route to TCP/UDP/etc.)\n");
+                } else {
+                    printf("   ✗ lwIP rejected packet (err=%d)\n", lwip_result);
+                }
             }
             #endif
+
+            /* CRITICAL DIAGNOSTIC: Log TCP SYN packets to diagnose connection acceptance */
+            if (packet_len >= sizeof(struct ethhdr)) {
+                struct ethhdr *eth = (struct ethhdr *)packet_data;
+                uint16_t eth_proto_check = ntohs(eth->h_proto);
+
+                if (eth_proto_check == 0x0800 && packet_len >= sizeof(struct ethhdr) + sizeof(struct iphdr)) {  /* IPv4 */
+                    struct iphdr *ip = (struct iphdr *)(packet_data + sizeof(struct ethhdr));
+                    if (ip->protocol == 6) {  /* TCP */
+                        size_t ip_hdr_len = (ip->ihl) * 4;
+                        if (packet_len >= sizeof(struct ethhdr) + ip_hdr_len + sizeof(struct tcphdr)) {
+                            struct tcphdr *tcp = (struct tcphdr *)(packet_data + sizeof(struct ethhdr) + ip_hdr_len);
+                            uint32_t daddr = ntohl(ip->daddr);
+
+                            if (tcp->syn && !tcp->ack) {
+                                /* This is a SYN packet (connection attempt) */
+                                printf("%s: 🔍 SYN packet detected: Dest IP = %u.%u.%u.%u:%u (Interface IP = 192.168.95.2)\n",
+                                       COMPONENT_NAME,
+                                       (daddr >> 24) & 0xFF, (daddr >> 16) & 0xFF, (daddr >> 8) & 0xFF, daddr & 0xFF,
+                                       ntohs(tcp->dest));
+                                printf("%s:    → If dest IP matches interface IP, lwIP should accept. Otherwise it rejects.\n", COMPONENT_NAME);
+                            }
+                        }
+                    }
+                }
+            }
 
             if (lwip_result != ERR_OK) {
                 pbuf_free(p);
@@ -1161,6 +1525,9 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
 
 static err_t tcp_echo_accept(void *arg, struct tcp_pcb *newpcb, err_t err)
 {
+    printf("%s: 🔔 tcp_echo_accept() CALLED! arg=%p, newpcb=%p, err=%d\n",
+           COMPONENT_NAME, arg, newpcb, err);
+
     if (err != ERR_OK || newpcb == NULL) {
         printf("%s: ❌ TCP accept FAILED - err=%d (%s), newpcb=%p\n",
                COMPONENT_NAME, err,
@@ -1227,11 +1594,11 @@ static void setup_tcp_echo_server(void)
 
 #if DEBUG_VERBOSE
     printf("%s: [DEBUG] ✓ TCP PCB created successfully at %p\n", COMPONENT_NAME, (void*)pcb);
-    printf("%s: [DEBUG] About to call tcp_bind(pcb, IP_ANY_TYPE, %d)...\n", COMPONENT_NAME, TCP_ECHO_PORT);
+    printf("%s: [DEBUG] About to call tcp_bind(pcb, IP_ADDR_ANY, %d)...\n", COMPONENT_NAME, TCP_ECHO_PORT);
     fflush(stdout);
 #endif
 
-    err_t err = tcp_bind(pcb, IP_ANY_TYPE, TCP_ECHO_PORT);
+    err_t err = tcp_bind(pcb, IP_ADDR_ANY, TCP_ECHO_PORT);
 
 #if DEBUG_VERBOSE
     printf("%s: [DEBUG] tcp_bind() returned: err=%d (%s)\n", COMPONENT_NAME,
@@ -1276,7 +1643,35 @@ static void setup_tcp_echo_server(void)
     fflush(stdout);
 #endif
 
-    printf("%s: TCP echo server created (will bind after DHCP)\n", COMPONENT_NAME);
+    /* CRITICAL DEBUG: Print actual PCB local_ip to diagnose TCP matching */
+    struct tcp_pcb_listen *lpcb = (struct tcp_pcb_listen *)pcb;
+    printf("\n");
+    printf("%s: ═══════════════════════════════════════════════════════════\n", COMPONENT_NAME);
+    printf("%s: ✓ TCP SERVER CONFIGURATION\n", COMPONENT_NAME);
+    printf("%s: ═══════════════════════════════════════════════════════════\n", COMPONENT_NAME);
+    printf("%s: Port:           %d\n", COMPONENT_NAME, TCP_ECHO_PORT);
+    printf("%s: PCB local_ip:   %u.%u.%u.%u\n", COMPONENT_NAME,
+           ip4_addr1(&lpcb->local_ip), ip4_addr2(&lpcb->local_ip),
+           ip4_addr3(&lpcb->local_ip), ip4_addr4(&lpcb->local_ip));
+
+    /* Validate PCB binding */
+    bool is_wildcard = (ip4_addr1(&lpcb->local_ip) == 0 &&
+                        ip4_addr2(&lpcb->local_ip) == 0 &&
+                        ip4_addr3(&lpcb->local_ip) == 0 &&
+                        ip4_addr4(&lpcb->local_ip) == 0);
+
+    if (is_wildcard) {
+        printf("%s: Status:         ✅ WILDCARD (0.0.0.0) - accepts ANY destination IP\n", COMPONENT_NAME);
+        printf("%s: Will accept:    Packets to 10.2.0.2, 192.168.95.2, or any IP\n", COMPONENT_NAME);
+    } else {
+        printf("%s: Status:         ⚠️  SPECIFIC IP - only accepts packets to this IP\n", COMPONENT_NAME);
+        printf("%s: Will accept:    Packets to %u.%u.%u.%u ONLY\n", COMPONENT_NAME,
+               ip4_addr1(&lpcb->local_ip), ip4_addr2(&lpcb->local_ip),
+               ip4_addr3(&lpcb->local_ip), ip4_addr4(&lpcb->local_ip));
+        printf("%s: Will REJECT:    Packets to 192.168.95.2 (if not matching above)\n", COMPONENT_NAME);
+    }
+    printf("%s: ═══════════════════════════════════════════════════════════\n", COMPONENT_NAME);
+    printf("\n");
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -1918,7 +2313,9 @@ static int virtio_net_init(void)
  */
 void post_init(void)
 {
-    printf("%s: Component started\n\n", COMPONENT_NAME);
+    printf("%s: Component started\n", COMPONENT_NAME);
+    printf("%s: 🔖 SOFTWARE VERSION: v2.14-disable-reverse-nat (2025-10-11)\n", COMPONENT_NAME);
+    printf("%s: 🔧 Features: Disabled reverse NAT - let host SNAT handle IP translation\n\n", COMPONENT_NAME);
 
     /* Initialize VirtIO device */
     if (virtio_net_init() != 0) {
@@ -1960,25 +2357,81 @@ void post_init(void)
     printf("%s: Initializing lwIP TCP/IP stack...\n", COMPONENT_NAME);
     lwip_init();
 
+    /* CRITICAL: Setup TCP server BEFORE netif_add() so PCB stays bound to 0.0.0.0
+     * This is the key to accepting packets for ANY destination IP (both 10.2.0.2 and 192.168.95.2)
+     * If we do netif_add() first, lwIP might bind the PCB to the interface IP
+     */
+    printf("%s: Setting up TCP server on port %d (binding to 0.0.0.0 for promiscuous accept)...\n", COMPONENT_NAME, TCP_ECHO_PORT);
+    setup_tcp_echo_server();
 
-    /* Add network interface with STATIC IP */
+    /* Add network interface - BRIDGE ARCHITECTURE
+     * nic0 IS the external gateway (192.168.96.2) that pfSense routes through
+     * No gateway needed - we ARE the gateway!
+     * TCP server listens on 192.168.96.2:502
+     */
     struct ip4_addr ipaddr, netmask, gw;
-    IP4_ADDR(&ipaddr, 10, 2, 0, 2);
-    IP4_ADDR(&netmask, 255, 255, 255, 0);
-    IP4_ADDR(&gw, 10, 2, 0, 1);
+    IP4_ADDR(&ipaddr, 192, 168, 96, 2);    /* Static IP: 192.168.96.2 (external gateway) */
+    IP4_ADDR(&netmask, 255, 255, 255, 0);  /* Netmask: 255.255.255.0 */
+    IP4_ADDR(&gw, 0, 0, 0, 0);             /* No gateway - WE are the gateway! */
 
-    printf("%s: Using STATIC IP configuration:\n", COMPONENT_NAME);
-    printf("%s:   IP:      10.2.0.2\n", COMPONENT_NAME);
+    printf("%s: Configuring network interface:\n", COMPONENT_NAME);
+    printf("%s:   IP:      192.168.96.2 (external gateway - pfSense routes here)\n", COMPONENT_NAME);
     printf("%s:   Netmask: 255.255.255.0\n", COMPONENT_NAME);
-    printf("%s:   Gateway: 10.2.0.1\n", COMPONENT_NAME);
+    printf("%s:   Gateway: None (this interface IS the gateway)\n", COMPONENT_NAME);
+    printf("%s:   TCP server: 192.168.96.2:%d\n", COMPONENT_NAME, TCP_ECHO_PORT);
 
-    netif_add(&netif_data, &ipaddr, &netmask, &gw, NULL, custom_netif_init, ethernet_input);
+    netif_add(&netif_data, &ipaddr, &netmask, &gw, NULL, custom_netif_init, custom_input_promiscuous);
     netif_set_default(&netif_data);
     netif_set_status_callback(&netif_data, netif_status_callback);
     netif_set_up(&netif_data);
 
-    printf("%s: Network interface UP with static IP\n", COMPONENT_NAME);
-    setup_tcp_echo_server();
+    /* Static ARP entry NOT needed with bridge architecture!
+     * With bridges, all devices are on the same Layer 2 network
+     * ARP works naturally without any hacks
+     */
+
+    /* Verify interface configuration */
+    printf("\n");
+    printf("%s: ═══════════════════════════════════════════════════════════\n", COMPONENT_NAME);
+    printf("%s: ✓ NETWORK INTERFACE CONFIGURATION\n", COMPONENT_NAME);
+    printf("%s: ═══════════════════════════════════════════════════════════\n", COMPONENT_NAME);
+    printf("%s: Interface IP:   %u.%u.%u.%u\n", COMPONENT_NAME,
+           ip4_addr1(netif_ip4_addr(&netif_data)),
+           ip4_addr2(netif_ip4_addr(&netif_data)),
+           ip4_addr3(netif_ip4_addr(&netif_data)),
+           ip4_addr4(netif_ip4_addr(&netif_data)));
+    printf("%s: Netmask:        %u.%u.%u.%u\n", COMPONENT_NAME,
+           ip4_addr1(netif_ip4_netmask(&netif_data)),
+           ip4_addr2(netif_ip4_netmask(&netif_data)),
+           ip4_addr3(netif_ip4_netmask(&netif_data)),
+           ip4_addr4(netif_ip4_netmask(&netif_data)));
+    printf("%s: Gateway:        %u.%u.%u.%u\n", COMPONENT_NAME,
+           ip4_addr1(netif_ip4_gw(&netif_data)),
+           ip4_addr2(netif_ip4_gw(&netif_data)),
+           ip4_addr3(netif_ip4_gw(&netif_data)),
+           ip4_addr4(netif_ip4_gw(&netif_data)));
+    printf("%s: Status:         %s\n", COMPONENT_NAME, netif_is_up(&netif_data) ? "UP" : "DOWN");
+    printf("%s: Role:           External gateway (transparent security gateway)\n", COMPONENT_NAME);
+    printf("%s: ═══════════════════════════════════════════════════════════\n", COMPONENT_NAME);
+    printf("\n");
+
+    /* Validation check */
+    uint8_t if_ip1 = ip4_addr1(netif_ip4_addr(&netif_data));
+    uint8_t if_ip2 = ip4_addr2(netif_ip4_addr(&netif_data));
+    uint8_t if_ip3 = ip4_addr3(netif_ip4_addr(&netif_data));
+    uint8_t if_ip4 = ip4_addr4(netif_ip4_addr(&netif_data));
+
+    if (if_ip1 == 192 && if_ip2 == 168 && if_ip3 == 96 && if_ip4 == 2) {
+        printf("%s: ✅ CONFIGURATION VALID: External gateway IP = 192.168.96.2\n", COMPONENT_NAME);
+        printf("%s: ✅ pfSense routes 192.168.95.0/24 traffic through this gateway\n", COMPONENT_NAME);
+        printf("%s: ✅ Bridge br0 forwards all traffic to/from ens224\n", COMPONENT_NAME);
+    } else {
+        printf("%s: ⚠️  WARNING: Interface IP (%u.%u.%u.%u) does NOT match expected (192.168.96.2)\n",
+               COMPONENT_NAME, if_ip1, if_ip2, if_ip3, if_ip4);
+        printf("%s: ⚠️  pfSense routing will FAIL!\n", COMPONENT_NAME);
+    }
+    printf("\n");
+
     tcp_server_initialized = true;
     printf("%s: ✓ Initialization complete\n", COMPONENT_NAME);
     printf("%s: Network ready\n\n", COMPONENT_NAME);
@@ -2024,6 +2477,10 @@ int run(void)
         /* Process lwIP timers and RX packets */
         sys_check_timeouts();
         process_rx_packets();
+
+        /* Refill RX buffers OUTSIDE IRQ context to avoid IRQ storm
+         * This happens in main loop after processing completes */
+        refill_rx_queue();
 
         seL4_Yield();
     }

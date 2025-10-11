@@ -621,13 +621,23 @@ static err_t netif_output(struct netif *netif, struct pbuf *p)
                                    (meta->original_dest_ip >> 8) & 0xFF, meta->original_dest_ip & 0xFF);
 
                             /* Recalculate IP checksum using lwIP's inet_chksum */
+                            uint16_t old_ip_check = ip->check;
                             ip->check = 0;
-                            ip->check = inet_chksum(ip, ip->ihl * 4);
+                            uint16_t new_ip_check = inet_chksum(ip, ip->ihl * 4);
+                            ip->check = new_ip_check;
+
+                            printf("%s: 🔧 TX: IP checksum: 0x%04x → 0x%04x\n",
+                                   COMPONENT_NAME, ntohs(old_ip_check), ntohs(new_ip_check));
 
                             /* Recalculate TCP checksum with pseudo-header */
+                            uint16_t old_tcp_check = tcp->check;
                             tcp->check = 0;
                             uint16_t tcp_len = ntohs(ip->tot_len) - (ip->ihl * 4);
-                            tcp->check = tcp_checksum(ip, tcp, tcp_len);
+                            uint16_t new_tcp_check = tcp_checksum(ip, tcp, tcp_len);
+                            tcp->check = new_tcp_check;
+
+                            printf("%s: 🔧 TX: TCP checksum: 0x%04x → 0x%04x\n",
+                                   COMPONENT_NAME, ntohs(old_tcp_check), ntohs(new_tcp_check));
                         }
                     } else {
                         printf("%s: ⚠️  TX: No metadata found for TCP port %u → %u\n",

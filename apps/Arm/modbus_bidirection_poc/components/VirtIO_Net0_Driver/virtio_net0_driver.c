@@ -439,6 +439,7 @@ static err_t netif_output(struct netif *netif, struct pbuf *p);
 static err_t custom_netif_init(struct netif *netif);
 static void netif_status_callback(struct netif *netif);
 static void setup_tcp_echo_server(void);
+static inline uint16_t ip_fast_csum(const void *iph, unsigned int ihl);
 
 /*
  * Get free RX buffer index

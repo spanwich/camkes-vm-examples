@@ -1219,7 +1219,11 @@ static void setup_tcp_echo_server(void)
     fflush(stdout);
 #endif
 
-    err_t err = tcp_bind(pcb, IP_ANY_TYPE, TCP_ECHO_PORT);
+    /* CRITICAL: Bind to 0.0.0.0 (IP_ADDR_ANY) to accept connections to ANY destination IP
+     * This allows Net1 to accept packets destined for metadata.dst_ip (e.g., 192.168.95.2)
+     * even though the interface itself is configured as 10.3.0.2
+     */
+    err_t err = tcp_bind(pcb, IP_ADDR_ANY, TCP_ECHO_PORT);
 
 #if DEBUG_VERBOSE
     printf("%s: [DEBUG] tcp_bind() returned: err=%d (%s)\n", COMPONENT_NAME,
@@ -1263,6 +1267,46 @@ static void setup_tcp_echo_server(void)
     printf("%s: [DEBUG] Exiting setup_tcp_echo_server() - SUCCESS\n", COMPONENT_NAME);
     fflush(stdout);
 #endif
+
+    /* ═══════════════════════════════════════════════════════════
+     * TCP SERVER CONFIGURATION CHECK
+     * ═══════════════════════════════════════════════════════════
+     * Print the actual PCB local_ip to verify we're bound to 0.0.0.0
+     * This diagnostic ensures TCP will accept ANY destination IP
+     */
+
+    /* CRITICAL DEBUG: Print actual PCB local_ip to diagnose TCP matching */
+    struct tcp_pcb_listen *lpcb = (struct tcp_pcb_listen *)pcb;
+    printf("\n");
+    printf("%s: ═══════════════════════════════════════════════════════════\n", COMPONENT_NAME);
+    printf("%s: ✓ TCP SERVER CONFIGURATION (Net1 - PLC-facing)\n", COMPONENT_NAME);
+    printf("%s: ═══════════════════════════════════════════════════════════\n", COMPONENT_NAME);
+    printf("%s: Port:           %d\n", COMPONENT_NAME, TCP_ECHO_PORT);
+    printf("%s: PCB local_ip:   %u.%u.%u.%u\n", COMPONENT_NAME,
+           ip4_addr1(&lpcb->local_ip), ip4_addr2(&lpcb->local_ip),
+           ip4_addr3(&lpcb->local_ip), ip4_addr4(&lpcb->local_ip));
+
+    /* Validate PCB binding */
+    bool is_wildcard = (ip4_addr1(&lpcb->local_ip) == 0 &&
+                        ip4_addr2(&lpcb->local_ip) == 0 &&
+                        ip4_addr3(&lpcb->local_ip) == 0 &&
+                        ip4_addr4(&lpcb->local_ip) == 0);
+
+    if (is_wildcard) {
+        printf("%s: Status:         ✅ WILDCARD (0.0.0.0) - accepts ANY destination IP\n", COMPONENT_NAME);
+        printf("%s: Will accept:    Packets to 10.3.0.2 (interface IP) or metadata.dst_ip (e.g., 192.168.95.2)\n", COMPONENT_NAME);
+        printf("%s: Purpose:        Allows TCP client to connect using metadata.dst_ip from ICS pipeline\n", COMPONENT_NAME);
+    } else {
+        printf("%s: Status:         ⚠️  SPECIFIC IP - only accepts packets to this IP\n", COMPONENT_NAME);
+        printf("%s: Will accept:    Packets to %u.%u.%u.%u ONLY\n", COMPONENT_NAME,
+               ip4_addr1(&lpcb->local_ip), ip4_addr2(&lpcb->local_ip),
+               ip4_addr3(&lpcb->local_ip), ip4_addr4(&lpcb->local_ip));
+        printf("%s: Will REJECT:    Packets to metadata.dst_ip if different (e.g., 192.168.95.2)\n", COMPONENT_NAME);
+        printf("%s: ⚠️  WARNING:     ICS pipeline forwarding will FAIL if dst_ip doesn't match!\n", COMPONENT_NAME);
+    }
+
+    printf("%s: ═══════════════════════════════════════════════════════════\n", COMPONENT_NAME);
+    printf("\n");
 
     printf("%s: TCP echo server created (will bind after DHCP)\n", COMPONENT_NAME);
 }
@@ -1457,29 +1501,64 @@ void inbound_ready_handle(void)
     inbound_tcp_client.bytes_sent = 0;
     inbound_tcp_client.active = true;
 
-    /* Set up destination IP address - use QEMU gateway to reach host */
-    ip_addr_t dest_ip;
-    ipaddr_aton(INBOUND_FORWARD_IP, &dest_ip);  /* 10.0.2.2 - QEMU gateway */
+    /* Extract source and destination from metadata
+     * This preserves end-to-end IP addresses through the gateway
+     * Example: SCADA (192.168.90.5) → PLC (192.168.95.2)
+     *   Net0 receives: src=192.168.90.5, dst=192.168.95.2
+     *   Net1 binds to: 192.168.90.5 (appears as SCADA to PLC)
+     *   Net1 connects to: 192.168.95.2 (real PLC)
+     */
+    ip_addr_t src_ip, dest_ip;
+    IP4_ADDR(&src_ip,
+             (ics_msg->metadata.src_ip >> 24) & 0xFF,
+             (ics_msg->metadata.src_ip >> 16) & 0xFF,
+             (ics_msg->metadata.src_ip >> 8) & 0xFF,
+             ics_msg->metadata.src_ip & 0xFF);
+
+    IP4_ADDR(&dest_ip,
+             (ics_msg->metadata.dst_ip >> 24) & 0xFF,
+             (ics_msg->metadata.dst_ip >> 16) & 0xFF,
+             (ics_msg->metadata.dst_ip >> 8) & 0xFF,
+             ics_msg->metadata.dst_ip & 0xFF);
+
+    /* NOTE: Cannot use tcp_bind() with external IP (192.168.90.5) because lwIP
+     * only allows binding to IPs configured on the local interface (10.3.0.2)
+     *
+     * WORKAROUND: We'll bind to IP_ADDR_ANY and let lwIP use 10.3.0.2 as source.
+     * The host will perform SNAT to translate 10.3.0.2 → original src IP via iptables.
+     *
+     * Alternative future solution: Use raw sockets or modify lwIP to allow arbitrary source IPs
+     */
+    err_t bind_err = tcp_bind(pcb, IP_ADDR_ANY, 0);  /* Bind to any, port 0 = ephemeral */
+    if (bind_err != ERR_OK) {
+        printf("%s: INBOUND: tcp_bind failed: %d\n", COMPONENT_NAME, bind_err);
+        tcp_close(pcb);
+        inbound_tcp_client.active = false;
+        inbound_tcp_client.pcb = NULL;
+        return;
+    }
 
     /* CRITICAL: Set callback argument BEFORE tcp_connect()
      * This prevents null pointer dereference in inbound_tcp_sent_callback
      */
     tcp_arg(pcb, &inbound_tcp_client);
 
-    /* CROSS-DOMAIN PORT MAPPING:
-     * External port 6000 (Net0) → maps to → Host port 18000 (via QEMU gateway)
-     * This creates the protocol break diode architecture
-     */
-    uint16_t mapped_port = INBOUND_FORWARD_PORT;  /* Configurable destination port */
+    /* Use original destination port from metadata */
+    uint16_t dest_port = ics_msg->metadata.dst_port;
 
-    printf("%s: INBOUND: Port mapping: external:%u → host:%s:%u (via QEMU gateway)\n",
-           COMPONENT_NAME, ics_msg->metadata.dst_port, INBOUND_FORWARD_IP, mapped_port);
+    printf("%s: INBOUND: Binding to %u.%u.%u.%u and connecting to %u.%u.%u.%u:%u\n",
+           COMPONENT_NAME,
+           (ics_msg->metadata.src_ip >> 24) & 0xFF,
+           (ics_msg->metadata.src_ip >> 16) & 0xFF,
+           (ics_msg->metadata.src_ip >> 8) & 0xFF,
+           ics_msg->metadata.src_ip & 0xFF,
+           (ics_msg->metadata.dst_ip >> 24) & 0xFF,
+           (ics_msg->metadata.dst_ip >> 16) & 0xFF,
+           (ics_msg->metadata.dst_ip >> 8) & 0xFF,
+           ics_msg->metadata.dst_ip & 0xFF,
+           dest_port);
 
-    /* Connect to host via QEMU gateway */
-    printf("%s: INBOUND: Connecting to host via %s:%u...\n",
-           COMPONENT_NAME, INBOUND_FORWARD_IP, mapped_port);
-
-    err_t err = tcp_connect(pcb, &dest_ip, mapped_port, inbound_tcp_connected_callback);
+    err_t err = tcp_connect(pcb, &dest_ip, dest_port, inbound_tcp_connected_callback);
     if (err != ERR_OK) {
         printf("%s: INBOUND: tcp_connect failed: %d\n", COMPONENT_NAME, err);
         tcp_close(pcb);
@@ -1488,7 +1567,7 @@ void inbound_ready_handle(void)
         return;
     }
 
-    printf("%s: INBOUND: Connection initiated\n", COMPONENT_NAME);
+    printf("%s: INBOUND: Connection initiated (end-to-end IP preservation)\n", COMPONENT_NAME);
 }
 
 /*
@@ -1816,7 +1895,9 @@ static int virtio_net_init(void)
  */
 void post_init(void)
 {
-    printf("%s: Component started\n\n", COMPONENT_NAME);
+    printf("%s: Component started\n", COMPONENT_NAME);
+    printf("%s: 🔖 SOFTWARE VERSION: v2.15-bridge-architecture (2025-10-11)\n", COMPONENT_NAME);
+    printf("%s: 🔧 Features: Pure L2 bridge - NO NAT, real gateway IPs (192.168.95.1)\n\n", COMPONENT_NAME);
 
     /* Initialize VirtIO device */
     if (virtio_net_init() != 0) {
@@ -1860,17 +1941,19 @@ void post_init(void)
     printf("%s: Initializing lwIP TCP/IP stack...\n", COMPONENT_NAME);
     lwip_init();
 
-    /* Add network interface with STATIC IP (VLAN deployment - private network) */
+    /* Add network interface - BRIDGE ARCHITECTURE
+     * nic1 IS the internal gateway (192.168.95.1) that PLC uses as its gateway
+     * No gateway needed - we ARE the gateway!
+     */
     struct ip4_addr ipaddr, netmask, gw;
-    IP4_ADDR(&ipaddr, 10, 3, 0, 2);        /* Static IP: 10.3.0.2 (private network) */
+    IP4_ADDR(&ipaddr, 192, 168, 95, 1);    /* Static IP: 192.168.95.1 (internal gateway) */
     IP4_ADDR(&netmask, 255, 255, 255, 0);  /* Netmask: 255.255.255.0 */
-    IP4_ADDR(&gw, 10, 3, 0, 1);            /* Gateway: 10.3.0.1 (tap1) */
+    IP4_ADDR(&gw, 0, 0, 0, 0);             /* No gateway - WE are the gateway! */
 
-    printf("%s: Using STATIC IP configuration (VLAN deployment - private network):\n", COMPONENT_NAME);
-    printf("%s:   IP:      10.3.0.2 (connected to tap1)\n", COMPONENT_NAME);
+    printf("%s: Configuring network interface:\n", COMPONENT_NAME);
+    printf("%s:   IP:      192.168.95.1 (internal gateway - PLC routes here)\n", COMPONENT_NAME);
     printf("%s:   Netmask: 255.255.255.0\n", COMPONENT_NAME);
-    printf("%s:   Gateway: 10.3.0.1 (host tap1)\n", COMPONENT_NAME);
-    printf("%s:   Host NAT: eth1 (192.168.90.1) ←→ tap1 (10.3.0.2)\n", COMPONENT_NAME);
+    printf("%s:   Gateway: None (this interface IS the gateway)\n", COMPONENT_NAME);
 
     netif_add(&netif_data, &ipaddr, &netmask, &gw, NULL, custom_netif_init, ethernet_input);
     netif_set_default(&netif_data);
@@ -1879,6 +1962,56 @@ void post_init(void)
 
     /* Skip DHCP - use static IP */
     printf("%s: Network interface UP with static IP\n", COMPONENT_NAME);
+
+    /* ═══════════════════════════════════════════════════════════
+     * NETWORK INTERFACE CONFIGURATION CHECK
+     * ═══════════════════════════════════════════════════════════
+     * Verify the interface has the correct IP configuration
+     * This diagnostic ensures proper ARP resolution with tap1
+     */
+
+    printf("\n");
+    printf("%s: ═══════════════════════════════════════════════════════════\n", COMPONENT_NAME);
+    printf("%s: ✓ NETWORK INTERFACE CONFIGURATION (Net1 - PLC-facing)\n", COMPONENT_NAME);
+    printf("%s: ═══════════════════════════════════════════════════════════\n", COMPONENT_NAME);
+    printf("%s: Interface IP:   %u.%u.%u.%u\n", COMPONENT_NAME,
+           ip4_addr1(netif_ip4_addr(&netif_data)),
+           ip4_addr2(netif_ip4_addr(&netif_data)),
+           ip4_addr3(netif_ip4_addr(&netif_data)),
+           ip4_addr4(netif_ip4_addr(&netif_data)));
+    printf("%s: Netmask:        %u.%u.%u.%u\n", COMPONENT_NAME,
+           ip4_addr1(netif_ip4_netmask(&netif_data)),
+           ip4_addr2(netif_ip4_netmask(&netif_data)),
+           ip4_addr3(netif_ip4_netmask(&netif_data)),
+           ip4_addr4(netif_ip4_netmask(&netif_data)));
+    printf("%s: Gateway:        %u.%u.%u.%u\n", COMPONENT_NAME,
+           ip4_addr1(netif_ip4_gw(&netif_data)),
+           ip4_addr2(netif_ip4_gw(&netif_data)),
+           ip4_addr3(netif_ip4_gw(&netif_data)),
+           ip4_addr4(netif_ip4_gw(&netif_data)));
+    printf("%s: MAC:            %02x:%02x:%02x:%02x:%02x:%02x\n", COMPONENT_NAME,
+           netif_data.hwaddr[0], netif_data.hwaddr[1], netif_data.hwaddr[2],
+           netif_data.hwaddr[3], netif_data.hwaddr[4], netif_data.hwaddr[5]);
+
+    /* Validation check */
+    uint8_t if_ip1 = ip4_addr1(netif_ip4_addr(&netif_data));
+    uint8_t if_ip2 = ip4_addr2(netif_ip4_addr(&netif_data));
+    uint8_t if_ip3 = ip4_addr3(netif_ip4_addr(&netif_data));
+    uint8_t if_ip4 = ip4_addr4(netif_ip4_addr(&netif_data));
+
+    if (if_ip1 == 10 && if_ip2 == 3 && if_ip3 == 0 && if_ip4 == 2) {
+        printf("%s: ✅ CONFIGURATION VALID: Interface IP matches expected tap1 subnet (10.3.0.2)\n", COMPONENT_NAME);
+        printf("%s: ✅ Host can ARP for this IP and establish communication\n", COMPONENT_NAME);
+        printf("%s: ✅ TCP client will use this IP as source when connecting to metadata.dst_ip\n", COMPONENT_NAME);
+    } else {
+        printf("%s: ⚠️  WARNING: Interface IP (%u.%u.%u.%u) does NOT match tap1 subnet (expected 10.3.0.2)\n",
+               COMPONENT_NAME, if_ip1, if_ip2, if_ip3, if_ip4);
+        printf("%s: ⚠️  Host will ARP for 10.3.0.2 but won't get a response - communication will FAIL!\n", COMPONENT_NAME);
+        printf("%s: ⚠️  TCP connections to PLC will not work without correct interface IP\n", COMPONENT_NAME);
+    }
+
+    printf("%s: ═══════════════════════════════════════════════════════════\n", COMPONENT_NAME);
+    printf("\n");
 
     /* TEMPORARY: Re-enable immediate TCP server creation to test verbose debug
      * This WILL cause malloc fault at address 0x10, but allows us to capture

@@ -425,10 +425,6 @@ static err_t custom_netif_init(struct netif *netif);
 static void netif_status_callback(struct netif *netif);
 static void setup_tcp_echo_server(void);
 
-/* Global storage for Virtual NAT mapping (RX path stores, TX path uses for reverse NAT) */
-static uint32_t last_packet_original_source_ip = 0;  /* Incoming source (e.g., 192.168.90.5 SCADA) */
-static uint32_t last_packet_original_dest_ip = 0;    /* Incoming dest (e.g., 192.168.95.2 PLC) */
-
 /*
  * Get free RX buffer index
  */
@@ -549,118 +545,6 @@ static err_t netif_output(struct netif *netif, struct pbuf *p)
         return ERR_BUF;
     }
 
-    /* REVERSE VIRTUAL NAT: **DISABLED**
-     *
-     * Original plan: Rewrite source IP to match original dest (192.168.95.2)
-     * Problem: Host routing breaks! Packets with src=192.168.95.2 don't match SNAT rules
-     *
-     * Correct approach:
-     *   - RX: Rewrite dest 192.168.95.2 → 10.2.0.2 (for lwIP) ✅
-     *   - TX: Leave source as 10.2.0.2 (lwIP's interface IP) ✅
-     *   - Host SNAT: Translates 10.2.0.2 → 192.168.96.2 automatically ✅
-     *
-     * lwIP naturally sends responses with:
-     *   - Source: 10.2.0.2 (interface IP)
-     *   - Dest: 192.168.90.5 (client IP from incoming packet)
-     * This is CORRECT! Don't rewrite!
-     */
-    if (0 && last_packet_original_source_ip != 0 && last_packet_original_dest_ip != 0) {  /* DISABLED */
-        uint8_t *tx_data = packet_buffers[tx_buf_idx];
-
-        /* Check if this is an IPv4 packet */
-        if (p->tot_len >= sizeof(struct ethhdr) + sizeof(struct iphdr)) {
-            struct ethhdr *eth = (struct ethhdr *)tx_data;
-            if (ntohs(eth->h_proto) == 0x0800) {  /* IPv4 */
-                struct iphdr *iphdr = (struct iphdr *)(tx_data + sizeof(struct ethhdr));
-
-                /* Check if this is a TCP packet going to the original client */
-                if (iphdr->protocol == 6) {  /* TCP */
-                    uint32_t current_src_ip = ntohl(iphdr->saddr);
-                    uint32_t current_dest_ip = ntohl(iphdr->daddr);
-                    uint32_t expected_src_ip = last_packet_original_dest_ip;    /* PLC IP from incoming */
-                    uint32_t expected_dest_ip = last_packet_original_source_ip;  /* SCADA IP from incoming */
-
-                    /* Only rewrite if IPs don't match expected */
-                    if (current_src_ip != expected_src_ip || current_dest_ip != expected_dest_ip) {
-                        printf("%s: 🔄 REVERSE NAT: src=%u.%u.%u.%u → %u.%u.%u.%u, dest=%u.%u.%u.%u → %u.%u.%u.%u\n",
-                               COMPONENT_NAME,
-                               (current_src_ip >> 24) & 0xFF, (current_src_ip >> 16) & 0xFF,
-                               (current_src_ip >> 8) & 0xFF, current_src_ip & 0xFF,
-                               (expected_src_ip >> 24) & 0xFF, (expected_src_ip >> 16) & 0xFF,
-                               (expected_src_ip >> 8) & 0xFF, expected_src_ip & 0xFF,
-                               (current_dest_ip >> 24) & 0xFF, (current_dest_ip >> 16) & 0xFF,
-                               (current_dest_ip >> 8) & 0xFF, current_dest_ip & 0xFF,
-                               (expected_dest_ip >> 24) & 0xFF, (expected_dest_ip >> 16) & 0xFF,
-                               (expected_dest_ip >> 8) & 0xFF, expected_dest_ip & 0xFF);
-
-                        /* Rewrite BOTH source and destination IPs */
-                        iphdr->saddr = htonl(expected_src_ip);   /* Restore PLC IP as source */
-                        iphdr->daddr = htonl(expected_dest_ip);  /* Set SCADA IP as destination */
-
-                        /* Recalculate IP header checksum */
-                        iphdr->check = 0;
-                        uint16_t ip_hdr_len = iphdr->ihl * 4;
-                        iphdr->check = inet_chksum(iphdr, ip_hdr_len);
-
-                        /* Recalculate TCP checksum */
-                        size_t tcp_offset = sizeof(struct ethhdr) + ip_hdr_len;
-                        if (p->tot_len >= tcp_offset + sizeof(struct tcphdr)) {
-                            struct tcphdr *tcphdr = (struct tcphdr *)(tx_data + tcp_offset);
-                            uint16_t tcp_len = ntohs(iphdr->tot_len) - ip_hdr_len;
-
-                            tcphdr->check = 0;
-
-                            /* Create pseudo-header for TCP checksum */
-                            struct tcp_pseudo_hdr {
-                                uint32_t src_addr;
-                                uint32_t dst_addr;
-                                uint8_t zero;
-                                uint8_t protocol;
-                                uint16_t tcp_length;
-                            } __attribute__((packed)) pseudo;
-
-                            pseudo.src_addr = iphdr->saddr;
-                            pseudo.dst_addr = iphdr->daddr;
-                            pseudo.zero = 0;
-                            pseudo.protocol = 6;  /* TCP */
-                            pseudo.tcp_length = htons(tcp_len);
-
-                            /* Calculate checksum over pseudo-header + TCP segment */
-                            uint32_t sum = 0;
-                            uint16_t *ptr;
-
-                            /* Add pseudo-header */
-                            ptr = (uint16_t *)&pseudo;
-                            for (int i = 0; i < sizeof(pseudo) / 2; i++) {
-                                sum += ptr[i];
-                            }
-
-                            /* Add TCP segment */
-                            ptr = (uint16_t *)tcphdr;
-                            for (int i = 0; i < tcp_len / 2; i++) {
-                                sum += ptr[i];
-                            }
-
-                            /* Handle odd byte */
-                            if (tcp_len & 1) {
-                                sum += ((uint8_t *)tcphdr)[tcp_len - 1];
-                            }
-
-                            /* Fold 32-bit sum to 16 bits */
-                            while (sum >> 16) {
-                                sum = (sum & 0xFFFF) + (sum >> 16);
-                            }
-
-                            tcphdr->check = ~sum;
-
-                            printf("%s:    ✅ Reverse NAT complete - IP/TCP checksums recalculated\n",
-                                   COMPONENT_NAME);
-                        }
-                    }
-                }
-            }
-        }
-    }
 
     /* Detailed TX packet inspection for first 10 packets */
     if (tx_count <= 10) {
@@ -787,141 +671,16 @@ static err_t netif_output(struct netif *netif, struct pbuf *p)
  * at our interface (192.168.96.2) with original IPs intact.
  * lwIP processes them normally.
  */
+/*
+ * Custom input function for bridge architecture
+ * With bridges, packets arrive with real IPs - no NAT needed!
+ */
 static err_t custom_input_promiscuous(struct pbuf *p, struct netif *inp)
 {
-    /* Simply pass packet to lwIP's standard input processing
-     * No NAT, no IP rewriting needed!
-     */
-    if (p->len >= sizeof(struct eth_hdr)) {
-        struct eth_hdr *ethhdr = (struct eth_hdr *)p->payload;
-        u16_t type = lwip_ntohs(ethhdr->type);
-
-        if (type == ETHTYPE_IP) {
-            /* Remove Ethernet header */
-            if (pbuf_remove_header(p, sizeof(struct eth_hdr)) == 0) {
-                /* Extract packet destination IP */
-                if (p->len >= 20) {  /* Minimum IPv4 header size */
-                    struct ip_hdr *iphdr = (struct ip_hdr *)p->payload;
-                    uint32_t pkt_dest_ip_network = iphdr->dest.addr;  /* Network byte order */
-                    uint32_t if_ip_network = ip4_addr_get_u32(netif_ip4_addr(inp));  /* Network byte order */
-
-                    /* Convert to host byte order for display and comparison */
-                    uint32_t pkt_dest_ip = lwip_ntohl(pkt_dest_ip_network);
-                    uint32_t pkt_src_ip = lwip_ntohl(iphdr->src.addr);  /* Extract source IP */
-                    uint32_t if_ip = lwip_ntohl(if_ip_network);
-
-                    /* Save BOTH source and dest IPs for reverse NAT (host byte order) */
-                    last_packet_original_source_ip = pkt_src_ip;  /* e.g., 192.168.90.5 SCADA */
-                    last_packet_original_dest_ip = pkt_dest_ip;   /* e.g., 192.168.95.2 PLC */
-
-                    /* If packet dest doesn't match interface IP, rewrite it */
-                    if (pkt_dest_ip != if_ip) {
-                        /* Debug: Show original packet before rewrite */
-                        printf("%s: 🔧 Virtual NAT BEFORE: dest=%u.%u.%u.%u, proto=%u, len=%u\n",
-                               COMPONENT_NAME,
-                               (pkt_dest_ip >> 24) & 0xFF, (pkt_dest_ip >> 16) & 0xFF,
-                               (pkt_dest_ip >> 8) & 0xFF, pkt_dest_ip & 0xFF,
-                               iphdr->_proto, lwip_ntohs(iphdr->_len));
-
-                        /* Rewrite destination IP in packet to match interface IP (network byte order) */
-                        uint32_t old_dest = iphdr->dest.addr;  /* Save for TCP checksum adjustment */
-                        iphdr->dest.addr = if_ip_network;  /* Already in network byte order */
-
-                        /* Recalculate IP header checksum */
-                        uint16_t old_ip_chksum = iphdr->_chksum;
-                        iphdr->_chksum = 0;
-                        iphdr->_chksum = inet_chksum(iphdr, IPH_HL(iphdr) * 4);
-
-                        /* CRITICAL: Recalculate TCP/UDP checksum (pseudo-header includes IP addresses!) */
-                        if (iphdr->_proto == 6) {  /* TCP */
-                            size_t ip_hdr_len = IPH_HL(iphdr) * 4;
-                            u16_t tcp_len = lwip_ntohs(iphdr->_len) - ip_hdr_len;
-                            if (p->len >= ip_hdr_len + 20) {  /* TCP header minimum 20 bytes */
-                                struct tcp_hdr *tcphdr = (struct tcp_hdr *)((uint8_t *)iphdr + ip_hdr_len);
-
-                                /* TCP checksum includes pseudo-header with IPs - must recalculate */
-                                uint16_t old_tcp_chksum = tcphdr->chksum;
-                                tcphdr->chksum = 0;
-
-                                /* Create temporary pbuf pointing at TCP segment for checksum calculation */
-                                struct pbuf tcp_pbuf;
-                                tcp_pbuf.next = NULL;
-                                tcp_pbuf.payload = tcphdr;
-                                tcp_pbuf.tot_len = tcp_len;
-                                tcp_pbuf.len = tcp_len;
-                                tcp_pbuf.flags = 0;
-                                tcp_pbuf.ref = 1;
-
-                                /* Calculate TCP checksum with new destination IP */
-                                tcphdr->chksum = ip_chksum_pseudo(&tcp_pbuf, IP_PROTO_TCP, tcp_len,
-                                                                  (ip_addr_t *)&iphdr->src,
-                                                                  (ip_addr_t *)&iphdr->dest);
-
-                                printf("%s:    TCP chksum: 0x%04x→0x%04x\n",
-                                       COMPONENT_NAME, old_tcp_chksum, tcphdr->chksum);
-                            }
-                        } else if (iphdr->_proto == 17) {  /* UDP */
-                            size_t ip_hdr_len = IPH_HL(iphdr) * 4;
-                            if (p->len >= ip_hdr_len + 8) {  /* UDP header 8 bytes */
-                                struct udp_hdr *udphdr = (struct udp_hdr *)((uint8_t *)iphdr + ip_hdr_len);
-
-                                /* UDP checksum includes pseudo-header - recalculate if present */
-                                if (udphdr->chksum != 0) {  /* UDP checksum is optional */
-                                    u16_t udp_len = lwip_ntohs(udphdr->len);
-                                    uint16_t old_udp_chksum = udphdr->chksum;
-                                    udphdr->chksum = 0;
-
-                                    /* Create temporary pbuf pointing at UDP segment */
-                                    struct pbuf udp_pbuf;
-                                    udp_pbuf.next = NULL;
-                                    udp_pbuf.payload = udphdr;
-                                    udp_pbuf.tot_len = udp_len;
-                                    udp_pbuf.len = udp_len;
-                                    udp_pbuf.flags = 0;
-                                    udp_pbuf.ref = 1;
-
-                                    udphdr->chksum = ip_chksum_pseudo(&udp_pbuf, IP_PROTO_UDP, udp_len,
-                                                                      (ip_addr_t *)&iphdr->src,
-                                                                      (ip_addr_t *)&iphdr->dest);
-
-                                    printf("%s:    UDP chksum: 0x%04x→0x%04x\n",
-                                           COMPONENT_NAME, old_udp_chksum, udphdr->chksum);
-                                }
-                            }
-                        }
-
-                        /* Debug: Verify rewrite */
-                        uint32_t new_dest = lwip_ntohl(iphdr->dest.addr);
-                        printf("%s: 🔧 Virtual NAT AFTER:  dest=%u.%u.%u.%u, IP chksum: 0x%04x→0x%04x %s\n",
-                               COMPONENT_NAME,
-                               (new_dest >> 24) & 0xFF, (new_dest >> 16) & 0xFF,
-                               (new_dest >> 8) & 0xFF, new_dest & 0xFF,
-                               old_ip_chksum, iphdr->_chksum,
-                               (new_dest == if_ip) ? "✅ MATCH" : "❌ MISMATCH");
-                    }
-                }
-
-                /* Process packet - lwIP now accepts it (dest matches interface) */
-                err_t result = ip_input(p, inp);
-
-                /* Debug: Track lwIP's decision */
-                if (result != ERR_OK) {
-                    printf("%s: ⚠️  lwIP ip_input() returned ERROR: %d\n", COMPONENT_NAME, result);
-                } else {
-                    printf("%s: ✅ lwIP ip_input() returned OK (packet accepted by IP layer)\n", COMPONENT_NAME);
-                }
-
-                return result;
-            }
-        } else if (type == ETHTYPE_IPV6 || type == ETHTYPE_ARP) {
-            /* Remove Ethernet header and pass to IP layer */
-            if (pbuf_remove_header(p, sizeof(struct eth_hdr)) == 0) {
-                return ip_input(p, inp);
-            }
-        }
+    /* Bridge architecture: just remove ethernet header and pass to lwIP */
+    if (pbuf_remove_header(p, sizeof(struct eth_hdr)) == 0) {
+        return ip_input(p, inp);
     }
-
-    /* Fallback to normal ethernet_input for other cases */
     return ethernet_input(p, inp);
 }
 
@@ -2314,8 +2073,8 @@ static int virtio_net_init(void)
 void post_init(void)
 {
     printf("%s: Component started\n", COMPONENT_NAME);
-    printf("%s: 🔖 SOFTWARE VERSION: v2.14-disable-reverse-nat (2025-10-11)\n", COMPONENT_NAME);
-    printf("%s: 🔧 Features: Disabled reverse NAT - let host SNAT handle IP translation\n\n", COMPONENT_NAME);
+    printf("%s: 🔖 SOFTWARE VERSION: v2.15-bridge-architecture (2025-10-11)\n", COMPONENT_NAME);
+    printf("%s: 🔧 Features: Pure L2 bridge - NO NAT, real gateway IPs (192.168.96.2)\n\n", COMPONENT_NAME);
 
     /* Initialize VirtIO device */
     if (virtio_net_init() != 0) {

@@ -52,13 +52,17 @@
 #define PBUF_POOL_SIZE                  32      /* Match our packet buffer count */
 #define PBUF_POOL_BUFSIZE               2048    /* Match PACKET_BUFFER_SIZE */
 
-/* Checksum configuration - let hardware handle it if possible */
+/* Checksum configuration
+ * CRITICAL: Disable TCP RX checksum validation because we rewrite dest IP
+ * before lwIP sees the packet, which invalidates the TCP checksum
+ * (TCP checksum includes IP pseudo-header with src/dest IPs)
+ */
 #define CHECKSUM_GEN_IP                 1
 #define CHECKSUM_GEN_UDP                1
 #define CHECKSUM_GEN_TCP                1
 #define CHECKSUM_CHECK_IP               1
 #define CHECKSUM_CHECK_UDP              1
-#define CHECKSUM_CHECK_TCP              1
+#define CHECKSUM_CHECK_TCP              0  /* Disabled - we rewrite dest IP */
 
 /* Debugging options - TCP-focused with minimal noise */
 #define LWIP_DEBUG                      1

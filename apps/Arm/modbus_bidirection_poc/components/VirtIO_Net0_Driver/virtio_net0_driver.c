@@ -2326,8 +2326,8 @@ static int virtio_net_init(void)
 void post_init(void)
 {
     printf("%s: Component started\n", COMPONENT_NAME);
-    printf("%s: 🔖 SOFTWARE VERSION: v2.18-metadata-preservation (2025-10-11)\n", COMPONENT_NAME);
-    printf("%s: 🔧 Features: Connection tracking preserves & restores original IPs for ICS validation\n\n", COMPONENT_NAME);
+    printf("%s: 🔖 SOFTWARE VERSION: v2.19-disable-tcp-checksum (2025-10-11)\n", COMPONENT_NAME);
+    printf("%s: 🔧 Features: Disabled TCP RX checksum - rewriting dest IP invalidates it\n\n", COMPONENT_NAME);
 
     /* Initialize VirtIO device */
     if (virtio_net_init() != 0) {

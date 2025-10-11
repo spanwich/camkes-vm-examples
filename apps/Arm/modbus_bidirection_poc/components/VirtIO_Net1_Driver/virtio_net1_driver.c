@@ -1534,11 +1534,11 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
         return err;
     }
 
-    /* ═══ Forward TCP data to ICS_Inbound (INBOUND path) ═══ */
+    /* ═══ Forward TCP data to ICS_Outbound (PLC→SCADA response path) ═══ */
 
     #if DEBUG_MESSAGE_FLOW
     uint32_t msg_id = ++message_id_counter;
-    printf("\n🟢 [MSG #%u] ═══ TCP: Data received from TCP connection ═══\n", msg_id);
+    printf("\n🟢 [MSG #%u] ═══ TCP: Data received from PLC (OUTBOUND response) ═══\n", msg_id);
     printf("   Connection: %u.%u.%u.%u:%u → %u.%u.%u.%u:%u\n",
            ip4_addr1(&pcb->remote_ip), ip4_addr2(&pcb->remote_ip),
            ip4_addr3(&pcb->remote_ip), ip4_addr4(&pcb->remote_ip), pcb->remote_port,
@@ -1559,18 +1559,19 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
     printf("\"\n");
     #endif
 
-    /* CRITICAL: Check if dataport is properly mapped by CAmkES */
-    if (inbound_dp == NULL) {
-        printf("%s: ❌ FATAL: inbound_dp is NULL! CAmkES dataport not mapped\n", COMPONENT_NAME);
+    /* CRITICAL: Check if dataport is properly mapped by CAmkES
+     * PLC responses must go through OUTBOUND path (Net1 → ICS_Outbound → Net0 → SCADA) */
+    if (outbound_dp == NULL) {
+        printf("%s: ❌ FATAL: outbound_dp is NULL! CAmkES dataport not mapped\n", COMPONENT_NAME);
         printf("%s:    This indicates seL4 capability/memory allocation failure\n", COMPONENT_NAME);
         pbuf_free(p);
         return ERR_MEM;
     }
 
-    printf("%s: ✓ Dataport check: inbound_dp=%p (valid)\n", COMPONENT_NAME, (void*)inbound_dp);
+    printf("%s: ✓ Dataport check: outbound_dp=%p (valid)\n", COMPONENT_NAME, (void*)outbound_dp);
 
     /* Step 1: Create ICS message with metadata */
-    ICS_Message *ics_msg = (ICS_Message *)inbound_dp;
+    ICS_Message *ics_msg = (ICS_Message *)outbound_dp;
 
     /* Step 2: Populate FrameMetadata (Phase 1: basic info, Phase 2: full header parsing) */
     printf("%s: About to memset ics_msg->metadata at %p (size=%zu)\n",
@@ -1596,7 +1597,7 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
     ics_msg->payload_length = ics_msg->metadata.payload_length;
     memcpy(ics_msg->payload, p->payload, ics_msg->payload_length);
 
-    printf("%s: INBOUND: Forwarding %u bytes to ICS_Inbound (proto=TCP, src_port=%u, dst_port=%u)\n",
+    printf("%s: OUTBOUND: Forwarding %u bytes to ICS_Outbound (proto=TCP, src_port=%u, dst_port=%u)\n",
            COMPONENT_NAME, ics_msg->payload_length,
            ics_msg->metadata.src_port, ics_msg->metadata.dst_port);
 
@@ -1614,16 +1615,16 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
     printf("\"\n");
 
     #if DEBUG_MESSAGE_FLOW
-    printf("   ✓ ICS message prepared in shared memory (inbound_dp)\n");
-    printf("   Action: Signaling ICS_Inbound component via outbound_ready_emit()\n");
+    printf("   ✓ ICS message prepared in shared memory (outbound_dp)\n");
+    printf("   Action: Signaling ICS_Outbound component via outbound_ready_emit()\n");
     #endif
 
-    /* Step 4: Signal ICS_Inbound that message is ready */
+    /* Step 4: Signal ICS_Outbound that PLC response is ready */
     outbound_ready_emit();
 
     #if DEBUG_MESSAGE_FLOW
-    printf("   ✓ Signal sent to ICS_Inbound - message handoff complete\n");
-    printf("   [MSG #%u now in ICS pipeline - waiting for processing]\n\n", msg_id);
+    printf("   ✓ Signal sent to ICS_Outbound - PLC response handoff complete\n");
+    printf("   [MSG #%u now in OUTBOUND pipeline - forwarding to Net0]\n\n", msg_id);
     #endif
 
     /* Tell TCP we've processed the data */
@@ -2675,7 +2676,8 @@ static int virtio_net_init(void)
 void post_init(void)
 {
     printf("%s: Component started\n", COMPONENT_NAME);
-    printf("%s: 🔖 NET1 SOFTWARE VERSION: v2.27-inbound-ready (2025-10-11)\n", COMPONENT_NAME);
+    printf("%s: 🔖 NET1 SOFTWARE VERSION: v2.28-fix-outbound-path (2025-10-11)\n", COMPONENT_NAME);
+    printf("%s: 🔧 Features: PLC responses via ICS_Outbound (fixed direction)\n", COMPONENT_NAME);
     printf("%s: 🔧 Features: Internal gateway (no upstream GW), IP 192.168.95.1, inbound handler active\n\n", COMPONENT_NAME);
 
     /* Initialize connection tracking table */

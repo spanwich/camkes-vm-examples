@@ -2424,8 +2424,8 @@ static int virtio_net_init(void)
 void post_init(void)
 {
     printf("%s: Component started\n", COMPONENT_NAME);
-    printf("%s: 🔖 SOFTWARE VERSION: v2.24-debug-checksums (2025-10-11)\n", COMPONENT_NAME);
-    printf("%s: 🔧 Features: Fixed IP/TCP checksums with lwIP functions, added checksum debug output\n\n", COMPONENT_NAME);
+    printf("%s: 🔖 SOFTWARE VERSION: v2.25-fix-net1-gateway (2025-10-11)\n", COMPONENT_NAME);
+    printf("%s: 🔧 Features: Internal gateway (no upstream GW), IP 192.168.95.1, checksums fixed\n\n", COMPONENT_NAME);
 
     /* Initialize connection tracking table */
     memset(connection_table, 0, sizeof(connection_table));
@@ -2485,14 +2485,14 @@ void post_init(void)
      * TCP server listens on 192.168.95.1:502
      */
     struct ip4_addr ipaddr, netmask, gw;
-    IP4_ADDR(&ipaddr, 192, 168, 96, 2);    /* Static IP: 192.168.95.1 */
+    IP4_ADDR(&ipaddr, 192, 168, 95, 1);    /* Static IP: 192.168.95.1 (internal gateway) */
     IP4_ADDR(&netmask, 255, 255, 255, 0);  /* Netmask: 255.255.255.0 */
-    IP4_ADDR(&gw, 192, 168, 96, 1);        /* Gateway: pfSense (to reach 192.168.90.x network) */
+    IP4_ADDR(&gw, 0, 0, 0, 0);              /* NO Gateway - this interface IS the gateway */
 
     printf("%s: Configuring network interface:\n", COMPONENT_NAME);
-    printf("%s:   IP:      192.168.95.1 (security gateway on 192.168.96.0/24)\n", COMPONENT_NAME);
+    printf("%s:   IP:      192.168.95.1 (internal gateway - PLC network)\n", COMPONENT_NAME);
     printf("%s:   Netmask: 255.255.255.0\n", COMPONENT_NAME);
-    printf("%s:   Gateway: 192.168.96.1 (pfSense - routes to SCADA network)\n", COMPONENT_NAME);
+    printf("%s:   Gateway: None (this interface IS the gateway)\n", COMPONENT_NAME);
     printf("%s:   TCP server: 192.168.95.1:%d\n", COMPONENT_NAME, TCP_ECHO_PORT);
 
     netif_add(&netif_data, &ipaddr, &netmask, &gw, NULL, custom_netif_init, custom_input_promiscuous);

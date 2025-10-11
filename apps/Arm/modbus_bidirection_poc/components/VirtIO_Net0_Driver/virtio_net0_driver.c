@@ -1691,6 +1691,10 @@ static err_t tcp_echo_accept(void *arg, struct tcp_pcb *newpcb, err_t err)
     tcp_recv(newpcb, tcp_echo_recv);
     tcp_err(newpcb, tcp_echo_err);  /* Register error callback for connection cleanup */
 
+    /* Link PCB to connection metadata for original IP restoration
+     * This associates the PCB with the metadata entry stored during RX processing */
+    connection_link_pcb(newpcb, newpcb->remote_port, newpcb->local_port);
+
     return ERR_OK;
 }
 
@@ -2448,8 +2452,8 @@ static int virtio_net_init(void)
 void post_init(void)
 {
     printf("%s: Component started\n", COMPONENT_NAME);
-    printf("%s: 🔖 NET0 SOFTWARE VERSION: v2.29-fix-original-dest-ip (2025-10-11)\n", COMPONENT_NAME);
-    printf("%s: 🔧 Features: Original PLC IP forwarding, connection tracking, TCP/IP checksums\n\n", COMPONENT_NAME);
+    printf("%s: 🔖 NET0 SOFTWARE VERSION: v2.30-link-pcb-metadata (2025-10-11)\n", COMPONENT_NAME);
+    printf("%s: 🔧 Features: PCB-metadata linking, original PLC IP forwarding, connection tracking\n\n", COMPONENT_NAME);
 
     /* Initialize connection tracking table */
     memset(connection_table, 0, sizeof(connection_table));

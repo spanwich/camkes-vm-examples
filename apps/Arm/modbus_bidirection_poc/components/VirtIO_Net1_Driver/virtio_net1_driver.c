@@ -96,6 +96,7 @@ struct connection_metadata {
     /* v2.50: Connection validation fields for robust reuse */
     uint32_t tcp_seq_num;          /* Initial TCP sequence number - detects port reuse */
     uint32_t timestamp;            /* Creation time - for metadata consistency with Net0 */
+    uint32_t last_activity;        /* Last activity timestamp - for idle timeout (v2.59) */
 };
 
 static struct connection_metadata connection_table[MAX_CONNECTIONS];
@@ -962,6 +963,8 @@ static struct connection_metadata* connection_add(uint32_t orig_src, uint32_t or
             connection_table[i].original_dest_ip = orig_dest;
             connection_table[i].src_port = sport;
             connection_table[i].dest_port = dport;
+            connection_table[i].timestamp = sys_now();  /* v2.50: For validation */
+            connection_table[i].last_activity = sys_now();  /* v2.59: For idle timeout */
             connection_count++;
 
             #if DEBUG_METADATA
@@ -1089,6 +1092,9 @@ static void connection_print_stats(void)
 static void connection_cleanup_stale(void)
 {
     int cleaned = 0;
+    int closed_idle = 0;
+    uint32_t now = sys_now();
+    const uint32_t IDLE_TIMEOUT_MS = 30000;  /* v2.59: 30 seconds idle timeout */
 
     for (int i = 0; i < MAX_CONNECTIONS; i++) {
         if (!connection_table[i].active) {
@@ -1118,12 +1124,49 @@ static void connection_cleanup_stale(void)
             connection_table[i].pcb = NULL;
             connection_count--;
             cleaned++;
+            continue;
+        }
+
+        /* v2.59: Close idle connections (no activity for IDLE_TIMEOUT_MS) */
+        if (pcb->state == ESTABLISHED) {
+            uint32_t idle_time = now - connection_table[i].last_activity;
+            if (idle_time > IDLE_TIMEOUT_MS) {
+                printf("%s: ⏱️  Closing idle connection [%d]: idle for %u ms (timeout=%u ms)\n",
+                       COMPONENT_NAME, i, idle_time, IDLE_TIMEOUT_MS);
+                printf("%s:    Connection: %u.%u.%u.%u:%u → %u.%u.%u.%u:%u\n",
+                       COMPONENT_NAME,
+                       (connection_table[i].original_src_ip >> 24) & 0xFF,
+                       (connection_table[i].original_src_ip >> 16) & 0xFF,
+                       (connection_table[i].original_src_ip >> 8) & 0xFF,
+                       connection_table[i].original_src_ip & 0xFF,
+                       connection_table[i].src_port,
+                       (connection_table[i].original_dest_ip >> 24) & 0xFF,
+                       (connection_table[i].original_dest_ip >> 16) & 0xFF,
+                       (connection_table[i].original_dest_ip >> 8) & 0xFF,
+                       connection_table[i].original_dest_ip & 0xFF,
+                       connection_table[i].dest_port);
+
+                /* Close the idle connection */
+                tcp_recv(pcb, NULL);
+                tcp_sent(pcb, NULL);
+                tcp_err(pcb, NULL);
+                tcp_arg(pcb, NULL);
+                tcp_abort(pcb);  /* Force RST for immediate cleanup */
+
+                connection_table[i].active = false;
+                connection_table[i].pcb = NULL;
+                connection_count--;
+                active_connections--;
+                total_connections_closed++;
+                closed_idle++;
+            }
         }
     }
 
-    if (cleaned > 0) {
+    if (cleaned > 0 || closed_idle > 0) {
         #if DEBUG_METADATA
-        printf("%s: 🧹 Cleaned %d stale connection(s)\n", COMPONENT_NAME, cleaned);
+        printf("%s: 🧹 Cleaned %d stale + %d idle connection(s)\n",
+               COMPONENT_NAME, cleaned, closed_idle);
         connection_print_stats();
         #endif
     }
@@ -1914,27 +1957,39 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
     printf("   [MSG #%u now in OUTBOUND pipeline - forwarding to Net0]\n\n", msg_id);
     #endif
 
-    /* v2.57: CRITICAL FIX - Keep connection alive for follow-up requests!
+    /* v2.59: Keep connection alive BUT update last_activity timestamp for idle cleanup
      *
-     * Previous behavior (v2.56):
-     * - Returned ERR_ABRT after forwarding response
-     * - Closed connection immediately
-     * - PLC saw ESTABLISHED connections accumulate (not closed properly)
-     * - Gateway created new connection for each request (expensive)
+     * Problem Analysis (user feedback):
+     * - Gateway creates new connections without checking if SCADA reuses its connection
+     * - When SCADA keeps connection alive and sends multiple requests:
+     *   - Request #1: Net1 creates connection to PLC
+     *   - v2.58 closes Net1→PLC immediately after response
+     *   - Request #2 on SAME SCADA connection: Net1 finds metadata but PCB closed
+     *   - Validation fails → creates NEW PLC connection
+     *   - Result: PLC accumulates ESTABLISHED connections
      *
-     * Correct behavior (per BREADCRUMB_TRACE.md line 32):
-     * - Keep connection alive after forwarding response
-     * - Reuse same connection for multiple request-response cycles
-     * - Only close when remote peer closes (p == NULL path above)
-     * - Modbus TCP supports connection reuse (keep-alive)
+     * Solution: Keep connections alive for reuse + idle timeout cleanup
+     * - Keep Net1→PLC connection alive after forwarding response
+     * - Update last_activity timestamp for idle detection
+     * - Periodic cleanup task closes connections idle > 30 seconds
+     * - Supports SCADA connection reuse (multiple requests on one connection)
      *
-     * This matches the inbound_tcp_recv_callback behavior (line 1011 breadcrumb).
+     * Benefits:
+     * 1. Connection reuse when SCADA keeps connection alive (efficient)
+     * 2. Idle timeout prevents accumulation when SCADA closes silently
+     * 3. Matches gateway architecture: Mirror SCADA connection lifecycle
      */
 
     tcp_recved(pcb, p->len);  /* Tell lwIP we consumed the data */
     pbuf_free(p);              /* Free the pbuf we were given */
 
-    /* DO NOT close connection - keep alive for next request */
+    /* Update last_activity timestamp for idle timeout detection */
+    struct connection_metadata *meta = connection_lookup_by_pcb(pcb);
+    if (meta != NULL && meta->active) {
+        meta->last_activity = sys_now();  /* lwIP millisecond timer */
+    }
+
+    /* DO NOT close connection - keep alive for next request from same SCADA connection */
     /* DO NOT decrement active_connections - connection still active */
     /* DO NOT remove metadata - needed for connection reuse validation */
 
@@ -2506,6 +2561,9 @@ void inbound_ready_handle(void)
          * ═══════════════════════════════════════════════════════════════════ */
         printf("%s:   ✅ Connection validation passed - REUSING for same SCADA session\n", COMPONENT_NAME);
         printf("%s:   → Supports: Multi-packet responses (>MTU), HTTP keep-alive, streaming\n", COMPONENT_NAME);
+
+        /* v2.59: Update last_activity timestamp for idle timeout detection */
+        existing_meta->last_activity = sys_now();
 
         /* Validate payload size before copying */
         if (ics_msg->payload_length > MAX_PAYLOAD_SIZE) {
@@ -3344,12 +3402,12 @@ static int virtio_net_init(void)
 void post_init(void)
 {
     printf("%s: Component started\n", COMPONENT_NAME);
-    printf("%s: 🔖 NET1 SOFTWARE VERSION: v2.57-keep-alive (2025-10-13)\n", COMPONENT_NAME);
+    printf("%s: 🔖 NET1 SOFTWARE VERSION: v2.59-idle-timeout (2025-10-13)\n", COMPONENT_NAME);
     printf("%s: 🔧 MODE: PRODUCTION-READY with Multi-Layer Validation\n", COMPONENT_NAME);
     printf("%s: ✅ FIX 1: payload_data buffer (prevents dataport corruption)\n", COMPONENT_NAME);
     printf("%s: ✅ FIX 2: Correct lwIP callback protocol (ERR_ABRT without tcp_abort)\n", COMPONENT_NAME);
-    printf("%s: ✅ FIX 3: Keep connections alive for reuse (prevents accumulation)\n", COMPONENT_NAME);
-    printf("%s: ✅ FIX 4: connection_remove() in all close paths (prevents table exhaustion)\n", COMPONENT_NAME);
+    printf("%s: ✅ FIX 3: Connection reuse when SCADA keeps connection alive\n", COMPONENT_NAME);
+    printf("%s: ✅ FIX 4: Idle timeout (30s) prevents orphaned connection accumulation\n", COMPONENT_NAME);
     printf("%s: 🎯 FEATURES: Supports >MTU data, HTTP keep-alive, streaming protocols\n", COMPONENT_NAME);
     printf("%s: ⚠️  CRITICAL: Never uses tcp_close() - always sends RST for immediate cleanup\n\n", COMPONENT_NAME);
 

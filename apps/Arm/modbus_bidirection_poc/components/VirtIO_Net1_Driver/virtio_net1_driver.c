@@ -1816,26 +1816,33 @@ static void tcp_echo_err(void *arg, err_t err)
 static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err)
 {
     if (p == NULL) {
-        /* Connection closed gracefully by remote peer */
-        active_connections--;
-        total_connections_closed++;
+        /* v2.82: CRITICAL FIX - Connection closed by remote peer
+         * MUST return ERR_ABRT WITHOUT calling tcp_close()!
+         * Same fix as Net0 v2.81 */
+
+        /* v2.82: Only decrement if counter is positive (prevent underflow)
+         * lwIP may call both err callback and recv(p=NULL) for the same connection */
+        if (active_connections > 0) {
+            active_connections--;
+            total_connections_closed++;
+        } else {
+            printf("%s: ⚠️  BUG: active_connections already 0 in recv, not decrementing\n",
+                   COMPONENT_NAME);
+        }
 
         #if DEBUG_TRAFFIC
         printf("%s: 🔌 TCP connection closed gracefully\n", COMPONENT_NAME);
         printf("%s:    Remote: %u.%u.%u.%u:%u\n", COMPONENT_NAME,
                ip4_addr1(&pcb->remote_ip), ip4_addr2(&pcb->remote_ip),
                ip4_addr3(&pcb->remote_ip), ip4_addr4(&pcb->remote_ip), pcb->remote_port);
-        #endif
-
-        /* Clean up connection metadata before closing */
-        connection_remove(pcb);
-
         printf("%s:    → Active connections: %u | Total created: %u | Total closed: %u\n",
                COMPONENT_NAME, active_connections, total_connections_created, total_connections_closed);
+        #endif
 
-        /* v2.57: CRITICAL FIX - Return ERR_ABRT WITHOUT calling tcp_abort()!
-         * When returning ERR_ABRT, lwIP handles tcp_abort() internally.
-         * Calling it ourselves violates lwIP protocol and causes state corruption. */
+        /* Clean up connection metadata before lwIP frees PCB */
+        connection_remove(pcb);
+
+        /* v2.82: Return ERR_ABRT - lwIP handles tcp_abort() internally */
         return ERR_ABRT;
     }
 
@@ -2337,6 +2344,38 @@ static err_t inbound_tcp_sent_callback(void *arg, struct tcp_pcb *pcb, u16_t len
     return ERR_OK;
 }
 
+/* v2.82: CRITICAL FIX - Add missing error callback for inbound TCP client connections
+ *
+ * Bug Analysis (v2.81 crash at 0x10 in Net1):
+ * - Net1 never registered tcp_err() callback for inbound client connections
+ * - When connection error occurred, lwIP freed PCB but had no callback to notify us
+ * - Later, inbound_tcp_connected_callback() fired with freed PCB
+ * - Crash at offset 0x10 when accessing tcp_sndbuf(pcb)
+ *
+ * Fix: Add error callback to clean up state when connection fails
+ * This is the same pattern as Net0's tcp_echo_err callback
+ */
+static void inbound_tcp_err_callback(void *arg, err_t err)
+{
+    struct tcp_inbound_client_state *state = (struct tcp_inbound_client_state *)arg;
+
+    printf("%s: ⚠️  INBOUND TCP error - err=%d (%s)\n", COMPONENT_NAME, err,
+           err == ERR_ABRT ? "ERR_ABRT (Connection aborted)" :
+           err == ERR_RST ? "ERR_RST (Connection reset)" :
+           err == ERR_CLSD ? "ERR_CLSD (Connection closed)" :
+           err == ERR_CONN ? "ERR_CONN (Not connected)" :
+           err == ERR_TIMEOUT ? "ERR_TIMEOUT (Timeout)" : "Unknown");
+
+    /* CRITICAL: PCB is already freed by lwIP when err callback is called - don't access it!
+     * Clean up our state only */
+    if (state != NULL && state->active) {
+        state->active = false;
+        state->pcb = NULL;
+    }
+
+    printf("%s: 🧹 INBOUND connection error triggered - state cleaned up\n", COMPONENT_NAME);
+}
+
 static err_t inbound_tcp_connected_callback(void *arg, struct tcp_pcb *pcb, err_t err)
 {
     struct tcp_inbound_client_state *state = (struct tcp_inbound_client_state *)arg;
@@ -2800,6 +2839,10 @@ cleanup_and_create_new:
      * This prevents null pointer dereference in inbound_tcp_sent_callback
      */
     tcp_arg(pcb, &inbound_tcp_client);
+
+    /* v2.82: Register error callback BEFORE tcp_connect()
+     * This is critical to handle connection failures and prevent dangling PCB access */
+    tcp_err(pcb, inbound_tcp_err_callback);
 
     /* Use original destination port from metadata */
     uint16_t dest_port = ics_msg->metadata.dst_port;
@@ -3437,7 +3480,7 @@ static int virtio_net_init(void)
 void post_init(void)
 {
     printf("%s: Component started\n", COMPONENT_NAME);
-    printf("%s: 🔖 NET1 SOFTWARE VERSION: v2.80-pbuf-double-free-debug (2025-10-13)\n", COMPONENT_NAME);
+    printf("%s: 🔖 NET1 SOFTWARE VERSION: v2.82-add-inbound-err-callback (2025-10-13)\n", COMPONENT_NAME);
     printf("%s: 🔧 MODE: PRODUCTION-READY with Multi-Layer Validation\n", COMPONENT_NAME);
     printf("%s: ✅ FIX 1: payload_data buffer (prevents dataport corruption)\n", COMPONENT_NAME);
     printf("%s: ✅ FIX 2: Correct lwIP callback protocol (ERR_ABRT without tcp_abort)\n", COMPONENT_NAME);

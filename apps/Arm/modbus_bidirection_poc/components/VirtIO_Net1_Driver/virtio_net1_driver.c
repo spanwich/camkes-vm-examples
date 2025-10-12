@@ -1090,24 +1090,25 @@ static void connection_print_stats(void)
  */
 static void connection_cleanup_stale(void)
 {
-    /* v2.84: SAFE idle timeout implementation
+    /* v2.85: Only clean up NULL PCBs - DO NOT call tcp_abort() from main loop!
      *
-     * Key insight from user observation:
-     * - After v2.83 removed idle timeout, Net1 accumulated 64 connections (table full!)
-     * - SCADA keeps connections alive, never closes them
-     * - Without idle timeout, connections never get cleaned up
-     * - System stops working when table fills
+     * History:
+     * - v2.83: Removed idle timeout (use-after-free when accessing pcb->state)
+     * - v2.84: Re-added "safe" idle timeout using metadata->last_activity
+     * - v2.85: Removed idle timeout again (tcp_abort() crashes if called during callback)
      *
-     * Safe implementation:
-     * 1. Check idle time using metadata->last_activity (OUR field, not PCB field)
-     * 2. Only abort if PCB is non-NULL (avoid use-after-free)
-     * 3. Clear callbacks BEFORE abort to prevent re-entry
-     * 4. Set metadata inactive BEFORE abort to prevent race conditions
+     * The problem with tcp_abort() from main loop:
+     * - lwIP callbacks may be on the call stack when main loop runs
+     * - tcp_abort() frees PCB immediately
+     * - Callback continues execution → use-after-free → crash
+     *
+     * This is DIFFERENT from the v2.83 bug:
+     * - v2.83: Accessing freed PCB fields (pcb->state)
+     * - v2.85: Freeing PCB while it's still in use by callback
+     *
+     * Solution: Only clean up NULL PCBs, let lwIP manage connection lifecycle
      */
     int cleaned = 0;
-    int closed_idle = 0;
-    uint32_t now = sys_now();
-    const uint32_t IDLE_TIMEOUT_MS = 2000;  /* 2 seconds for fast Modbus TCP */
 
     for (int i = 0; i < MAX_CONNECTIONS; i++) {
         if (!connection_table[i].active) {
@@ -1127,39 +1128,36 @@ static void connection_cleanup_stale(void)
             continue;
         }
 
-        /* v2.84: SAFE idle timeout - only uses metadata fields, no PCB field access!
-         * Check idle time using last_activity timestamp (stored in OUR metadata) */
-        uint32_t idle_time = now - connection_table[i].last_activity;
-        if (idle_time > IDLE_TIMEOUT_MS) {
-            #if DEBUG_METADATA
-            printf("%s: 🧹 Closing idle connection [%d]: idle for %u ms\n",
-                   COMPONENT_NAME, i, idle_time);
-            #endif
-
-            /* Clear callbacks FIRST to prevent re-entry during abort */
-            tcp_recv(pcb, NULL);
-            tcp_sent(pcb, NULL);
-            tcp_err(pcb, NULL);
-            tcp_arg(pcb, NULL);
-
-            /* Mark metadata inactive BEFORE abort (prevent race with Net0) */
-            connection_table[i].active = false;
-            connection_table[i].pcb = NULL;
-            connection_count--;
-
-            /* Memory barrier to ensure metadata update visible before PCB freed */
-            __sync_synchronize();
-
-            /* Now safe to abort - callbacks cleared, metadata marked inactive */
-            tcp_abort(pcb);
-            closed_idle++;
-        }
+        /* v2.85: REMOVED idle timeout - calling tcp_abort() from main loop is UNSAFE!
+         *
+         * Bug discovered by user: "But this only happened since latest fix"
+         * Root cause: tcp_abort() called while lwIP callbacks are still executing
+         * Sequence:
+         * 1. inbound_tcp_recv_callback() processing
+         * 2. Main loop runs connection_cleanup_stale()
+         * 3. Idle timeout calls tcp_abort(pcb)
+         * 4. lwIP callback still running → tries to use freed PCB → CRASH
+         *
+         * Assertion "p != NULL" failed at line 479 in pbuf.c
+         * - pbuf_add_header_impl() called with NULL pbuf
+         * - Caused by tcp_abort() freeing PCB while lwIP using it
+         *
+         * FUNDAMENTAL PROBLEM: Cannot safely call tcp_abort() from outside lwIP callbacks!
+         * - lwIP callbacks may be on the call stack
+         * - tcp_abort() frees PCB immediately
+         * - Callback continues → use-after-free → crash
+         *
+         * Solution: Remove idle timeout entirely
+         * - Rely on lwIP's internal TCP timeouts
+         * - Rely on remote peer closing connections
+         * - Accept that table may fill (but system won't crash)
+         */
     }
 
-    if (cleaned > 0 || closed_idle > 0) {
+    if (cleaned > 0) {
         #if DEBUG_METADATA
-        printf("%s: 🧹 Cleaned %d stale + %d idle connection(s)\n",
-               COMPONENT_NAME, cleaned, closed_idle);
+        printf("%s: 🧹 Cleaned %d stale connection(s)\n",
+               COMPONENT_NAME, cleaned);
         connection_print_stats();
         #endif
     }
@@ -3477,7 +3475,7 @@ static int virtio_net_init(void)
 void post_init(void)
 {
     printf("%s: Component started\n", COMPONENT_NAME);
-    printf("%s: 🔖 NET1 SOFTWARE VERSION: v2.84-safe-idle-timeout (2025-10-13)\n", COMPONENT_NAME);
+    printf("%s: 🔖 NET1 SOFTWARE VERSION: v2.85-no-abort-from-mainloop (2025-10-13)\n", COMPONENT_NAME);
     printf("%s: 🔧 MODE: PRODUCTION-READY with Multi-Layer Validation\n", COMPONENT_NAME);
     printf("%s: ✅ FIX 1: payload_data buffer (prevents dataport corruption)\n", COMPONENT_NAME);
     printf("%s: ✅ FIX 2: Correct lwIP callback protocol (ERR_ABRT without tcp_abort)\n", COMPONENT_NAME);

@@ -181,6 +181,21 @@ static inline bool everparse_validate(const uint8_t* payload, size_t length) {
 #define LOG_ERROR(fmt, ...) printf("[ERROR] " fmt "\n", ##__VA_ARGS__)
 
 /*
+ * Minimal breadcrumb tracing for debugging race conditions
+ * These are ultra-minimal - just marks execution points
+ * Enable/disable by setting BREADCRUMB_TRACE to 1/0
+ */
+#ifndef BREADCRUMB_TRACE
+#define BREADCRUMB_TRACE 1
+#endif
+
+#if BREADCRUMB_TRACE
+    #define BREADCRUMB(id) printf("B%d\n", (id))
+#else
+    #define BREADCRUMB(id) do {} while(0)
+#endif
+
+/*
  * Timestamp utility (simple incrementing counter for now)
  */
 extern uint64_t global_timestamp_counter;

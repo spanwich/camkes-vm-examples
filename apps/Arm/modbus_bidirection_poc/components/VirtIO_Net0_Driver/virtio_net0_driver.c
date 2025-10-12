@@ -52,9 +52,9 @@
 /* ═══════════════════════════════════════════════════════════════ */
 /* DEBUG OUTPUT CONTROL - Set ONE level to 1                        */
 /* ═══════════════════════════════════════════════════════════════ */
-#define DEBUG_LEVEL_SILENT   0  /* Testing: NO output - validates memory barriers */
+#define DEBUG_LEVEL_SILENT   1  /* Testing: NO output - breadcrumbs only */
 #define DEBUG_LEVEL_QUIET    0  /* Production: Only errors and warnings */
-#define DEBUG_LEVEL_NORMAL   1  /* Default: Connection lifecycle + traffic flow - REQUIRED FOR STABILITY */
+#define DEBUG_LEVEL_NORMAL   0  /* Default: Connection lifecycle + traffic flow */
 #define DEBUG_LEVEL_VERBOSE  0  /* Development: Full packet details */
 
 #if DEBUG_LEVEL_SILENT
@@ -62,6 +62,7 @@
     #define DEBUG_TRAFFIC       0
     #define DEBUG_METADATA      0
     #define DEBUG_PACKET_DETAIL 0
+    #define DEBUG_INIT          0  /* Initialization messages */
 #elif DEBUG_LEVEL_QUIET
     #define DEBUG_CRITICAL      1
     #define DEBUG_TRAFFIC       0
@@ -91,6 +92,9 @@ struct connection_metadata {
     uint16_t src_port;             /* Source port */
     uint16_t dest_port;            /* Destination port */
     bool active;                   /* Is this slot in use? */
+    /* v2.50: Connection validation - matches Net1 structure for consistency */
+    uint32_t tcp_seq_num;          /* Initial TCP sequence number - detects connection reuse */
+    uint32_t timestamp;            /* Creation time - for metadata consistency with Net1 */
 };
 
 static struct connection_metadata connection_table[MAX_CONNECTIONS];
@@ -731,6 +735,7 @@ static err_t netif_output(struct netif *netif, struct pbuf *p)
         }
     }
 
+    #if DEBUG_PACKET_DETAIL
     /* Detailed TX packet inspection for first 10 packets */
     if (tx_count <= 10) {
         uint8_t *tx_data = packet_buffers[tx_buf_idx];
@@ -791,6 +796,7 @@ static err_t netif_output(struct netif *netif, struct pbuf *p)
         }
         printf("══════════════════════════════════════════════════════════\n\n");
     }
+    #endif
 
     /* Setup virtio_net_hdr (already zero-initialized, no offloads needed) */
     uintptr_t hdr_paddr = tx_headers_paddr + (hdr_desc_idx * sizeof(virtio_net_hdr_t));
@@ -971,8 +977,12 @@ static void connection_link_pcb(struct tcp_pcb *pcb, uint16_t sport, uint16_t dp
             connection_table[i].dest_port == dport &&
             connection_table[i].pcb == NULL) {
             connection_table[i].pcb = pcb;
+            /* v2.50: Store validation metadata for consistency with Net1 */
+            connection_table[i].tcp_seq_num = pcb->snd_nxt;
+            connection_table[i].timestamp = sys_now();
             #if DEBUG_METADATA
-            printf("%s: 🔗 Linked PCB to metadata [%d]\n", COMPONENT_NAME, i);
+            printf("%s: 🔗 Linked PCB to metadata [%d] (seq=%u, ts=%u)\n",
+                   COMPONENT_NAME, i, pcb->snd_nxt, connection_table[i].timestamp);
             #endif
             return;
         }
@@ -1196,12 +1206,14 @@ static err_t custom_input_promiscuous(struct pbuf *p, struct netif *inp)
 
                     if (!meta) {
                         /* New connection - store metadata */
+                        #if DEBUG_METADATA
                         printf("%s: 📝 RX: Storing NEW metadata: src=%u.%u.%u.%u:%u dest=%u.%u.%u.%u:%u\n",
                                COMPONENT_NAME,
                                (pkt_src_ip >> 24) & 0xFF, (pkt_src_ip >> 16) & 0xFF,
                                (pkt_src_ip >> 8) & 0xFF, pkt_src_ip & 0xFF, src_port,
                                (pkt_dest_ip >> 24) & 0xFF, (pkt_dest_ip >> 16) & 0xFF,
                                (pkt_dest_ip >> 8) & 0xFF, pkt_dest_ip & 0xFF, dest_port);
+                        #endif
                         connection_add(pkt_src_ip, pkt_dest_ip, src_port, dest_port);
                     } else {
                         #if DEBUG_PACKET_DETAIL
@@ -1684,11 +1696,13 @@ static void process_rx_packets(void)
 
                             if (tcp->syn && !tcp->ack) {
                                 /* This is a SYN packet (connection attempt) */
+                                #if DEBUG_PACKET_DETAIL
                                 printf("%s: 🔍 SYN packet detected: Dest IP = %u.%u.%u.%u:%u (Interface IP = 192.168.95.2)\n",
                                        COMPONENT_NAME,
                                        (daddr >> 24) & 0xFF, (daddr >> 16) & 0xFF, (daddr >> 8) & 0xFF, daddr & 0xFF,
                                        ntohs(tcp->dest));
                                 printf("%s:    → If dest IP matches interface IP, lwIP should accept. Otherwise it rejects.\n", COMPONENT_NAME);
+                                #endif
                             }
                         }
                     }
@@ -1770,12 +1784,14 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
         active_connections--;
         total_connections_closed++;
 
+        #if DEBUG_TRAFFIC
         printf("%s: 🔌 TCP connection closed gracefully\n", COMPONENT_NAME);
         printf("%s:    Remote: %u.%u.%u.%u:%u\n", COMPONENT_NAME,
                ip4_addr1(&pcb->remote_ip), ip4_addr2(&pcb->remote_ip),
                ip4_addr3(&pcb->remote_ip), ip4_addr4(&pcb->remote_ip), pcb->remote_port);
         printf("%s:    → Active connections: %u | Total created: %u | Total closed: %u\n",
                COMPONENT_NAME, active_connections, total_connections_created, total_connections_closed);
+        #endif
 
         /* Clear PCB pointer in metadata before closing */
         struct connection_metadata *meta = connection_lookup_by_pcb(pcb);
@@ -1855,16 +1871,20 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
     if (meta != NULL && meta->active) {
         /* Use original destination IP from packet metadata */
         ics_msg->metadata.dst_ip = meta->original_dest_ip;
+        #if DEBUG_METADATA
         printf("%s: 🔍 Lookup: Found metadata - using original dest IP %u.%u.%u.%u\n",
                COMPONENT_NAME,
                (meta->original_dest_ip >> 24) & 0xFF,
                (meta->original_dest_ip >> 16) & 0xFF,
                (meta->original_dest_ip >> 8) & 0xFF,
                meta->original_dest_ip & 0xFF);
+        #endif
     } else {
         /* Fallback: use rewritten IP if lookup fails */
         ics_msg->metadata.dst_ip = ntohl(ip4_addr_get_u32(&pcb->local_ip));
+        #if DEBUG_METADATA
         printf("%s: ⚠️  Lookup: No metadata found - using rewritten IP (WRONG!)\n", COMPONENT_NAME);
+        #endif
     }
 
     ics_msg->metadata.src_port = pcb->remote_port;
@@ -1919,9 +1939,11 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
 
 static err_t tcp_echo_accept(void *arg, struct tcp_pcb *newpcb, err_t err)
 {
+    #if DEBUG_TRAFFIC
     printf("\n%s: ========================================\n", COMPONENT_NAME);
     printf("%s: 🎯 TCP ACCEPT CALLBACK TRIGGERED!\n", COMPONENT_NAME);
     printf("%s:    arg=%p, newpcb=%p, err=%d\n", COMPONENT_NAME, arg, newpcb, err);
+    #endif
 
     if (err != ERR_OK || newpcb == NULL) {
         printf("%s: ❌ TCP accept FAILED - err=%d (%s), newpcb=%p\n",
@@ -1943,6 +1965,7 @@ static err_t tcp_echo_accept(void *arg, struct tcp_pcb *newpcb, err_t err)
     active_connections++;
     total_connections_created++;
 
+    #if DEBUG_TRAFFIC
     printf("%s: ✓ TCP connection ACCEPTED from %u.%u.%u.%u:%u\n",
            COMPONENT_NAME,
            ip4_addr1(&newpcb->remote_ip), ip4_addr2(&newpcb->remote_ip),
@@ -1953,6 +1976,7 @@ static err_t tcp_echo_accept(void *arg, struct tcp_pcb *newpcb, err_t err)
     printf("%s:    → Active connections: %u | Total created: %u | Total closed: %u\n",
            COMPONENT_NAME, active_connections, total_connections_created, total_connections_closed);
     printf("%s: ========================================\n\n", COMPONENT_NAME);
+    #endif
 
     tcp_setprio(newpcb, TCP_PRIO_MIN);
 
@@ -2185,6 +2209,8 @@ static err_t outbound_tcp_connected_callback(void *arg, struct tcp_pcb *pcb, err
  */
 void outbound_ready_handle(void)
 {
+    BREADCRUMB(3000);  /* Entry: ICS_Outbound notification received */
+
     #if DEBUG_PACKET_DETAIL
     uint32_t msg_id = ++message_id_counter;
     printf("\n🟡 [MSG #%u] ═══ ICS→NET: Received PLC response from ICS_Outbound ═══\n", msg_id);
@@ -2192,24 +2218,36 @@ void outbound_ready_handle(void)
     printf("   Action: Forward response to SCADA via existing TCP connection\n");
     #endif
 
+    #if DEBUG_TRAFFIC
     printf("%s: ╔═══════════════════════════════════════════════════════════╗\n", COMPONENT_NAME);
     printf("%s: ║  OUTBOUND: Received PLC response from ICS_Outbound       ║\n", COMPONENT_NAME);
+    #endif
+
+    BREADCRUMB(3001);  /* Checking dataport */
 
     /* CRITICAL: Check if dataport is properly mapped by CAmkES */
     if (outbound_dp == NULL) {
+        BREADCRUMB(3002);  /* NULL dataport */
         printf("%s: ❌ FATAL: outbound_dp is NULL! CAmkES dataport not mapped\n", COMPONENT_NAME);
         printf("%s:    This indicates seL4 capability/memory allocation failure\n", COMPONENT_NAME);
         printf("%s: ╚═══════════════════════════════════════════════════════════╝\n", COMPONENT_NAME);
         return;
     }
 
+    #if DEBUG_TRAFFIC
     printf("%s: ✓ Dataport check: outbound_dp=%p (valid)\n", COMPONENT_NAME, (void*)outbound_dp);
+    #endif
+
+    BREADCRUMB(3003);  /* Reading ICS message */
 
     ICS_Message *ics_msg = (ICS_Message *)outbound_dp;
+    #if DEBUG_TRAFFIC
     printf("%s: ╚═══════════════════════════════════════════════════════════╝\n", COMPONENT_NAME);
+    #endif
 
     /* Validate message */
     if (ics_msg->payload_length > MAX_PAYLOAD_SIZE) {
+        BREADCRUMB(3004);  /* Invalid payload size */
         printf("%s: OUTBOUND: Invalid payload length %u (max %u)\n",
                COMPONENT_NAME, ics_msg->payload_length, MAX_PAYLOAD_SIZE);
         #if DEBUG_PACKET_DETAIL
@@ -2218,6 +2256,9 @@ void outbound_ready_handle(void)
         return;
     }
 
+    BREADCRUMB(3005);  /* Payload size valid */
+
+    #if DEBUG_TRAFFIC
     /* Print metadata - src/dst are SWAPPED because this is a response
      * Original request: SCADA (src) → PLC (dst)
      * Response: PLC (src) → SCADA (dst) */
@@ -2231,6 +2272,9 @@ void outbound_ready_handle(void)
            (ics_msg->metadata.dst_ip >> 8) & 0xFF, ics_msg->metadata.dst_ip & 0xFF,
            ics_msg->metadata.dst_port,
            ics_msg->payload_length);
+    #endif
+
+    BREADCRUMB(3006);  /* Looking up connection metadata */
 
     /* Look up existing TCP connection by metadata
      * The metadata should have: src=PLC, dst=SCADA
@@ -2243,6 +2287,7 @@ void outbound_ready_handle(void)
     );
 
     if (meta == NULL || meta->pcb == NULL) {
+        BREADCRUMB(3007);  /* Connection not found or NULL PCB */
         printf("%s: ❌ OUTBOUND: No active connection found for %u.%u.%u.%u:%u → %u.%u.%u.%u:%u\n",
                COMPONENT_NAME,
                (ics_msg->metadata.dst_ip >> 24) & 0xFF, (ics_msg->metadata.dst_ip >> 16) & 0xFF,
@@ -2255,11 +2300,38 @@ void outbound_ready_handle(void)
         return;
     }
 
-    printf("%s: ✓ Found existing connection (pcb=%p)\n", COMPONENT_NAME, (void*)meta->pcb);
+    BREADCRUMB(3008);  /* Connection found */
+
+    /* v2.50: Connection validation before tcp_write() - defensive check
+     * Unlike Net1 which CREATES connections, Net0 only VALIDATES existing SCADA connections
+     * before sending PLC responses back. This catches dead/reused connections early. */
+
+    /* VALIDATION LAYER 1: TCP Sequence Number Check
+     * Detects if SCADA closed and reopened connection (OS reused same port with new seq) */
+    if (meta->pcb->snd_nxt != meta->tcp_seq_num) {
+        return;  /* Silent drop - breadcrumb B3008 indicates validation point */
+    }
+
+    /* VALIDATION LAYER 2: PCB State Check
+     * Only ESTABLISHED connections can send data. Catches CLOSED, TIME_WAIT, etc. */
+    if (meta->pcb->state != ESTABLISHED) {
+        return;  /* Silent drop - breadcrumb B3008 indicates validation point */
+    }
+
+    /* VALIDATION LAYER 3: Sanity Checks
+     * Catch corrupted PCB structures */
+    if (meta->pcb->local_port == 0 || meta->pcb->remote_port == 0) {
+        return;  /* Silent drop - breadcrumb B3008 indicates validation point */
+    }
+
+    /* ALL VALIDATION PASSED - Connection is valid and ready */
+
+    BREADCRUMB(3009);  /* Attempting tcp_write */
 
     /* Send response data back to SCADA via existing TCP connection */
     err_t err = tcp_write(meta->pcb, ics_msg->payload, ics_msg->payload_length, TCP_WRITE_FLAG_COPY);
     if (err != ERR_OK) {
+        BREADCRUMB(3010);  /* tcp_write failed */
         printf("%s: ❌ OUTBOUND: tcp_write failed: %d (%s)\n",
                COMPONENT_NAME, err,
                err == ERR_MEM ? "OUT OF MEMORY" :
@@ -2267,14 +2339,22 @@ void outbound_ready_handle(void)
         return;
     }
 
+    BREADCRUMB(3011);  /* tcp_write succeeded, flushing output */
+
     /* Flush output buffer */
     tcp_output(meta->pcb);
 
+    BREADCRUMB(3012);  /* tcp_output complete */
+
+    #if DEBUG_TRAFFIC
     printf("%s: ✓ OUTBOUND: Sent %u bytes to SCADA\n", COMPONENT_NAME, ics_msg->payload_length);
+    #endif
 
     #if DEBUG_PACKET_DETAIL
     printf("   ✓ [MSG #%u] Response delivered to SCADA\n\n", msg_id);
     #endif
+
+    BREADCRUMB(3013);  /* Exit: outbound_ready_handle complete */
 }
 
 /*
@@ -2703,9 +2783,9 @@ static int virtio_net_init(void)
 void post_init(void)
 {
     printf("%s: Component started\n", COMPONENT_NAME);
-    printf("%s: 🔖 NET0 SOFTWARE VERSION: v2.42-stable-with-debug (2025-10-12)\n", COMPONENT_NAME);
-    printf("%s: 🔧 CRITICAL: Memory barriers + DEBUG_NORMAL required for stability\n", COMPONENT_NAME);
-    printf("%s: ⚠️  WARNING: Heisenbug - crashes without debug output (see README)\n\n", COMPONENT_NAME);
+    printf("%s: 🔖 NET0 SOFTWARE VERSION: v2.50-connection-validation (2025-10-13)\n", COMPONENT_NAME);
+    printf("%s: 🔧 MODE: SILENT + BREADCRUMB_TRACE (minimal debug output)\n", COMPONENT_NAME);
+    printf("%s: ⚠️  WARNING: Testing race condition with breadcrumbs only\n\n", COMPONENT_NAME);
 
     /* Initialize connection tracking table */
     memset(connection_table, 0, sizeof(connection_table));

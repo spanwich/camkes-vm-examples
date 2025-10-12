@@ -1,0 +1,108 @@
+=================================================================
+v2.43-breadcrumb-only: Minimal Debug Output Configuration
+=================================================================
+Date: 2025-10-12
+Status: Ready for testing
+
+CONFIGURATION SUMMARY
+=====================
+
+All components configured for SILENT mode with breadcrumbs only.
+
+1. VirtIO_Net0_Driver (External/SCADA)
+   - DEBUG_LEVEL_SILENT = 1 (all other levels = 0)
+   - Version: v2.43-breadcrumb-only
+   - Breadcrumbs: 3000-3013 (outbound_ready_handle)
+
+2. VirtIO_Net1_Driver (Internal/PLC)
+   - DEBUG_LEVEL_SILENT = 1 (all other levels = 0)
+   - Version: v2.43-breadcrumb-only
+   - Breadcrumbs: 1000-1011 (inbound_tcp_recv_callback)
+                 2000-2020 (inbound_ready_handle)
+
+3. ICS_Inbound (External→Internal validation)
+   - DEBUG_SILENT = 1
+   - All printf replaced with DEBUG_PRINTF (no output)
+
+4. ICS_Outbound (Internal→External validation)
+   - DEBUG_SILENT = 1
+   - All printf replaced with DEBUG_PRINTF (no output)
+
+5. common.h
+   - BREADCRUMB_TRACE = 1 (ENABLED)
+   - Breadcrumb output: "B<id>\n"
+
+EXPECTED OUTPUT
+===============
+
+Minimal startup messages:
+- Component initialization
+- Version strings (v2.43-breadcrumb-only)
+- Mode indicators
+
+During operation:
+- B<id> markers only (e.g., B2000, B2005, B3009)
+- NO verbose debug output
+- NO packet details
+- NO metadata logging
+
+TESTING STRATEGY
+================
+
+1. Build with v2.43 configuration
+2. Test on SERVER CONSOLE (not SSH)
+3. Watch for breadcrumb sequence before crash
+4. Example expected output:
+   
+   B2000
+   B2001
+   B2003
+   B2005
+   B2007
+   [CRASH] ← Crash occurred after B2007
+
+5. Crash indicates problem between:
+   - B2007: "Creating new TCP PCB"
+   - B2009: "PCB created successfully"
+
+REVERTING TO VERBOSE MODE
+==========================
+
+To restore full debug output for stable operation:
+
+1. common.h: Set BREADCRUMB_TRACE = 0
+2. Net0: Set DEBUG_LEVEL_NORMAL = 1, DEBUG_LEVEL_SILENT = 0
+3. Net1: Set DEBUG_LEVEL_NORMAL = 1, DEBUG_LEVEL_SILENT = 0
+4. ICS_Inbound: Set DEBUG_SILENT = 0
+5. ICS_Outbound: Set DEBUG_SILENT = 0
+
+FILES MODIFIED
+==============
+
+✓ components/include/common.h - BREADCRUMB_TRACE = 1
+✓ components/VirtIO_Net0_Driver/virtio_net0_driver.c - SILENT mode
+✓ components/VirtIO_Net1_Driver/virtio_net1_driver.c - SILENT mode
+✓ components/ICS_Inbound/ICS_Inbound.c - DEBUG_SILENT = 1
+✓ components/ICS_Outbound/ICS_Outbound.c - DEBUG_SILENT = 1
+
+BREADCRUMB REFERENCE
+====================
+
+See BREADCRUMB_TRACE.md for complete breadcrumb numbering scheme.
+
+Quick reference:
+- 1000-1011: Net1 PLC response handling
+- 2000-2020: Net1 ICS_Inbound message processing
+- 3000-3013: Net0 ICS_Outbound response forwarding
+
+KNOWN ISSUE
+===========
+
+System crashes in SILENT mode without breadcrumbs (v2.42).
+v2.43 adds breadcrumbs to identify crash location.
+
+Expected crash points (from v2.42-SILENT-TEST):
+- Net0: Address 0x10 (outbound_ready_handle)
+- Net1: Address 0x4 (after PLC response)
+
+Goal: Identify exact code section that triggers crash.

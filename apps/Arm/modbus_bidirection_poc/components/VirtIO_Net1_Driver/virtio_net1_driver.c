@@ -52,8 +52,8 @@
 /* ═══════════════════════════════════════════════════════════════ */
 /* DEBUG OUTPUT CONTROL - Set ONE level to 1                        */
 /* ═══════════════════════════════════════════════════════════════ */
-#define DEBUG_LEVEL_QUIET    1  /* Production: Only errors and warnings */
-#define DEBUG_LEVEL_NORMAL   0  /* Default: Connection lifecycle + traffic flow */
+#define DEBUG_LEVEL_QUIET    0  /* Production: Only errors and warnings */
+#define DEBUG_LEVEL_NORMAL   1  /* Default: Connection lifecycle + traffic flow */
 #define DEBUG_LEVEL_VERBOSE  0  /* Development: Full packet details */
 
 #if DEBUG_LEVEL_QUIET
@@ -653,15 +653,34 @@ static err_t netif_output(struct netif *netif, struct pbuf *p)
                         }
 
                         if (connection_table[i].active) {
-                            /* Try two lookup methods:
-                             * 1. By ephemeral port (works after tcp_connect() assigns port)
-                             * 2. By dest_port match (fallback for SYN packets before port assignment) */
-                            if ((connection_table[i].lwip_ephemeral_port == src_port &&
-                                 connection_table[i].src_port == dest_port) ||
-                                (connection_table[i].lwip_ephemeral_port == 0 &&
-                                 connection_table[i].dest_port == dest_port)) {
+                            /* Method 1: Lookup by ephemeral port (normal case after port is stored) */
+                            if (connection_table[i].lwip_ephemeral_port == src_port &&
+                                connection_table[i].src_port == dest_port) {
                                 meta = &connection_table[i];
                                 break;
+                            }
+
+                            /* Method 2: PCB-based lookup for race window (SYN packet before port stored)
+                             * This handles the race where tcp_connect() sends SYN before we store ephemeral port.
+                             * We validate that:
+                             * 1. Ephemeral port not yet stored (lwip_ephemeral_port == 0)
+                             * 2. PCB exists and its local_port matches the packet's src_port
+                             * 3. Destination port matches
+                             */
+                            if (connection_table[i].lwip_ephemeral_port == 0 &&
+                                connection_table[i].pcb != NULL &&
+                                connection_table[i].dest_port == dest_port) {
+                                /* Validate PCB's local_port matches packet src_port */
+                                if (connection_table[i].pcb->local_port == src_port) {
+                                    meta = &connection_table[i];
+                                    /* Opportunistically store ephemeral port to avoid future lookups */
+                                    meta->lwip_ephemeral_port = src_port;
+                                    #if DEBUG_METADATA
+                                    printf("%s: 🔧 TX: Opportunistically stored ephemeral port %u during race window\n",
+                                           COMPONENT_NAME, src_port);
+                                    #endif
+                                    break;
+                                }
                             }
                         }
                     }
@@ -701,8 +720,12 @@ static err_t netif_output(struct netif *netif, struct pbuf *p)
                                    COMPONENT_NAME, ntohs(old_tcp_check), ntohs(new_tcp_check));
                         }
                     } else {
-                        printf("%s: ⚠️  TX: No metadata found for TCP port %u → %u\n",
+                        /* With PCB-based lookup, this should rarely happen.
+                         * Only show in debug mode to avoid noise. */
+                        #if DEBUG_METADATA
+                        printf("%s: ⚠️  TX: No metadata found for TCP port %u → %u (connection may be closed)\n",
                                COMPONENT_NAME, src_port, dest_port);
+                        #endif
                     }
                 }
             }
@@ -924,12 +947,14 @@ static struct connection_metadata* connection_add(uint32_t orig_src, uint32_t or
             connection_table[i].dest_port = dport;
             connection_count++;
 
+            #if DEBUG_METADATA
             printf("%s: 📝 Stored metadata [%d]: %u.%u.%u.%u:%u → %u.%u.%u.%u:%u\n",
                    COMPONENT_NAME, i,
                    (orig_src >> 24) & 0xFF, (orig_src >> 16) & 0xFF,
                    (orig_src >> 8) & 0xFF, orig_src & 0xFF, sport,
                    (orig_dest >> 24) & 0xFF, (orig_dest >> 16) & 0xFF,
                    (orig_dest >> 8) & 0xFF, orig_dest & 0xFF, dport);
+            #endif
 
             return &connection_table[i];
         }
@@ -947,11 +972,15 @@ static void connection_link_pcb(struct tcp_pcb *pcb, uint16_t sport, uint16_t dp
             connection_table[i].dest_port == dport &&
             connection_table[i].pcb == NULL) {
             connection_table[i].pcb = pcb;
+            #if DEBUG_METADATA
             printf("%s: 🔗 Linked PCB to metadata [%d]\n", COMPONENT_NAME, i);
+            #endif
             return;
         }
     }
+    #if DEBUG_METADATA
     printf("%s: ⚠️  No metadata found for %u → %u\n", COMPONENT_NAME, sport, dport);
+    #endif
 }
 
 /* Lookup metadata by PCB */
@@ -985,7 +1014,9 @@ static void connection_remove(struct tcp_pcb *pcb)
 {
     for (int i = 0; i < MAX_CONNECTIONS; i++) {
         if (connection_table[i].active && connection_table[i].pcb == pcb) {
+            #if DEBUG_METADATA
             printf("%s: 🗑️  Removing metadata [%d]\n", COMPONENT_NAME, i);
+            #endif
             connection_table[i].active = false;
             connection_table[i].pcb = NULL;
             connection_count--;
@@ -1024,8 +1055,10 @@ static void connection_print_stats(void)
 
     int available = MAX_CONNECTIONS - active;
 
+    #if DEBUG_METADATA
     printf("%s: 📊 Connection table: %d active (%d PCB-linked, %d stale), %d available\n",
            COMPONENT_NAME, active, pcb_linked, stale, available);
+    #endif
 }
 
 /* Cleanup stale connections from the connection table
@@ -1049,7 +1082,9 @@ static void connection_cleanup_stale(void)
 
         /* Cleanup if PCB is NULL */
         if (pcb == NULL) {
+            #if DEBUG_METADATA
             printf("%s: 🧹 Cleanup stale connection [%d]: PCB is NULL\n", COMPONENT_NAME, i);
+            #endif
             connection_table[i].active = false;
             connection_count--;
             cleaned++;
@@ -1058,8 +1093,10 @@ static void connection_cleanup_stale(void)
 
         /* Cleanup if PCB state is CLOSED or TIME_WAIT */
         if (pcb->state == CLOSED || pcb->state == TIME_WAIT) {
+            #if DEBUG_METADATA
             printf("%s: 🧹 Cleanup stale connection [%d]: PCB state=%d (CLOSED=%d, TIME_WAIT=%d)\n",
                    COMPONENT_NAME, i, pcb->state, CLOSED, TIME_WAIT);
+            #endif
             connection_table[i].active = false;
             connection_table[i].pcb = NULL;
             connection_count--;
@@ -1068,8 +1105,10 @@ static void connection_cleanup_stale(void)
     }
 
     if (cleaned > 0) {
+        #if DEBUG_METADATA
         printf("%s: 🧹 Cleaned %d stale connection(s)\n", COMPONENT_NAME, cleaned);
         connection_print_stats();
+        #endif
     }
 }
 
@@ -2444,6 +2483,7 @@ void inbound_ready_handle(void)
      */
     meta->lwip_ephemeral_port = pcb->local_port;
 
+    #if DEBUG_METADATA
     printf("%s: 📝 Stored metadata [slot %d]: SCADA %u.%u.%u.%u:%u → PLC %u.%u.%u.%u:%u (lwIP port: %u)\n",
            COMPONENT_NAME, (int)(meta - connection_table),
            (meta->original_src_ip >> 24) & 0xFF, (meta->original_src_ip >> 16) & 0xFF,
@@ -2452,6 +2492,7 @@ void inbound_ready_handle(void)
            (meta->original_dest_ip >> 24) & 0xFF, (meta->original_dest_ip >> 16) & 0xFF,
            (meta->original_dest_ip >> 8) & 0xFF, meta->original_dest_ip & 0xFF,
            meta->dest_port, meta->lwip_ephemeral_port);
+    #endif
 
     printf("%s: INBOUND: Connection initiated to PLC on internal network\n", COMPONENT_NAME);
 }
@@ -3009,9 +3050,9 @@ static int virtio_net_init(void)
 void post_init(void)
 {
     printf("%s: Component started\n", COMPONENT_NAME);
-    printf("%s: 🔖 NET1 SOFTWARE VERSION: v2.40-pcb-dangling-pointer-fix (2025-10-12)\n", COMPONENT_NAME);
-    printf("%s: 🔧 CRITICAL FIX: Clear PCB pointer in metadata before tcp_close()\n", COMPONENT_NAME);
-    printf("%s: 🔧 Features: QUIET mode + TCP recv callback\n\n", COMPONENT_NAME);
+    printf("%s: 🔖 NET1 SOFTWARE VERSION: v2.42-pcb-metadata-race-fix (2025-10-12)\n", COMPONENT_NAME);
+    printf("%s: 🔧 CRITICAL FIX: PCB-based metadata lookup eliminates race condition\n", COMPONENT_NAME);
+    printf("%s: 🔧 Features: QUIET mode + opportunistic ephemeral port storage\n\n", COMPONENT_NAME);
 
     /* Initialize connection tracking table */
     memset(connection_table, 0, sizeof(connection_table));

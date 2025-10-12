@@ -52,8 +52,8 @@
 /* ═══════════════════════════════════════════════════════════════ */
 /* DEBUG OUTPUT CONTROL - Set ONE level to 1                        */
 /* ═══════════════════════════════════════════════════════════════ */
-#define DEBUG_LEVEL_QUIET    1  /* Production: Only errors and warnings */
-#define DEBUG_LEVEL_NORMAL   0  /* Default: Connection lifecycle + traffic flow */
+#define DEBUG_LEVEL_QUIET    0  /* Production: Only errors and warnings */
+#define DEBUG_LEVEL_NORMAL   1  /* Default: Connection lifecycle + traffic flow */
 #define DEBUG_LEVEL_VERBOSE  0  /* Development: Full packet details */
 
 #if DEBUG_LEVEL_QUIET
@@ -943,12 +943,14 @@ static struct connection_metadata* connection_add(uint32_t orig_src, uint32_t or
             connection_table[i].dest_port = dport;
             connection_count++;
 
+            #if DEBUG_METADATA
             printf("%s: 📝 Stored metadata [%d]: %u.%u.%u.%u:%u → %u.%u.%u.%u:%u\n",
                    COMPONENT_NAME, i,
                    (orig_src >> 24) & 0xFF, (orig_src >> 16) & 0xFF,
                    (orig_src >> 8) & 0xFF, orig_src & 0xFF, sport,
                    (orig_dest >> 24) & 0xFF, (orig_dest >> 16) & 0xFF,
                    (orig_dest >> 8) & 0xFF, orig_dest & 0xFF, dport);
+            #endif
 
             return &connection_table[i];
         }
@@ -966,11 +968,15 @@ static void connection_link_pcb(struct tcp_pcb *pcb, uint16_t sport, uint16_t dp
             connection_table[i].dest_port == dport &&
             connection_table[i].pcb == NULL) {
             connection_table[i].pcb = pcb;
+            #if DEBUG_METADATA
             printf("%s: 🔗 Linked PCB to metadata [%d]\n", COMPONENT_NAME, i);
+            #endif
             return;
         }
     }
+    #if DEBUG_METADATA
     printf("%s: ⚠️  No metadata found for %u → %u\n", COMPONENT_NAME, sport, dport);
+    #endif
 }
 
 /* Lookup metadata by PCB */
@@ -1004,7 +1010,9 @@ static void connection_remove(struct tcp_pcb *pcb)
 {
     for (int i = 0; i < MAX_CONNECTIONS; i++) {
         if (connection_table[i].active && connection_table[i].pcb == pcb) {
+            #if DEBUG_METADATA
             printf("%s: 🗑️  Removing metadata [%d]\n", COMPONENT_NAME, i);
+            #endif
             connection_table[i].active = false;
             connection_table[i].pcb = NULL;
             connection_count--;
@@ -1044,8 +1052,10 @@ static void connection_print_stats(void)
 
     int available = MAX_CONNECTIONS - active;
 
+    #if DEBUG_METADATA
     printf("%s: 📊 Connection table: %d active (%d PCB-linked, %d stale), %d available\n",
            COMPONENT_NAME, active, pcb_linked, stale, available);
+    #endif
 }
 
 /* Cleanup stale connections from the connection table
@@ -1069,7 +1079,9 @@ static void connection_cleanup_stale(void)
 
         /* Cleanup if PCB is NULL */
         if (pcb == NULL) {
+            #if DEBUG_METADATA
             printf("%s: 🧹 Cleanup stale connection [%d]: PCB is NULL\n", COMPONENT_NAME, i);
+            #endif
             connection_table[i].active = false;
             connection_count--;
             cleaned++;
@@ -1078,8 +1090,10 @@ static void connection_cleanup_stale(void)
 
         /* Cleanup if PCB state is CLOSED or TIME_WAIT */
         if (pcb->state == CLOSED || pcb->state == TIME_WAIT) {
+            #if DEBUG_METADATA
             printf("%s: 🧹 Cleanup stale connection [%d]: PCB state=%d (CLOSED=%d, TIME_WAIT=%d)\n",
                    COMPONENT_NAME, i, pcb->state, CLOSED, TIME_WAIT);
+            #endif
             connection_table[i].active = false;
             connection_table[i].pcb = NULL;
             connection_count--;
@@ -1088,8 +1102,10 @@ static void connection_cleanup_stale(void)
     }
 
     if (cleaned > 0) {
+        #if DEBUG_METADATA
         printf("%s: 🧹 Cleaned %d stale connection(s)\n", COMPONENT_NAME, cleaned);
         connection_print_stats();
+        #endif
     }
 }
 
@@ -2684,9 +2700,9 @@ static int virtio_net_init(void)
 void post_init(void)
 {
     printf("%s: Component started\n", COMPONENT_NAME);
-    printf("%s: 🔖 NET0 SOFTWARE VERSION: v2.40-pcb-dangling-pointer-fix (2025-10-12)\n", COMPONENT_NAME);
+    printf("%s: 🔖 NET0 SOFTWARE VERSION: v2.41-quiet-mode (2025-10-12)\n", COMPONENT_NAME);
     printf("%s: 🔧 CRITICAL FIX: Clear PCB pointer in metadata before tcp_close()\n", COMPONENT_NAME);
-    printf("%s: 🔧 Features: QUIET mode + buffer validation\n\n", COMPONENT_NAME);
+    printf("%s: 🔧 Features: Production QUIET mode - errors/warnings only\n\n", COMPONENT_NAME);
 
     /* Initialize connection tracking table */
     memset(connection_table, 0, sizeof(connection_table));

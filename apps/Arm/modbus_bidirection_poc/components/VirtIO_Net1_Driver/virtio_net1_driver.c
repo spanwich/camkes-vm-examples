@@ -1840,7 +1840,13 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
     }
 
     if (err != ERR_OK) {
-        pbuf_free(p);
+        /* v2.80: Pbuf double-free debugging - check ref count before free */
+        if (p->ref == 0) {
+            printf("%s: 🐛 BUG: pbuf ref already 0 at ECHO_ERR path! p=%p, err=%d\n", COMPONENT_NAME, (void*)p, err);
+        } else {
+            printf("%s: 🐛 Freeing pbuf at ECHO_ERR path: p=%p, ref=%d, err=%d\n", COMPONENT_NAME, (void*)p, p->ref, err);
+            pbuf_free(p);
+        }
         return err;
     }
 
@@ -1984,7 +1990,14 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
      */
 
     tcp_recved(pcb, p->len);  /* Tell lwIP we consumed the data */
-    pbuf_free(p);              /* Free the pbuf we were given */
+
+    /* v2.80: Pbuf double-free debugging - check ref count before free */
+    if (p->ref == 0) {
+        printf("%s: 🐛 BUG: pbuf ref already 0 at ECHO_NORMAL path! p=%p, len=%d\n", COMPONENT_NAME, (void*)p, p->len);
+    } else {
+        printf("%s: 🐛 Freeing pbuf at ECHO_NORMAL path: p=%p, ref=%d, len=%d\n", COMPONENT_NAME, (void*)p, p->ref, p->len);
+        pbuf_free(p);              /* Free the pbuf we were given */
+    }
 
     /* Update last_activity timestamp for idle timeout detection */
     /* Reuse 'meta' variable from above (line 1924) */
@@ -2197,13 +2210,25 @@ static err_t inbound_tcp_recv_callback(void *arg, struct tcp_pcb *pcb, struct pb
 
     if (err != ERR_OK) {
         BREADCRUMB(1002);  /* Error in receive */
-        pbuf_free(p);
+        /* v2.80: Pbuf double-free debugging - check ref count before free */
+        if (p->ref == 0) {
+            printf("%s: 🐛 BUG: pbuf ref already 0 at ERR path! p=%p, err=%d\n", COMPONENT_NAME, (void*)p, err);
+        } else {
+            printf("%s: 🐛 Freeing pbuf at ERR path: p=%p, ref=%d, err=%d\n", COMPONENT_NAME, (void*)p, p->ref, err);
+            pbuf_free(p);
+        }
         return err;
     }
 
     if (outbound_dp == NULL) {
         BREADCRUMB(1003);  /* NULL dataport */
-        pbuf_free(p);
+        /* v2.80: Pbuf double-free debugging - check ref count before free */
+        if (p->ref == 0) {
+            printf("%s: 🐛 BUG: pbuf ref already 0 at NULL_DP path! p=%p\n", COMPONENT_NAME, (void*)p);
+        } else {
+            printf("%s: 🐛 Freeing pbuf at NULL_DP path: p=%p, ref=%d\n", COMPONENT_NAME, (void*)p, p->ref);
+            pbuf_free(p);
+        }
         return ERR_MEM;
     }
 
@@ -2241,7 +2266,14 @@ static err_t inbound_tcp_recv_callback(void *arg, struct tcp_pcb *pcb, struct pb
     BREADCRUMB(1009);  /* Emitting notification */
     outbound_ready_emit();
     tcp_recved(pcb, p->len);
-    pbuf_free(p);
+
+    /* v2.80: Pbuf double-free debugging - check ref count before free */
+    if (p->ref == 0) {
+        printf("%s: 🐛 BUG: pbuf ref already 0 at NORMAL path! p=%p, len=%d\n", COMPONENT_NAME, (void*)p, p->len);
+    } else {
+        printf("%s: 🐛 Freeing pbuf at NORMAL path: p=%p, ref=%d, len=%d\n", COMPONENT_NAME, (void*)p, p->ref, p->len);
+        pbuf_free(p);
+    }
 
     BREADCRUMB(1010);  /* Response sent to ICS_Outbound */
 
@@ -3405,7 +3437,7 @@ static int virtio_net_init(void)
 void post_init(void)
 {
     printf("%s: Component started\n", COMPONENT_NAME);
-    printf("%s: 🔖 NET1 SOFTWARE VERSION: v2.64-metadata-barrier-fix (2025-10-13)\n", COMPONENT_NAME);
+    printf("%s: 🔖 NET1 SOFTWARE VERSION: v2.80-pbuf-double-free-debug (2025-10-13)\n", COMPONENT_NAME);
     printf("%s: 🔧 MODE: PRODUCTION-READY with Multi-Layer Validation\n", COMPONENT_NAME);
     printf("%s: ✅ FIX 1: payload_data buffer (prevents dataport corruption)\n", COMPONENT_NAME);
     printf("%s: ✅ FIX 2: Correct lwIP callback protocol (ERR_ABRT without tcp_abort)\n", COMPONENT_NAME);
@@ -3573,7 +3605,15 @@ int run(void)
     uint32_t loop_iterations = 0;
     const uint32_t CLEANUP_INTERVAL = 10000;  /* Run cleanup every ~10000 iterations (~30-60 seconds) */
 
+    static uint32_t heartbeat_counter = 0;
     while (1) {
+        /* v2.74: Heartbeat to detect silent hangs */
+        if (++heartbeat_counter >= 50000) {
+            printf("%s: ❤️  Heartbeat: %u iterations, %u active connections\n",
+                   COMPONENT_NAME, heartbeat_counter, connection_count);
+            heartbeat_counter = 0;
+        }
+
         /* Check for INBOUND notifications from ICS_Inbound (non-blocking) */
         if (inbound_ready_poll()) {
             inbound_ready_handle();

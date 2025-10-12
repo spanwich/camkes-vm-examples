@@ -17,6 +17,11 @@
 #define MEM_ALIGNMENT                   4
 #define MEM_SIZE                        (64 * 1024)  /* 64KB heap */
 
+/* v2.78: Use static memory pools instead of malloc to prevent cross-component contamination */
+#define MEM_LIBC_MALLOC                 0       /* DO NOT use system malloc */
+/* #define MEM_USE_POOLS                   1       -- Disabled: requires pool definitions */
+#define MEMP_MEM_MALLOC                 0       /* Memory pools are preallocated */
+
 /* ARP configuration */
 #define LWIP_ARP                        1
 #define ETHARP_SUPPORT_STATIC_ENTRIES   1

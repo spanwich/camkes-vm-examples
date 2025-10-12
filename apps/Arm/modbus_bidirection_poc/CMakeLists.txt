@@ -35,8 +35,29 @@ if("${LWIP_PATH}" STREQUAL "LWIP_PATH-NOTFOUND")
 endif()
 
 include(${CMAKE_CURRENT_LIST_DIR}/../../../../util_libs/liblwip/lwip_helpers.cmake)
-# Only call AddLWIPConfiguration once - both drivers will use the same lwIP config
+
+# v2.79: Create SEPARATE lwIP libraries for Net0 and Net1 to prevent shared state corruption
+# Each component gets its own lwIP instance with isolated memory pools
+
+# lwIP for Net0 (SCADA-facing driver)
 AddLWIPConfiguration(${CMAKE_CURRENT_LIST_DIR}/components/VirtIO_Net0_Driver)
+
+# lwIP for Net1 (PLC-facing driver) - Create separate library with its own config
+add_library(liblwip_config_net1 INTERFACE)
+target_include_directories(liblwip_config_net1 INTERFACE ${CMAKE_CURRENT_LIST_DIR}/components/VirtIO_Net1_Driver)
+
+file(GLOB lwip_sources_net1
+    ${LWIP_PATH}/src/*/*.c
+    ${LWIP_PATH}/src/core/ipv4/*.c
+)
+add_library(lwip_net1 STATIC EXCLUDE_FROM_ALL ${lwip_sources_net1})
+target_include_directories(lwip_net1 PUBLIC
+    ${LWIP_PATH}/src/include
+    ${CMAKE_CURRENT_LIST_DIR}/../../../../util_libs/liblwip/include
+    ${CMAKE_CURRENT_LIST_DIR}/../../../../util_libs/liblwip/include/lwip
+)
+target_link_libraries(lwip_net1 muslc liblwip_config_net1)
+target_compile_definitions(lwip_net1 PRIVATE LWIP_NET1_INSTANCE=1)
 
 # VirtIO_Net0_Driver Component (External Network - port 6000)
 DeclareCAmkESComponent(
@@ -55,6 +76,7 @@ DeclareCAmkESComponent(
 )
 
 # VirtIO_Net1_Driver Component (Internal Network - port 7000)
+# v2.79: Uses separate lwip_net1 library for isolation
 DeclareCAmkESComponent(
     VirtIO_Net1_Driver
     SOURCES
@@ -67,7 +89,7 @@ DeclareCAmkESComponent(
     LIBS
         sel4_autoconf
         utils
-        lwip
+        lwip_net1
 )
 
 # ICS_Inbound Component (External → Internal validation)

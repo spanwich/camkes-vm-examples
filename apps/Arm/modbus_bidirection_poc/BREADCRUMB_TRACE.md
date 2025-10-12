@@ -81,6 +81,15 @@ Edit `components/include/common.h`:
   - ⚠️ Condition: PCB state != ESTABLISHED (connection closed by Net1)
   - 🧹 Action: Removes stale metadata, prevents crash
   - 🛡️ Protection: Catches freed PCB before dereferencing other fields
+- 3020: **v2.77** After outbound_ready_handle (main loop)
+- 3021: **v2.77** Before sys_check_timeouts (main loop)
+- 3022: **v2.77** After sys_check_timeouts (main loop)
+- 3023: **v2.77** After process_rx_packets (main loop)
+- 3024: **v2.77** After refill_rx_queue (main loop)
+- 3025: **v2.77** After connection_cleanup_stale (main loop)
+- 3026: **v2.77** Before seL4_Yield (main loop)
+- 3027: **v2.77** After seL4_Yield (main loop)
+- 3028: **v2.77** After delay, top of loop (main loop)
 
 ### Reserved Ranges
 
@@ -150,12 +159,39 @@ Memory barriers (`__sync_synchronize()`) are NECESSARY but NOT SUFFICIENT.
 - Required at: notification emit, metadata updates, PCB pointer updates
 - Not sufficient to fix the underlying race condition
 
+## Recent Changes
+
+### v2.80 - Pbuf Double-Free Debugging
+
+**Problem**: After running with v2.79 (separate lwIP instances), assertion `pbuf_free: p->ref > 0` still occurs.
+
+**Root Cause Investigation**: Added defensive checks before ALL `pbuf_free()` calls in Net1:
+- Check `p->ref == 0` before calling `pbuf_free()`
+- Log pbuf address and ref count at each free path
+- Identify which code path causes the double-free
+
+**Instrumented Functions**:
+1. `inbound_tcp_recv_callback()`:
+   - ERR path (line 1002) - error during receive
+   - NULL_DP path (line 1003) - dataport unavailable
+   - NORMAL path (line 1009) - successful message forwarding
+
+2. `tcp_echo_recv()`:
+   - ECHO_ERR path (line 1842) - error during echo receive
+   - ECHO_NORMAL path (line 1992) - successful echo forwarding
+
+**Expected Output**:
+```
+🐛 Freeing pbuf at NORMAL path: p=0x12345678, ref=1, len=12
+🐛 BUG: pbuf ref already 0 at NORMAL path! p=0x12345678, len=12  ← Double-free detected
+```
+
 ## Status
 
 - ✅ Breadcrumb infrastructure added to common.h
 - ✅ Net1 inbound_tcp_recv_callback instrumented (1000-1011)
 - ✅ Net1 inbound_ready_handle instrumented (2000-2020)
 - ✅ Net0 outbound_ready_handle instrumented (3000-3013)
+- ✅ v2.80: Pbuf double-free debugging added to all pbuf_free() calls
 - ⏳ IRQ handlers not yet instrumented
 - ⏳ lwIP callbacks not yet instrumented
-- ⏳ Testing with BREADCRUMB_TRACE=1 pending

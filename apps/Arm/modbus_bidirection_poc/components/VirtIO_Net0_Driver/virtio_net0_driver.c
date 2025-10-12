@@ -1760,8 +1760,15 @@ static void tcp_echo_err(void *arg, err_t err)
         default:           err_name = "UNKNOWN"; break;
     }
 
-    active_connections--;
-    total_connections_closed++;
+    /* v2.75: Only decrement if counter is positive (prevent underflow)
+     * lwIP may call both err callback and recv(p=NULL) for the same connection */
+    if (active_connections > 0) {
+        active_connections--;
+        total_connections_closed++;
+    } else {
+        printf("%s: ⚠️  BUG: active_connections already 0, not decrementing (double-free prevented)\n",
+               COMPONENT_NAME);
+    }
 
     printf("%s: ⚠️  TCP connection error - err=%d (%s)\n", COMPONENT_NAME, err, err_name);
     printf("%s:    → Active connections: %u | Total created: %u | Total closed: %u\n",
@@ -1781,8 +1788,16 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
 {
     if (p == NULL) {
         /* Connection closed gracefully by remote peer */
-        active_connections--;
-        total_connections_closed++;
+
+        /* v2.75: Only decrement if counter is positive (prevent underflow)
+         * lwIP may call both err callback and recv(p=NULL) for the same connection */
+        if (active_connections > 0) {
+            active_connections--;
+            total_connections_closed++;
+        } else {
+            printf("%s: ⚠️  BUG: active_connections already 0 in recv, not decrementing\n",
+                   COMPONENT_NAME);
+        }
 
         #if DEBUG_TRAFFIC
         printf("%s: 🔌 TCP connection closed gracefully\n", COMPONENT_NAME);
@@ -2359,6 +2374,17 @@ void outbound_ready_handle(void)
 
     BREADCRUMB(3009);  /* Attempting tcp_write */
 
+    /* v2.76: CRITICAL - Revalidate PCB state immediately before tcp_write
+     * Race condition: PCB can become invalid between validation and tcp_write */
+    if (meta->pcb == NULL || meta->pcb->state != ESTABLISHED) {
+        printf("%s: ⚠️  RACE DETECTED: PCB became invalid between validation and tcp_write!\n",
+               COMPONENT_NAME);
+        BREADCRUMB(3014);
+        meta->active = false;
+        meta->pcb = NULL;
+        return;
+    }
+
     /* Send response data back to SCADA via existing TCP connection */
     err_t err = tcp_write(meta->pcb, ics_msg->payload, ics_msg->payload_length, TCP_WRITE_FLAG_COPY);
     if (err != ERR_OK) {
@@ -2814,7 +2840,7 @@ static int virtio_net_init(void)
 void post_init(void)
 {
     printf("%s: Component started\n", COMPONENT_NAME);
-    printf("%s: 🔖 NET0 SOFTWARE VERSION: v2.73-yield-delay (2025-10-13)\n", COMPONENT_NAME);
+    printf("%s: 🔖 NET0 SOFTWARE VERSION: v2.80-pbuf-double-free-debug (2025-10-13)\n", COMPONENT_NAME);
     printf("%s: 🔧 MODE: PRODUCTION with fast cleanup (every 100 iterations)\n", COMPONENT_NAME);
     printf("%s: ✅ FIX: Connection table exhaustion resolved\n\n", COMPONENT_NAME);
 
@@ -2975,7 +3001,15 @@ int run(void)
     /* Main event loop - process lwIP timers, RX packets, and ICS notifications */
     /* Note: TCP server is now initialized in RX path after first packet */
     static uint32_t cleanup_counter = 0;
+    static uint32_t heartbeat_counter = 0;
     while (1) {
+        /* v2.74: Heartbeat to detect silent hangs */
+        if (++heartbeat_counter >= 50000) {
+            printf("%s: ❤️  Heartbeat: %u iterations, %u active connections\n",
+                   COMPONENT_NAME, heartbeat_counter, connection_count);
+            heartbeat_counter = 0;
+        }
+
         /* Check for OUTBOUND notifications from ICS_Outbound (non-blocking) */
         if (outbound_ready_poll()) {
             /* CRITICAL: Ensure we see latest dataport writes from ICS_Outbound */

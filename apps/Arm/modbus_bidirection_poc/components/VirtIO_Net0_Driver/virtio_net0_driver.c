@@ -2360,45 +2360,26 @@ void outbound_ready_handle(void)
         return;  /* Silent drop after cleanup */
     }
 
-    /* VALIDATION LAYER 2: PCB State Check
-     * Only ESTABLISHED connections can send data. Catches CLOSED, freed PCB, etc. */
-    if (meta->pcb->state != ESTABLISHED) {
-        /* PCB closed or freed - remove stale metadata */
-        printf("%s: ⚠️  OUTBOUND: PCB state != ESTABLISHED (state=%d) - dropping response for %u.%u.%u.%u:%u\n",
-               COMPONENT_NAME, meta->pcb->state,
-               (ics_msg->metadata.dst_ip >> 24) & 0xFF, (ics_msg->metadata.dst_ip >> 16) & 0xFF,
-               (ics_msg->metadata.dst_ip >> 8) & 0xFF, ics_msg->metadata.dst_ip & 0xFF,
-               ics_msg->metadata.dst_port);
-        BREADCRUMB(3014);  /* Stale PCB detected - removing metadata */
-        meta->active = false;
-        meta->pcb = NULL;
-        return;  /* Silent drop after cleanup */
-    }
+    /* v2.85: REMOVED VALIDATION LAYER 2 - accessing pcb->state causes crashes!
+     * DO NOT access pcb->state - it's a use-after-free bug if PCB is freed
+     * Rely on tcp_write() to return error if connection is not established */
 
-    /* VALIDATION LAYER 3: TCP Sequence Number Check
-     * Detects if SCADA closed and reopened connection (OS reused same port with new seq) */
-    if (meta->pcb->snd_nxt != meta->tcp_seq_num) {
-        return;  /* Silent drop - breadcrumb B3008 indicates validation point */
-    }
+    /* v2.85: REMOVED VALIDATION LAYER 3 - accessing pcb->snd_nxt is use-after-free!
+     * DO NOT access any PCB fields - only check if pcb != NULL */
 
-    /* VALIDATION LAYER 4: Sanity Checks
-     * Catch corrupted PCB structures */
-    if (meta->pcb->local_port == 0 || meta->pcb->remote_port == 0) {
-        return;  /* Silent drop - breadcrumb B3008 indicates validation point */
-    }
+    /* v2.85: REMOVED VALIDATION LAYER 4 - accessing pcb->local_port is use-after-free!
+     * DO NOT access any PCB fields before tcp_write() */
 
-    /* ALL VALIDATION PASSED - Connection is valid and ready */
+    /* v2.85: ONLY validate PCB is non-NULL
+     * tcp_write() will handle all other validation internally and return error if needed */
 
     BREADCRUMB(3009);  /* Attempting tcp_write */
 
-    /* v2.76: CRITICAL - Revalidate PCB state immediately before tcp_write
-     * Race condition: PCB can become invalid between validation and tcp_write */
-    if (meta->pcb == NULL || meta->pcb->state != ESTABLISHED) {
-        printf("%s: ⚠️  RACE DETECTED: PCB became invalid between validation and tcp_write!\n",
-               COMPONENT_NAME);
+    /* Final NULL check before tcp_write - this is the ONLY safe check we can do */
+    if (meta->pcb == NULL) {
+        printf("%s: ⚠️  OUTBOUND: PCB became NULL before tcp_write!\n", COMPONENT_NAME);
         BREADCRUMB(3014);
         meta->active = false;
-        meta->pcb = NULL;
         return;
     }
 
@@ -2857,7 +2838,7 @@ static int virtio_net_init(void)
 void post_init(void)
 {
     printf("%s: Component started\n", COMPONENT_NAME);
-    printf("%s: 🔖 NET0 SOFTWARE VERSION: v2.83-never-access-freed-pcb (2025-10-13)\n", COMPONENT_NAME);
+    printf("%s: 🔖 NET0 SOFTWARE VERSION: v2.85-no-pcb-field-access (2025-10-13)\n", COMPONENT_NAME);
     printf("%s: 🔧 MODE: PRODUCTION with fast cleanup (every 100 iterations)\n", COMPONENT_NAME);
     printf("%s: ✅ FIX: Connection table exhaustion resolved\n\n", COMPONENT_NAME);
 

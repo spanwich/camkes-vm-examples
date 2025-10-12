@@ -170,6 +170,9 @@ void pre_init(void) {
     memset(&stats, 0, sizeof(stats));
     tcp_messages = udp_messages = arp_messages = other_messages = 0;
     printf("ICS_Inbound: Initializing external→internal validation...\n");
+    printf("ICS_Inbound: 🔖 SOFTWARE VERSION: v1.0-passthrough (2025-10-12)\n");
+    printf("ICS_Inbound: 🔧 Features: Metadata logging + EverParse validation hooks\n");
+    printf("ICS_Inbound: 📊 Protocols: TCP, UDP, ARP detection\n\n");
 }
 
 int run(void) {

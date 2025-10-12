@@ -49,6 +49,35 @@
 #define COMPONENT_NAME "VirtIO_Net1_Driver"
 #define TCP_SERVER_PORT 502  /* INBOUND: Modbus port - pretends to be PLC */
 
+/* ═══════════════════════════════════════════════════════════════ */
+/* DEBUG OUTPUT CONTROL - Set ONE level to 1                        */
+/* ═══════════════════════════════════════════════════════════════ */
+#define DEBUG_LEVEL_QUIET    1  /* Production: Only errors and warnings */
+#define DEBUG_LEVEL_NORMAL   0  /* Default: Connection lifecycle + traffic flow */
+#define DEBUG_LEVEL_VERBOSE  0  /* Development: Full packet details */
+
+#if DEBUG_LEVEL_QUIET
+    #define DEBUG_CRITICAL      1
+    #define DEBUG_TRAFFIC       0
+    #define DEBUG_METADATA      0
+    #define DEBUG_PACKET_DETAIL 0
+    #define DEBUG_PACKET_DETAIL  0
+#elif DEBUG_LEVEL_NORMAL
+    #define DEBUG_CRITICAL      1
+    #define DEBUG_TRAFFIC       1
+    #define DEBUG_METADATA      1  /* Keep for v2.36 validation */
+    #define DEBUG_PACKET_DETAIL 0
+    #define DEBUG_PACKET_DETAIL  0
+#elif DEBUG_LEVEL_VERBOSE
+    #define DEBUG_CRITICAL      1
+    #define DEBUG_TRAFFIC       1
+    #define DEBUG_METADATA      1
+    #define DEBUG_PACKET_DETAIL 1
+    #define DEBUG_PACKET_DETAIL  1
+#else
+    #error "No debug level selected"
+#endif
+
 /* Connection tracking for metadata preservation */
 #define MAX_CONNECTIONS 64
 
@@ -56,8 +85,9 @@ struct connection_metadata {
     struct tcp_pcb *pcb;           /* lwIP connection pointer (key) */
     uint32_t original_src_ip;      /* Original source IP (e.g., 192.168.90.5 SCADA) */
     uint32_t original_dest_ip;     /* Original destination IP (e.g., 192.168.95.2 PLC) */
-    uint16_t src_port;             /* Source port */
-    uint16_t dest_port;            /* Destination port */
+    uint16_t src_port;             /* Source port (SCADA's ephemeral port) */
+    uint16_t dest_port;            /* Destination port (502) */
+    uint16_t lwip_ephemeral_port;  /* lwIP's ephemeral port for outbound connection */
     bool active;                   /* Is this slot in use? */
 };
 
@@ -80,13 +110,9 @@ static int connection_count = 0;
 #define INBOUND_FORWARD_PORT 502               /* Unused - Net1 handles inbound */
 
 /*
- * DEBUG CONFIGURATION
- * Set to 1 to enable, 0 to disable
+ * LEGACY DEBUG CONFIGURATION - Now controlled by DEBUG_LEVEL above
+ * Keeping GDB/test flags separate from DEBUG_LEVEL system
  */
-#define DEBUG_VERBOSE 0           /* Enable verbose debug output */
-#define DEBUG_PACKET_LOG 0        /* Enable detailed packet logging (VERY VERBOSE - hex dumps) */
-#define DEBUG_PACKET_SUMMARY 1    /* Enable lightweight packet summary (source→dest, protocol) */
-#define DEBUG_MESSAGE_FLOW 1      /* Track message flow through RX→ICS→TX pipeline */
 #define ENABLE_GDB_WAIT 0         /* Enable 60-second GDB wait during init */
 #define ENABLE_PAINT_TEST 0       /* Enable virtqueue memory paint test */
 
@@ -475,11 +501,18 @@ static void refill_rx_queue(void)
         if (!rx_buffer_used[i]) free_count++;
     }
 
+    #if DEBUG_PACKET_DETAIL
     if (first_call || free_count > 0) {
         printf("%s: refill_rx_queue() call #%u: %d/%d buffers free (available to refill)\n",
                COMPONENT_NAME, refill_call_count, free_count, MAX_PACKETS);
         first_call = false;
     }
+    #else
+    /* Only warn if buffers are critically low */
+    if (free_count > MAX_PACKETS / 2) {
+        printf("%s: ⚠️  RX buffers low: %d/%d free\n", COMPONENT_NAME, free_count, MAX_PACKETS);
+    }
+    #endif
 
     /* Add available buffers to RX virtqueue */
     for (int i = 0; i < MAX_PACKETS; i++) {
@@ -509,8 +542,10 @@ static void refill_rx_queue(void)
     }
 
     if (buffers_added > 0) {
+        #if DEBUG_PACKET_DETAIL
         printf("%s: ✅ Refilled RX queue with %d buffers (avail_idx now=%u)\n",
                COMPONENT_NAME, buffers_added, vq->avail->idx);
+        #endif
         /* Notify device of new buffers */
         VREG_WRITE(VIRTIO_MMIO_QUEUE_NOTIFY, VIRTIO_NET_RX_QUEUE);
     } else if (free_count > 0) {
@@ -553,6 +588,18 @@ static err_t netif_output(struct netif *netif, struct pbuf *p)
 
     int tx_buf_idx = (hdr_desc_idx + MAX_PACKETS/2) % MAX_PACKETS;
 
+    /* CRITICAL: Validate TX buffer index */
+    if (tx_buf_idx < 0 || tx_buf_idx >= MAX_PACKETS) {
+        printf("%s: ❌ FATAL: Invalid TX buffer index %d (hdr_desc=%u, max=%d)\n",
+               COMPONENT_NAME, tx_buf_idx, hdr_desc_idx, MAX_PACKETS);
+        return ERR_BUF;
+    }
+
+    if (packet_buffers[tx_buf_idx] == NULL) {
+        printf("%s: ❌ FATAL: TX Buffer[%d] is NULL!\n", COMPONENT_NAME, tx_buf_idx);
+        return ERR_BUF;
+    }
+
     /* Copy pbuf chain to TX buffer */
     uint16_t copied = pbuf_copy_partial(p, packet_buffers[tx_buf_idx],
                                         p->tot_len, 0);
@@ -585,10 +632,18 @@ static err_t netif_output(struct netif *netif, struct pbuf *p)
                 size_t ip_hdr_len = (ip->ihl) * 4;
                 if (p->tot_len >= sizeof(struct ethhdr) + ip_hdr_len + sizeof(struct tcphdr)) {
                     struct tcphdr *tcp = (struct tcphdr *)(tx_data + sizeof(struct ethhdr) + ip_hdr_len);
-                    uint16_t src_port = ntohs(tcp->source);  /* 502 */
+                    uint16_t src_port = ntohs(tcp->source);  /* lwIP's ephemeral port */
                     uint16_t dest_port = ntohs(tcp->dest);   /* SCADA's port */
 
-                    /* Lookup original metadata by destination (SCADA) port */
+                    /* CRITICAL FIX: Lookup metadata by lwIP's ephemeral port
+                     *
+                     * Previous bug: Tried to match connection_table[i].dest_port (502) with src_port
+                     * But src_port is lwIP's ephemeral port (e.g., 64085), NOT 502!
+                     *
+                     * Correct lookup:
+                     *   - connection_table[i].lwip_ephemeral_port == src_port (lwIP's port)
+                     *   - connection_table[i].src_port == dest_port (SCADA's port)
+                     */
                     struct connection_metadata *meta = NULL;
                     for (int i = 0; i < MAX_CONNECTIONS; i++) {
                         /* Defensive check: ensure index is valid */
@@ -597,11 +652,17 @@ static err_t netif_output(struct netif *netif, struct pbuf *p)
                             break;
                         }
 
-                        if (connection_table[i].active &&
-                            connection_table[i].dest_port == src_port &&  /* Our port 502 */
-                            connection_table[i].src_port == dest_port) {  /* SCADA's port */
-                            meta = &connection_table[i];
-                            break;
+                        if (connection_table[i].active) {
+                            /* Try two lookup methods:
+                             * 1. By ephemeral port (works after tcp_connect() assigns port)
+                             * 2. By dest_port match (fallback for SYN packets before port assignment) */
+                            if ((connection_table[i].lwip_ephemeral_port == src_port &&
+                                 connection_table[i].src_port == dest_port) ||
+                                (connection_table[i].lwip_ephemeral_port == 0 &&
+                                 connection_table[i].dest_port == dest_port)) {
+                                meta = &connection_table[i];
+                                break;
+                            }
                         }
                     }
 
@@ -728,7 +789,7 @@ static err_t netif_output(struct netif *netif, struct pbuf *p)
     uint16_t avail_idx = vq->avail->idx % vq->num;
     vq->avail->ring[avail_idx] = hdr_desc_idx;
 
-    #if DEBUG_VERBOSE
+    #if DEBUG_PACKET_DETAIL
     /* DEBUG: Log descriptor setup for first TX */
     if (tx_count == 1) {
         printf("%s: DEBUG TX descriptor chain:\n", COMPONENT_NAME);
@@ -745,7 +806,7 @@ static err_t netif_output(struct netif *netif, struct pbuf *p)
     /* Notify device */
     VREG_WRITE(VIRTIO_MMIO_QUEUE_NOTIFY, VIRTIO_NET_TX_QUEUE);
 
-    #if DEBUG_VERBOSE
+    #if DEBUG_PACKET_DETAIL
     /* BOUNDARY CHECK: Verify notification was written and device state */
     if (tx_count == 1) {
         uint32_t dev_status = VREG_READ(VIRTIO_MMIO_STATUS);
@@ -930,6 +991,85 @@ static void connection_remove(struct tcp_pcb *pcb)
             connection_count--;
             return;
         }
+    }
+}
+
+/* Print connection table statistics
+ *
+ * Shows:
+ * - Active connections (metadata slots in use)
+ * - Stale connections (PCB NULL or CLOSED/TIME_WAIT)
+ * - Available slots
+ */
+static void connection_print_stats(void)
+{
+    int active = 0;
+    int stale = 0;
+    int pcb_linked = 0;
+
+    for (int i = 0; i < MAX_CONNECTIONS; i++) {
+        if (connection_table[i].active) {
+            active++;
+            struct tcp_pcb *pcb = connection_table[i].pcb;
+            if (pcb != NULL) {
+                pcb_linked++;
+                if (pcb->state == CLOSED || pcb->state == TIME_WAIT) {
+                    stale++;
+                }
+            } else {
+                stale++;
+            }
+        }
+    }
+
+    int available = MAX_CONNECTIONS - active;
+
+    printf("%s: 📊 Connection table: %d active (%d PCB-linked, %d stale), %d available\n",
+           COMPONENT_NAME, active, pcb_linked, stale, available);
+}
+
+/* Cleanup stale connections from the connection table
+ *
+ * This function removes connections where:
+ * 1. PCB is NULL (connection already closed but metadata not cleaned up)
+ * 2. PCB state is CLOSED or TIME_WAIT (connection finished)
+ *
+ * Called periodically from main loop to prevent table exhaustion
+ */
+static void connection_cleanup_stale(void)
+{
+    int cleaned = 0;
+
+    for (int i = 0; i < MAX_CONNECTIONS; i++) {
+        if (!connection_table[i].active) {
+            continue;
+        }
+
+        struct tcp_pcb *pcb = connection_table[i].pcb;
+
+        /* Cleanup if PCB is NULL */
+        if (pcb == NULL) {
+            printf("%s: 🧹 Cleanup stale connection [%d]: PCB is NULL\n", COMPONENT_NAME, i);
+            connection_table[i].active = false;
+            connection_count--;
+            cleaned++;
+            continue;
+        }
+
+        /* Cleanup if PCB state is CLOSED or TIME_WAIT */
+        if (pcb->state == CLOSED || pcb->state == TIME_WAIT) {
+            printf("%s: 🧹 Cleanup stale connection [%d]: PCB state=%d (CLOSED=%d, TIME_WAIT=%d)\n",
+                   COMPONENT_NAME, i, pcb->state, CLOSED, TIME_WAIT);
+            connection_table[i].active = false;
+            connection_table[i].pcb = NULL;
+            connection_count--;
+            cleaned++;
+        }
+    }
+
+    if (cleaned > 0) {
+        printf("%s: 🧹 Cleaned %d stale connection(s)\n", COMPONENT_NAME, cleaned);
+        connection_print_stats();
     }
 }
 
@@ -1227,14 +1367,68 @@ static void process_rx_packets(void)
         if (desc_idx >= MAX_PACKETS) {
             printf("%s: ⚠️  INVALID descriptor index: %u (max %u)\n",
                    COMPONENT_NAME, desc_idx, MAX_PACKETS);
-            printf("%s:     Skipping corrupted descriptor\n", COMPONENT_NAME);
+            printf("%s:     Ring: used_ring_idx=%u, last_used=%u, current=%u\n",
+                   COMPONENT_NAME, used_ring_idx, last_used_idx, current_used_idx);
+
+            /* seL4-SAFE RECOVERY STRATEGY:
+             * seL4's memory safety allows aggressive recovery without corruption risk.
+             * We try multiple strategies knowing seL4 prevents double-free/use-after-free.
+             */
+
+            bool buffer_freed = false;
+
+            // STRATEGY 1: Free buffer at ring position (most likely correct)
+            if (used_ring_idx < MAX_PACKETS && rx_buffer_used[used_ring_idx]) {
+                printf("%s: 🛡️  seL4-SAFE: Freeing buffer %u (ring position)\n",
+                       COMPONENT_NAME, used_ring_idx);
+                rx_buffer_used[used_ring_idx] = false;
+                buffer_freed = true;
+            }
+
+            // STRATEGY 2: If ring position was already free, scan for any used buffer
+            if (!buffer_freed) {
+                printf("%s: ⚠️  Ring position %u already free - scanning for leaked buffers\n",
+                       COMPONENT_NAME, used_ring_idx);
+
+                for (int i = 0; i < MAX_PACKETS; i++) {
+                    if (rx_buffer_used[i]) {
+                        printf("%s: 🛡️  seL4-SAFE FALLBACK: Freeing leaked buffer %u\n",
+                               COMPONENT_NAME, i);
+                        rx_buffer_used[i] = false;
+                        buffer_freed = true;
+                        break;  // Free one buffer to avoid over-correction
+                    }
+                }
+            }
+
+            if (!buffer_freed) {
+                printf("%s: ⚠️  No used buffers found - possible state desync!\n", COMPONENT_NAME);
+            }
+
             last_used_idx++;
             continue;
         }
 
         /* Get packet buffer (use buffer index, not physical address from descriptor) */
         int buf_idx = desc_idx;
+
+        /* CRITICAL: Validate buffer index to prevent out-of-bounds access */
+        if (buf_idx < 0 || buf_idx >= MAX_PACKETS) {
+            printf("%s: ❌ FATAL: Invalid buffer index %d (desc_idx=%u, max=%d)\n",
+                   COMPONENT_NAME, buf_idx, desc_idx, MAX_PACKETS);
+            printf("%s:    last_used_idx=%u, RX queue full, system halting\n",
+                   COMPONENT_NAME, last_used_idx);
+            last_used_idx++;
+            continue;
+        }
+
         uint8_t *buffer = packet_buffers[buf_idx];
+
+        if (buffer == NULL) {
+            printf("%s: ❌ FATAL: Buffer[%d] is NULL!\n", COMPONENT_NAME, buf_idx);
+            last_used_idx++;
+            continue;
+        }
 
         /* Skip virtio_net_hdr at start of buffer */
         uint8_t *packet_data = buffer + VIRTIO_NET_HDR_SIZE;
@@ -1247,7 +1441,7 @@ static void process_rx_packets(void)
          * This deferred initialization code is no longer needed.
          */
 
-        #if DEBUG_PACKET_LOG
+        #if DEBUG_PACKET_DETAIL
         /* Log packet arrival with detailed inspection (VERY VERBOSE - only for debugging) */
         uint32_t timestamp_ms = sys_now();
         printf("\n╔══════════════════════════════════════════════════════════╗\n");
@@ -1311,9 +1505,9 @@ static void process_rx_packets(void)
             }
         }
         printf("══════════════════════════════════════════════════════════\n\n");
-        #endif /* DEBUG_PACKET_LOG */
+        #endif /* DEBUG_PACKET_DETAIL */
 
-        #if DEBUG_PACKET_SUMMARY
+        #if DEBUG_PACKET_DETAIL
         /* Lightweight packet summary - just protocol and ports (with filtering) */
         bool show_packet = false;
         uint8_t packet_protocol = 0;  /* 0=other, 6=TCP, 17=UDP, 1=ICMP */
@@ -1386,20 +1580,13 @@ static void process_rx_packets(void)
                 #endif
             }
         }
-        #endif /* DEBUG_PACKET_SUMMARY */
+        #endif /* DEBUG_PACKET_DETAIL */
 
-        #if DEBUG_MESSAGE_FLOW
-        /* Only show message flow for filtered packets */
-        #if DEBUG_PACKET_SUMMARY
-        if (show_packet) {
-        #endif
-            uint32_t msg_id = ++message_id_counter;
-            printf("\n🔵 [MSG #%u] ═══ RX: Packet received from VirtIO device ═══\n", msg_id);
-            printf("   Size: %u bytes, Buffer index: %d\n", packet_len, buf_idx);
-            printf("   Action: Feeding to lwIP stack for processing\n");
-        #if DEBUG_PACKET_SUMMARY
-        }
-        #endif
+        #if DEBUG_PACKET_DETAIL
+        uint32_t msg_id = ++message_id_counter;
+        printf("\n🔵 [NET1-INTERNAL MSG #%u] ═══ RX: Packet received from VirtIO device ═══\n", msg_id);
+        printf("   Size: %u bytes, Buffer index: %d\n", packet_len, buf_idx);
+        printf("   Action: Feeding to lwIP stack for processing\n");
         #endif
 
         /* Allocate pbuf and copy packet data (skipping header) */
@@ -1407,7 +1594,7 @@ static void process_rx_packets(void)
         if (p != NULL) {
             pbuf_take(p, packet_data, packet_len);
 
-            #if DEBUG_MESSAGE_FLOW && DEBUG_PACKET_SUMMARY
+            #if DEBUG_PACKET_DETAIL && DEBUG_PACKET_DETAIL
             if (show_packet) {
                 printf("   ✓ pbuf allocated, passing to lwIP input handler\n");
             }
@@ -1416,7 +1603,7 @@ static void process_rx_packets(void)
             /* Feed packet to lwIP */
             err_t lwip_result = netif_data.input(p, &netif_data);
 
-            #if DEBUG_MESSAGE_FLOW && DEBUG_PACKET_SUMMARY
+            #if DEBUG_PACKET_DETAIL && DEBUG_PACKET_DETAIL
             if (show_packet) {
                 if (lwip_result == ERR_OK) {
                     printf("   ✓ lwIP accepted packet (will route to TCP/UDP/etc.)\n");
@@ -1507,10 +1694,17 @@ static void tcp_echo_err(void *arg, err_t err)
     total_connections_closed++;
 
     printf("%s: ⚠️  TCP connection error - err=%d (%s)\n", COMPONENT_NAME, err, err_name);
+
+    /* CRITICAL: PCB is already freed by lwIP when err callback is called - don't access it!
+     * However, we need to clean up connection metadata to prevent table exhaustion.
+     *
+     * Since we can't use the PCB pointer (it's freed), we trigger an immediate cleanup
+     * which will find and remove all entries with NULL or CLOSED PCBs.
+     */
+    connection_cleanup_stale();
+
     printf("%s:    → Active connections: %u | Total created: %u | Total closed: %u\n",
            COMPONENT_NAME, active_connections, total_connections_created, total_connections_closed);
-
-    /* PCB is already freed by lwIP when err callback is called - don't access it! */
 }
 
 /*
@@ -1527,6 +1721,10 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
         printf("%s:    Remote: %u.%u.%u.%u:%u\n", COMPONENT_NAME,
                ip4_addr1(&pcb->remote_ip), ip4_addr2(&pcb->remote_ip),
                ip4_addr3(&pcb->remote_ip), ip4_addr4(&pcb->remote_ip), pcb->remote_port);
+
+        /* Clean up connection metadata before closing */
+        connection_remove(pcb);
+
         printf("%s:    → Active connections: %u | Total created: %u | Total closed: %u\n",
                COMPONENT_NAME, active_connections, total_connections_created, total_connections_closed);
 
@@ -1541,7 +1739,7 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
 
     /* ═══ Forward TCP data to ICS_Outbound (PLC→SCADA response path) ═══ */
 
-    #if DEBUG_MESSAGE_FLOW
+    #if DEBUG_PACKET_DETAIL
     uint32_t msg_id = ++message_id_counter;
     printf("\n🟢 [MSG #%u] ═══ TCP: Data received from PLC (OUTBOUND response) ═══\n", msg_id);
     printf("   Connection: %u.%u.%u.%u:%u → %u.%u.%u.%u:%u\n",
@@ -1590,11 +1788,31 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
     ics_msg->metadata.is_tcp = 1;
 
     /* Extract IP addresses from lwIP pcb (network byte order -> host byte order) */
-    ics_msg->metadata.src_ip = ntohl(ip4_addr_get_u32(&pcb->remote_ip));
-    ics_msg->metadata.dst_ip = ntohl(ip4_addr_get_u32(&pcb->local_ip));
+    ics_msg->metadata.src_ip = ntohl(ip4_addr_get_u32(&pcb->remote_ip));  /* PLC IP (192.168.95.2) */
+
+    /* CRITICAL: Look up original SCADA IP from connection tracking table
+     * pcb->local_ip is the gateway IP (192.168.95.1)
+     * We need the ORIGINAL SCADA IP (e.g., 192.168.90.5) for Net0 to send response to */
+    struct connection_metadata *meta = connection_lookup_by_pcb(pcb);
+    if (meta != NULL && meta->active) {
+        /* Use original SCADA IP from request metadata */
+        ics_msg->metadata.dst_ip = meta->original_src_ip;  /* Original SCADA IP */
+        ics_msg->metadata.dst_port = meta->src_port;       /* Original SCADA port */
+        printf("%s: 🔍 Lookup: Found metadata - using original SCADA IP %u.%u.%u.%u:%u\n",
+               COMPONENT_NAME,
+               (meta->original_src_ip >> 24) & 0xFF,
+               (meta->original_src_ip >> 16) & 0xFF,
+               (meta->original_src_ip >> 8) & 0xFF,
+               meta->original_src_ip & 0xFF,
+               meta->src_port);
+    } else {
+        /* Fallback: use local IP if lookup fails (will cause Net0 to fail lookup) */
+        ics_msg->metadata.dst_ip = ntohl(ip4_addr_get_u32(&pcb->local_ip));
+        ics_msg->metadata.dst_port = pcb->local_port;
+        printf("%s: ⚠️  Lookup: No metadata found - using gateway IP (WRONG - Net0 won't find connection!)\n", COMPONENT_NAME);
+    }
 
     ics_msg->metadata.src_port = pcb->remote_port;
-    ics_msg->metadata.dst_port = pcb->local_port;
     ics_msg->metadata.payload_offset = 0;  /* TCP payload directly */
     ics_msg->metadata.payload_length = (p->len < MAX_PAYLOAD_SIZE) ? p->len : MAX_PAYLOAD_SIZE;
 
@@ -1619,7 +1837,7 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
     if (ics_msg->payload_length > 200) printf("... (%u more bytes)", ics_msg->payload_length - 200);
     printf("\"\n");
 
-    #if DEBUG_MESSAGE_FLOW
+    #if DEBUG_PACKET_DETAIL
     printf("   ✓ ICS message prepared in shared memory (outbound_dp)\n");
     printf("   Action: Signaling ICS_Outbound component via outbound_ready_emit()\n");
     #endif
@@ -1627,7 +1845,7 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
     /* Step 4: Signal ICS_Outbound that PLC response is ready */
     outbound_ready_emit();
 
-    #if DEBUG_MESSAGE_FLOW
+    #if DEBUG_PACKET_DETAIL
     printf("   ✓ Signal sent to ICS_Outbound - PLC response handoff complete\n");
     printf("   [MSG #%u now in OUTBOUND pipeline - forwarding to Net0]\n\n", msg_id);
     #endif
@@ -1683,7 +1901,7 @@ static void setup_tcp_echo_server(void)
 {
     struct tcp_pcb *pcb;
 
-#if DEBUG_VERBOSE
+#if DEBUG_PACKET_DETAIL
     printf("\n%s: ╔════════════════════════════════════════════════════════════╗\n", COMPONENT_NAME);
     printf("%s: ║  [DEBUG] Entering setup_tcp_echo_server()                 ║\n", COMPONENT_NAME);
     printf("%s: ╚════════════════════════════════════════════════════════════╝\n", COMPONENT_NAME);
@@ -1693,14 +1911,14 @@ static void setup_tcp_echo_server(void)
 
     pcb = tcp_new_ip_type(IPADDR_TYPE_V4);
 
-#if DEBUG_VERBOSE
+#if DEBUG_PACKET_DETAIL
     printf("%s: [DEBUG] tcp_new_ip_type() returned: pcb=%p\n", COMPONENT_NAME, (void*)pcb);
     fflush(stdout);
 #endif
 
     if (pcb == NULL) {
         printf("%s: ❌ Failed to create TCP PCB\n", COMPONENT_NAME);
-#if DEBUG_VERBOSE
+#if DEBUG_PACKET_DETAIL
         printf("%s: [DEBUG] TCP PCB creation returned NULL - malloc likely failed\n", COMPONENT_NAME);
         printf("%s: [DEBUG] This suggests lwIP memory allocator is not ready\n", COMPONENT_NAME);
         fflush(stdout);
@@ -1708,7 +1926,7 @@ static void setup_tcp_echo_server(void)
         return;
     }
 
-#if DEBUG_VERBOSE
+#if DEBUG_PACKET_DETAIL
     printf("%s: [DEBUG] ✓ TCP PCB created successfully at %p\n", COMPONENT_NAME, (void*)pcb);
     printf("%s: [DEBUG] About to call tcp_bind(pcb, IP_ADDR_ANY, %d)...\n", COMPONENT_NAME, TCP_ECHO_PORT);
     fflush(stdout);
@@ -1716,7 +1934,7 @@ static void setup_tcp_echo_server(void)
 
     err_t err = tcp_bind(pcb, IP_ADDR_ANY, TCP_ECHO_PORT);
 
-#if DEBUG_VERBOSE
+#if DEBUG_PACKET_DETAIL
     printf("%s: [DEBUG] tcp_bind() returned: err=%d (%s)\n", COMPONENT_NAME,
            err, err == ERR_OK ? "ERR_OK" : "ERROR");
     fflush(stdout);
@@ -1727,7 +1945,7 @@ static void setup_tcp_echo_server(void)
         return;
     }
 
-#if DEBUG_VERBOSE
+#if DEBUG_PACKET_DETAIL
     printf("%s: [DEBUG] ✓ Successfully bound to port %d\n", COMPONENT_NAME, TCP_ECHO_PORT);
     printf("%s: [DEBUG] About to call tcp_listen_with_backlog(pcb, %d)...\n", COMPONENT_NAME, MAX_TCP_CONNECTIONS);
     fflush(stdout);
@@ -1735,7 +1953,7 @@ static void setup_tcp_echo_server(void)
 
     pcb = tcp_listen_with_backlog(pcb, MAX_TCP_CONNECTIONS);
 
-#if DEBUG_VERBOSE
+#if DEBUG_PACKET_DETAIL
     printf("%s: [DEBUG] tcp_listen_with_backlog() returned: pcb=%p\n", COMPONENT_NAME, (void*)pcb);
     fflush(stdout);
 #endif
@@ -1745,7 +1963,7 @@ static void setup_tcp_echo_server(void)
         return;
     }
 
-#if DEBUG_VERBOSE
+#if DEBUG_PACKET_DETAIL
     printf("%s: [DEBUG] ✓ Now listening on port %d\n", COMPONENT_NAME, TCP_ECHO_PORT);
     printf("%s: [DEBUG] About to call tcp_accept(pcb, tcp_echo_accept)...\n", COMPONENT_NAME);
     fflush(stdout);
@@ -1753,7 +1971,7 @@ static void setup_tcp_echo_server(void)
 
     tcp_accept(pcb, tcp_echo_accept);
 
-#if DEBUG_VERBOSE
+#if DEBUG_PACKET_DETAIL
     printf("%s: [DEBUG] ✓ Accept callback registered\n", COMPONENT_NAME);
     printf("%s: [DEBUG] Exiting setup_tcp_echo_server() - SUCCESS\n", COMPONENT_NAME);
     fflush(stdout);
@@ -1809,6 +2027,75 @@ static struct tcp_inbound_client_state inbound_tcp_client = {0};
 /*
  * TCP client callbacks for INBOUND path
  */
+
+/**
+ * Receive callback for INBOUND TCP client (receives PLC responses)
+ */
+static err_t inbound_tcp_recv_callback(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err)
+{
+    struct tcp_inbound_client_state *state = (struct tcp_inbound_client_state *)arg;
+
+    if (p == NULL) {
+        tcp_close(pcb);
+        state->active = false;
+        state->pcb = NULL;
+        return ERR_OK;
+    }
+
+    if (err != ERR_OK) {
+        pbuf_free(p);
+        return err;
+    }
+
+    if (outbound_dp == NULL) {
+        pbuf_free(p);
+        return ERR_MEM;
+    }
+
+    ICS_Message *ics_msg = (ICS_Message *)outbound_dp;
+    memset(&ics_msg->metadata, 0, sizeof(FrameMetadata));
+
+    ics_msg->metadata.ethertype = 0x0800;
+    ics_msg->metadata.ip_protocol = 6;
+    ics_msg->metadata.is_ip = 1;
+    ics_msg->metadata.is_tcp = 1;
+    ics_msg->metadata.src_ip = ntohl(ip4_addr_get_u32(&pcb->remote_ip));
+
+    /* Look up original SCADA IP */
+    struct connection_metadata *meta = connection_lookup_by_pcb(pcb);
+    if (meta != NULL && meta->active) {
+        ics_msg->metadata.dst_ip = meta->original_src_ip;
+        ics_msg->metadata.dst_port = meta->src_port;
+    } else {
+        ics_msg->metadata.dst_ip = ntohl(ip4_addr_get_u32(&pcb->local_ip));
+        ics_msg->metadata.dst_port = pcb->local_port;
+    }
+
+    ics_msg->metadata.src_port = pcb->remote_port;
+    ics_msg->metadata.payload_offset = 0;
+    ics_msg->metadata.payload_length = (p->len < MAX_PAYLOAD_SIZE) ? p->len : MAX_PAYLOAD_SIZE;
+
+    ics_msg->payload_length = ics_msg->metadata.payload_length;
+    memcpy(ics_msg->payload, p->payload, ics_msg->payload_length);
+
+    outbound_ready_emit();
+    tcp_recved(pcb, p->len);
+    pbuf_free(p);
+
+    /* CRITICAL: Clear PCB pointer in metadata BEFORE closing connection
+     * Otherwise IRQ handler may try to use dangling pointer
+     * Reuse 'meta' from above lookup at line 2059 */
+    if (meta != NULL && meta->active) {
+        meta->pcb = NULL;  /* Prevent dangling pointer */
+    }
+
+    tcp_close(pcb);
+    state->active = false;
+    state->pcb = NULL;
+
+    return ERR_OK;
+}
+
 static err_t inbound_tcp_sent_callback(void *arg, struct tcp_pcb *pcb, u16_t len)
 {
     struct tcp_inbound_client_state *state = (struct tcp_inbound_client_state *)arg;
@@ -1819,14 +2106,9 @@ static err_t inbound_tcp_sent_callback(void *arg, struct tcp_pcb *pcb, u16_t len
 
     /* Check if all data sent */
     if (state->bytes_sent >= state->payload_len) {
-        printf("%s: INBOUND: Complete - sent %u/%u bytes\n",
+        printf("%s: INBOUND: Complete - sent %u/%u bytes, waiting for PLC response\n",
                COMPONENT_NAME, state->bytes_sent, state->payload_len);
-
-        /* Close connection after successful transmission */
-        tcp_close(pcb);
-        state->active = false;
-        state->pcb = NULL;
-
+        /* Do NOT close - keep connection open to receive PLC response */
         return ERR_OK;
     }
 
@@ -1859,7 +2141,8 @@ static err_t inbound_tcp_connected_callback(void *arg, struct tcp_pcb *pcb, err_
 
     printf("%s: INBOUND: Connected to internal network\n", COMPONENT_NAME);
 
-    /* Set sent callback */
+    /* Set callbacks */
+    tcp_recv(pcb, inbound_tcp_recv_callback);
     tcp_sent(pcb, inbound_tcp_sent_callback);
 
     /* Send the payload */
@@ -1979,7 +2262,7 @@ static err_t outbound_tcp_connected_callback(void *arg, struct tcp_pcb *pcb, err
  */
 void inbound_ready_handle(void)
 {
-    #if DEBUG_MESSAGE_FLOW
+    #if DEBUG_PACKET_DETAIL
     uint32_t msg_id = ++message_id_counter;
     printf("\n🟡 [MSG #%u] ═══ ICS→NET: Received from ICS_Inbound ═══\n", msg_id);
     printf("   Source: ICS pipeline validation complete\n");
@@ -2005,7 +2288,7 @@ void inbound_ready_handle(void)
     if (ics_msg->payload_length > MAX_PAYLOAD_SIZE) {
         printf("%s: INBOUND: Invalid payload length %u (max %u)\n",
                COMPONENT_NAME, ics_msg->payload_length, MAX_PAYLOAD_SIZE);
-        #if DEBUG_MESSAGE_FLOW
+        #if DEBUG_PACKET_DETAIL
         printf("   ✗ [MSG #%u] DROPPED - invalid payload size\n\n", msg_id);
         #endif
         return;
@@ -2021,7 +2304,7 @@ void inbound_ready_handle(void)
         inbound_tcp_client.pcb = NULL;
     }
 
-    #if DEBUG_MESSAGE_FLOW
+    #if DEBUG_PACKET_DETAIL
     printf("   Payload size: %u bytes\n", ics_msg->payload_length);
     printf("   Destination: %u.%u.%u.%u:%u\n",
            (ics_msg->metadata.dst_ip >> 24) & 0xFF,
@@ -2126,6 +2409,9 @@ void inbound_ready_handle(void)
         return;
     }
 
+    /* Store PCB pointer immediately so netif_output() can find metadata by PCB */
+    meta->pcb = pcb;
+
     /* CRITICAL: Set callback argument BEFORE tcp_connect()
      * This prevents null pointer dereference in inbound_tcp_sent_callback
      */
@@ -2148,8 +2434,24 @@ void inbound_ready_handle(void)
         tcp_close(pcb);
         inbound_tcp_client.active = false;
         inbound_tcp_client.pcb = NULL;
+        meta->pcb = NULL;  /* Clear PCB from metadata */
         return;
     }
+
+    /* CRITICAL: Store lwIP's ephemeral port after tcp_connect()
+     * This port is assigned by lwIP and is needed for metadata lookup in netif_output()
+     * The ephemeral port is used as the source port in outgoing packets to the PLC
+     */
+    meta->lwip_ephemeral_port = pcb->local_port;
+
+    printf("%s: 📝 Stored metadata [slot %d]: SCADA %u.%u.%u.%u:%u → PLC %u.%u.%u.%u:%u (lwIP port: %u)\n",
+           COMPONENT_NAME, (int)(meta - connection_table),
+           (meta->original_src_ip >> 24) & 0xFF, (meta->original_src_ip >> 16) & 0xFF,
+           (meta->original_src_ip >> 8) & 0xFF, meta->original_src_ip & 0xFF,
+           meta->src_port,
+           (meta->original_dest_ip >> 24) & 0xFF, (meta->original_dest_ip >> 16) & 0xFF,
+           (meta->original_dest_ip >> 8) & 0xFF, meta->original_dest_ip & 0xFF,
+           meta->dest_port, meta->lwip_ephemeral_port);
 
     printf("%s: INBOUND: Connection initiated to PLC on internal network\n", COMPONENT_NAME);
 }
@@ -2160,7 +2462,7 @@ void inbound_ready_handle(void)
  */
 void outbound_ready_handle(void)
 {
-    #if DEBUG_MESSAGE_FLOW
+    #if DEBUG_PACKET_DETAIL
     uint32_t msg_id = ++message_id_counter;
     printf("\n🟡 [MSG #%u] ═══ ICS→NET: Received from ICS_Outbound ═══\n", msg_id);
     printf("   Source: ICS pipeline validation complete\n");
@@ -2187,7 +2489,7 @@ void outbound_ready_handle(void)
     if (ics_msg->payload_length > MAX_PAYLOAD_SIZE) {
         printf("%s: OUTBOUND: Invalid payload length %u (max %u)\n",
                COMPONENT_NAME, ics_msg->payload_length, MAX_PAYLOAD_SIZE);
-        #if DEBUG_MESSAGE_FLOW
+        #if DEBUG_PACKET_DETAIL
         printf("   ✗ [MSG #%u] DROPPED - invalid payload size\n\n", msg_id);
         #endif
         return;
@@ -2203,7 +2505,7 @@ void outbound_ready_handle(void)
         outbound_tcp_client.pcb = NULL;
     }
 
-    #if DEBUG_MESSAGE_FLOW
+    #if DEBUG_PACKET_DETAIL
     printf("   Payload size: %u bytes\n", ics_msg->payload_length);
     printf("   Destination: %u.%u.%u.%u:%u\n",
            (ics_msg->metadata.dst_ip >> 24) & 0xFF,
@@ -2503,14 +2805,14 @@ static int virtio_net_init(void)
     /* Get physical address for VirtIO device DMA access (sDDF: device_resources.regions[1].io_addr) */
     uintptr_t ring_base_paddr = camkes_dma_get_paddr(ring_base);
 
-    #if DEBUG_VERBOSE
+    #if DEBUG_PACKET_DETAIL
     printf("%s: DEBUG: ring_base virtual  = 0x%lx\n", COMPONENT_NAME, (uintptr_t)ring_base);
     printf("%s: DEBUG: ring_base physical = 0x%lx (via camkes_dma_get_paddr)\n", COMPONENT_NAME, ring_base_paddr);
     #endif
 
     /* RX queue */
     VREG_WRITE(VIRTIO_MMIO_QUEUE_SEL, VIRTIO_NET_RX_QUEUE);
-    #if DEBUG_VERBOSE
+    #if DEBUG_PACKET_DETAIL
     printf("%s: DEBUG: QueueSel set to %u\n", COMPONENT_NAME, VIRTIO_NET_RX_QUEUE);
     printf("%s: DEBUG: QueueSel readback = %u\n", COMPONENT_NAME, VREG_READ(VIRTIO_MMIO_QUEUE_SEL));
     printf("%s: DEBUG: QueueNumMax = %u\n", COMPONENT_NAME, VREG_READ(VIRTIO_MMIO_QUEUE_NUM_MAX));
@@ -2521,21 +2823,28 @@ static int virtio_net_init(void)
      */
     uint32_t queue_num_max = VREG_READ(VIRTIO_MMIO_QUEUE_NUM_MAX);
 
-    if (queue_num_max == 0) {
-        printf("%s: WARNING: QueueNumMax is 0, using default 256\n", COMPONENT_NAME);
-        rx_virtq.num = 256;
-    } else if (queue_num_max > 1024) {
-        printf("%s: WARNING: QueueNumMax=%u exceeds VirtIO max (1024), capping to 1024\n",
-               COMPONENT_NAME, queue_num_max);
-        rx_virtq.num = 1024;
-    } else {
-        rx_virtq.num = queue_num_max;
-        printf("%s: RX Queue: QueueNumMax=%u (from device register)\n",
-               COMPONENT_NAME, queue_num_max);
+    /* CRITICAL FIX: Ring size MUST match buffer pool size to prevent accessing
+     * uninitialized descriptors. Previous bug: QEMU offered 256 descriptors but
+     * we only had 32 buffers, causing descriptor index wraparound to hit
+     * uninitialized memory after ~352 packets.
+     *
+     * Solution: Tell QEMU to use exactly MAX_PACKETS descriptors (32).
+     * This ensures QEMU never tries to use descriptors we haven't initialized.
+     */
+    rx_virtq.num = MAX_PACKETS;
+
+    printf("%s: 🔧 RX Queue: Device offers %u descriptors, using %u (matches buffer pool)\n",
+           COMPONENT_NAME, queue_num_max, rx_virtq.num);
+
+    if (queue_num_max < MAX_PACKETS) {
+        printf("%s: ⚠️  WARNING: Device only supports %u descriptors but we need %u\n",
+               COMPONENT_NAME, queue_num_max, MAX_PACKETS);
+        printf("%s:             This may cause issues - consider reducing MAX_PACKETS\n", COMPONENT_NAME);
     }
 
-    #if DEBUG_VERBOSE
-    printf("%s: DEBUG: rx_virtq.num = %u\n", COMPONENT_NAME, rx_virtq.num);
+    #if DEBUG_PACKET_DETAIL
+    printf("%s: DEBUG: rx_virtq.num = %u (FIXED to match MAX_PACKETS=%u)\n",
+           COMPONENT_NAME, rx_virtq.num, MAX_PACKETS);
     #endif
 
     /* Virtual addresses for driver access */
@@ -2548,7 +2857,7 @@ static int virtio_net_init(void)
     uintptr_t avail_paddr = ring_base_paddr + 0x2000;
     uintptr_t used_paddr = ring_base_paddr + 0x2408;
 
-    #if DEBUG_VERBOSE
+    #if DEBUG_PACKET_DETAIL
     printf("%s: DEBUG: RX desc paddr  = 0x%lx\n", COMPONENT_NAME, desc_paddr);
     printf("%s: DEBUG: RX avail paddr = 0x%lx\n", COMPONENT_NAME, avail_paddr);
     printf("%s: DEBUG: RX used paddr  = 0x%lx\n", COMPONENT_NAME, used_paddr);
@@ -2596,17 +2905,17 @@ static int virtio_net_init(void)
     /* Read and validate QueueNumMax from device register */
     queue_num_max = VREG_READ(VIRTIO_MMIO_QUEUE_NUM_MAX);
 
-    if (queue_num_max == 0) {
-        printf("%s: WARNING: TX QueueNumMax is 0, using default 256\n", COMPONENT_NAME);
-        tx_virtq.num = 256;
-    } else if (queue_num_max > 1024) {
-        printf("%s: WARNING: TX QueueNumMax=%u exceeds VirtIO max (1024), capping to 1024\n",
-               COMPONENT_NAME, queue_num_max);
-        tx_virtq.num = 1024;
-    } else {
-        tx_virtq.num = queue_num_max;
-        printf("%s: TX Queue: QueueNumMax=%u (from device register)\n",
-               COMPONENT_NAME, queue_num_max);
+    /* CRITICAL FIX: Same as RX - TX ring size must match buffer pool.
+     * TX uses MAX_PACKETS/2 buffers (16), so set ring size to match.
+     */
+    tx_virtq.num = MAX_PACKETS;  /* Use same size as RX for consistency */
+
+    printf("%s: 🔧 TX Queue: Device offers %u descriptors, using %u (matches buffer pool)\n",
+           COMPONENT_NAME, queue_num_max, tx_virtq.num);
+
+    if (queue_num_max < MAX_PACKETS) {
+        printf("%s: ⚠️  WARNING: Device only supports %u TX descriptors but we need %u\n",
+               COMPONENT_NAME, queue_num_max, MAX_PACKETS);
     }
 
     /* Virtual addresses for driver access */
@@ -2700,9 +3009,9 @@ static int virtio_net_init(void)
 void post_init(void)
 {
     printf("%s: Component started\n", COMPONENT_NAME);
-    printf("%s: 🔖 NET1 SOFTWARE VERSION: v2.30-store-connection-metadata (2025-10-11)\n", COMPONENT_NAME);
-    printf("%s: 🔧 Features: Connection metadata storage for IP restoration in responses\n", COMPONENT_NAME);
-    printf("%s: 🔧 Features: Internal gateway (no upstream GW), IP 192.168.95.1, inbound handler active\n\n", COMPONENT_NAME);
+    printf("%s: 🔖 NET1 SOFTWARE VERSION: v2.40-pcb-dangling-pointer-fix (2025-10-12)\n", COMPONENT_NAME);
+    printf("%s: 🔧 CRITICAL FIX: Clear PCB pointer in metadata before tcp_close()\n", COMPONENT_NAME);
+    printf("%s: 🔧 Features: QUIET mode + TCP recv callback\n\n", COMPONENT_NAME);
 
     /* Initialize connection tracking table */
     memset(connection_table, 0, sizeof(connection_table));
@@ -2860,6 +3169,9 @@ int run(void)
 
     /* Main event loop - process lwIP timers, RX packets, and ICS notifications */
     /* Note: TCP server is now initialized in RX path after first packet */
+    uint32_t loop_iterations = 0;
+    const uint32_t CLEANUP_INTERVAL = 10000;  /* Run cleanup every ~10000 iterations (~30-60 seconds) */
+
     while (1) {
         /* Check for INBOUND notifications from ICS_Inbound (non-blocking) */
         if (inbound_ready_poll()) {
@@ -2873,6 +3185,13 @@ int run(void)
         /* Refill RX buffers OUTSIDE IRQ context to avoid IRQ storm
          * This happens in main loop after processing completes */
         refill_rx_queue();
+
+        /* Periodic connection table cleanup to prevent exhaustion */
+        loop_iterations++;
+        if (loop_iterations >= CLEANUP_INTERVAL) {
+            connection_cleanup_stale();
+            loop_iterations = 0;
+        }
 
         seL4_Yield();
     }

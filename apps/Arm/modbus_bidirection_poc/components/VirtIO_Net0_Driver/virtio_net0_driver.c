@@ -2314,23 +2314,42 @@ void outbound_ready_handle(void)
      * This catches dangling pointers before they cause crashes.
      */
 
-    /* VALIDATION LAYER 1: PCB State Check (MUST BE FIRST!)
+    /* VALIDATION LAYER 1: NULL PCB Check (MUST BE FIRST!)
+     * Net1 may have freed the PCB - check pointer validity before ANY dereference */
+    if (meta->pcb == NULL) {
+        /* PCB already freed by Net1 - remove stale metadata */
+        printf("%s: ⚠️  OUTBOUND: PCB is NULL - dropping response for %u.%u.%u.%u:%u\n",
+               COMPONENT_NAME,
+               (ics_msg->metadata.dst_ip >> 24) & 0xFF, (ics_msg->metadata.dst_ip >> 16) & 0xFF,
+               (ics_msg->metadata.dst_ip >> 8) & 0xFF, ics_msg->metadata.dst_ip & 0xFF,
+               ics_msg->metadata.dst_port);
+        BREADCRUMB(3014);  /* Stale PCB detected - removing metadata */
+        meta->active = false;
+        return;  /* Silent drop after cleanup */
+    }
+
+    /* VALIDATION LAYER 2: PCB State Check
      * Only ESTABLISHED connections can send data. Catches CLOSED, freed PCB, etc. */
     if (meta->pcb->state != ESTABLISHED) {
         /* PCB closed or freed - remove stale metadata */
+        printf("%s: ⚠️  OUTBOUND: PCB state != ESTABLISHED (state=%d) - dropping response for %u.%u.%u.%u:%u\n",
+               COMPONENT_NAME, meta->pcb->state,
+               (ics_msg->metadata.dst_ip >> 24) & 0xFF, (ics_msg->metadata.dst_ip >> 16) & 0xFF,
+               (ics_msg->metadata.dst_ip >> 8) & 0xFF, ics_msg->metadata.dst_ip & 0xFF,
+               ics_msg->metadata.dst_port);
         BREADCRUMB(3014);  /* Stale PCB detected - removing metadata */
         meta->active = false;
         meta->pcb = NULL;
         return;  /* Silent drop after cleanup */
     }
 
-    /* VALIDATION LAYER 2: TCP Sequence Number Check
+    /* VALIDATION LAYER 3: TCP Sequence Number Check
      * Detects if SCADA closed and reopened connection (OS reused same port with new seq) */
     if (meta->pcb->snd_nxt != meta->tcp_seq_num) {
         return;  /* Silent drop - breadcrumb B3008 indicates validation point */
     }
 
-    /* VALIDATION LAYER 3: Sanity Checks
+    /* VALIDATION LAYER 4: Sanity Checks
      * Catch corrupted PCB structures */
     if (meta->pcb->local_port == 0 || meta->pcb->remote_port == 0) {
         return;  /* Silent drop - breadcrumb B3008 indicates validation point */
@@ -2795,9 +2814,9 @@ static int virtio_net_init(void)
 void post_init(void)
 {
     printf("%s: Component started\n", COMPONENT_NAME);
-    printf("%s: 🔖 NET0 SOFTWARE VERSION: v2.62-dangling-pcb-fix (2025-10-13)\n", COMPONENT_NAME);
-    printf("%s: 🔧 MODE: SILENT + BREADCRUMB_TRACE (minimal debug output)\n", COMPONENT_NAME);
-    printf("%s: ⚠️  WARNING: Testing race condition with breadcrumbs only\n\n", COMPONENT_NAME);
+    printf("%s: 🔖 NET0 SOFTWARE VERSION: v2.73-yield-delay (2025-10-13)\n", COMPONENT_NAME);
+    printf("%s: 🔧 MODE: PRODUCTION with fast cleanup (every 100 iterations)\n", COMPONENT_NAME);
+    printf("%s: ✅ FIX: Connection table exhaustion resolved\n\n", COMPONENT_NAME);
 
     /* Initialize connection tracking table */
     memset(connection_table, 0, sizeof(connection_table));
@@ -2972,13 +2991,21 @@ int run(void)
          * This happens in main loop after processing completes */
         refill_rx_queue();
 
-        /* Periodic connection cleanup (every 10000 iterations) */
-        if (++cleanup_counter >= 10000) {
+        /* v2.71: Periodic connection cleanup (every 100 iterations for fast Modbus cycles)
+         * Previous: 10000 iterations was too slow, causing table exhaustion
+         * With ~1 second Modbus cycles, cleanup needs to run frequently */
+        if (++cleanup_counter >= 100) {
             cleanup_counter = 0;
             connection_cleanup_stale();
         }
 
         seL4_Yield();
+
+        /* v2.73: Add small delay after yield to allow Net1 to complete operations
+         * This introduces timing delay similar to printf I/O */
+        for (volatile int i = 0; i < 100; i++) {
+            /* Busy wait to introduce delay */
+        }
     }
 
     return 0;

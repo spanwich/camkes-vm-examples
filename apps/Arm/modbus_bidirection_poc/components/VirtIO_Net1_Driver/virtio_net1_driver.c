@@ -1148,12 +1148,18 @@ static void connection_cleanup_stale(void)
                 tcp_err(pcb, NULL);
                 tcp_arg(pcb, NULL);
 
-                /* tcp_abort() sends RST and frees PCB */
-                tcp_abort(pcb);
-
+                /* v2.64 CRITICAL FIX: Mark metadata as inactive BEFORE tcp_abort()
+                 * to prevent Net0 from using dangling pointer during race window */
                 connection_table[i].active = false;
                 connection_table[i].pcb = NULL;
                 connection_count--;
+
+                /* Ensure Net0 sees metadata update before PCB is freed */
+                __sync_synchronize();
+
+                /* tcp_abort() sends RST and frees PCB */
+                tcp_abort(pcb);
+
                 closed_idle++;
             }
         }
@@ -3399,7 +3405,7 @@ static int virtio_net_init(void)
 void post_init(void)
 {
     printf("%s: Component started\n", COMPONENT_NAME);
-    printf("%s: 🔖 NET1 SOFTWARE VERSION: v2.63-minimal-output (2025-10-13)\n", COMPONENT_NAME);
+    printf("%s: 🔖 NET1 SOFTWARE VERSION: v2.64-metadata-barrier-fix (2025-10-13)\n", COMPONENT_NAME);
     printf("%s: 🔧 MODE: PRODUCTION-READY with Multi-Layer Validation\n", COMPONENT_NAME);
     printf("%s: ✅ FIX 1: payload_data buffer (prevents dataport corruption)\n", COMPONENT_NAME);
     printf("%s: ✅ FIX 2: Correct lwIP callback protocol (ERR_ABRT without tcp_abort)\n", COMPONENT_NAME);

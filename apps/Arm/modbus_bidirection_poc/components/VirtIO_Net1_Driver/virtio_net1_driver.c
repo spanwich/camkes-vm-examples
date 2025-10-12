@@ -82,7 +82,14 @@
 #endif
 
 /* Connection tracking for metadata preservation */
-#define MAX_CONNECTIONS 64
+/* v2.86: Increased from 64 to 256 to prevent table exhaustion
+ * User insight: "increase active connections and let lwIP clear it naturally"
+ * - SCADA keeps connections alive, accumulates over time
+ * - Can't safely call tcp_abort() from main loop (v2.85 lesson)
+ * - Solution: Increase limit, let lwIP's TCP timeouts handle cleanup
+ * - Memory cost: ~12KB (256 * ~48 bytes) - negligible
+ * - Benefit: System won't deadlock when table fills */
+#define MAX_CONNECTIONS 256
 
 struct connection_metadata {
     struct tcp_pcb *pcb;           /* lwIP connection pointer (key) */
@@ -3475,7 +3482,7 @@ static int virtio_net_init(void)
 void post_init(void)
 {
     printf("%s: Component started\n", COMPONENT_NAME);
-    printf("%s: 🔖 NET1 SOFTWARE VERSION: v2.85-no-abort-from-mainloop (2025-10-13)\n", COMPONENT_NAME);
+    printf("%s: 🔖 NET1 SOFTWARE VERSION: v2.86-increase-max-connections (2025-10-13)\n", COMPONENT_NAME);
     printf("%s: 🔧 MODE: PRODUCTION-READY with Multi-Layer Validation\n", COMPONENT_NAME);
     printf("%s: ✅ FIX 1: payload_data buffer (prevents dataport corruption)\n", COMPONENT_NAME);
     printf("%s: ✅ FIX 2: Correct lwIP callback protocol (ERR_ABRT without tcp_abort)\n", COMPONENT_NAME);

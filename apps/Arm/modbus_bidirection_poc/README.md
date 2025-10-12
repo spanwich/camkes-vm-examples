@@ -1315,6 +1315,161 @@ The issue is **NOT just cache coherency** - there's a deeper **structural race c
 
 ---
 
-**Last Updated:** 2025-10-12
-**Version:** 2.42-SILENT-TEST (Heisenbug documented)
+## Version History & Bug Fixes
+
+### v2.81 - Fix Net0 lwIP Callback Protocol Violation (2025-10-13)
+
+**Critical Bug Fixed**: Net0 crash at address 0x10 after processing responses
+
+**Root Cause:**
+- Net0's `tcp_echo_recv()` was calling `tcp_close(pcb)` and returning `ERR_OK` when connection closed
+- This violated lwIP protocol: returning ERR_OK tells lwIP to continue using the PCB
+- lwIP freed the PCB, then `sys_check_timeouts()` accessed it → crash at offset 0x10
+
+**Fix Applied:**
+```c
+// OLD (WRONG):
+if (p == NULL) {
+    tcp_close(pcb);
+    return ERR_OK;  // ← Bug: lwIP thinks connection still active
+}
+
+// NEW (CORRECT):
+if (p == NULL) {
+    connection_remove(pcb);
+    return ERR_ABRT;  // ← Correct: lwIP handles cleanup internally
+}
+```
+
+**Impact**: Eliminates dangling PCB pointer crashes in Net0 (same fix as Net1 v2.57)
+
+---
+
+### v2.80 - Pbuf Double-Free Debugging Instrumentation (2025-10-13)
+
+**Added**: Defensive checks before all `pbuf_free()` calls in Net1 to identify double-free sources
+
+**Changes:**
+- Check `p->ref == 0` before calling `pbuf_free()` at all 5 free paths
+- Log pbuf address and ref count for debugging
+- Helps identify which code path causes assertion `pbuf_free: p->ref > 0`
+
+**Diagnostic Output:**
+```
+🐛 Freeing pbuf at NORMAL path: p=0x1a6fe8, ref=1, len=10
+🐛 BUG: pbuf ref already 0 at NORMAL path! p=0x1a6fe8, len=12
+```
+
+---
+
+### v2.79 - Separate lwIP Libraries (2025-10-13)
+
+**Critical Architecture Fix**: Eliminated shared lwIP memory corruption
+
+**Problem:**
+- Both Net0 and Net1 were linking to the same `lwip` library
+- Shared static variables: `ram_heap`, PCB pools, pbuf pools
+- Race conditions caused memory corruption and random crashes
+
+**Solution:**
+```cmake
+# Net0 uses 'lwip'
+AddLWIPConfiguration(${CMAKE_CURRENT_LIST_DIR}/components/VirtIO_Net0_Driver)
+
+# Net1 uses 'lwip_net1' (separate build with own memory pools)
+add_library(lwip_net1 STATIC EXCLUDE_FROM_ALL ${lwip_sources_net1})
+target_link_libraries(VirtIO_Net1_Driver lwip_net1)
+```
+
+**Impact:**
+- Completely isolated memory pools for Net0 and Net1
+- Eliminated cross-component memory corruption
+- Each component has its own: ram_heap, PCB lists, pbuf pools
+
+**Files Modified:**
+- `CMakeLists.txt`: Added separate lwip_net1 library build
+- `components/VirtIO_Net0_Driver/lwipopts.h`: Set MEM_LIBC_MALLOC=0
+- `components/VirtIO_Net1_Driver/lwipopts.h`: Set MEM_LIBC_MALLOC=0
+
+---
+
+### v2.60-v2.78 - Connection Management Fixes
+
+**v2.75: Connection Counter Underflow Protection**
+- Added check: `if (active_connections > 0)` before decrement
+- Prevents underflow when lwIP calls both error and recv callbacks
+
+**v2.74: Heartbeat Monitoring**
+- Added heartbeat every 50,000 iterations to detect silent hangs
+- Monitors both Net0 and Net1 independently
+
+**v2.73: Timing Delay After seL4_Yield()**
+- Added small delay after `seL4_Yield()` to allow component synchronization
+- Prevents race conditions in cross-component operations
+
+**v2.71: Fast Connection Cleanup**
+- Reduced cleanup interval from 10,000 to 100 iterations
+- Prevents connection table exhaustion with fast Modbus TCP cycles (~1 second)
+
+**v2.70: PCB NULL Validation**
+- Added NULL and state checks before accessing PCB fields
+- Prevents crashes from dangling pointers
+
+**v2.64: Memory Barrier Fix**
+- Added `__sync_synchronize()` after setting `metadata.active = false`
+- Ensures Net0 sees metadata update before PCB is freed by Net1
+
+**v2.60: Idle Timeout Reduction**
+- Changed from 30 seconds to 2 seconds
+- Matches Modbus TCP request rates (sub-second to ~1 second cycles)
+- Prevents PLC connection accumulation
+
+---
+
+### v2.57 - Net1 lwIP Callback Protocol Fix
+
+**Fixed**: Incorrect lwIP callback protocol in Net1 causing state corruption
+
+**Change:**
+```c
+// OLD (WRONG):
+if (p == NULL) {
+    tcp_abort(pcb);
+    return ERR_ABRT;  // ← Calling tcp_abort() ourselves violates protocol
+}
+
+// NEW (CORRECT):
+if (p == NULL) {
+    connection_remove(pcb);
+    return ERR_ABRT;  // ← lwIP handles tcp_abort() internally
+}
+```
+
+**Impact**: Eliminated Net1 crashes and PCB state corruption
+
+---
+
+## Current Status
+
+**Software Versions:**
+- Net0: v2.81-fix-lwip-callback-protocol
+- Net1: v2.80-pbuf-double-free-debug
+
+**Stability:**
+- ✅ Separate lwIP libraries (no shared memory corruption)
+- ✅ Correct lwIP callback protocol in both Net0 and Net1
+- ✅ Connection table management with fast cleanup
+- ✅ Memory barriers for cross-component synchronization
+- ✅ Defensive NULL checks and underflow protection
+- ✅ Heartbeat monitoring for silent hang detection
+
+**Known Limitations:**
+- Debug output enabled for diagnostics (minimal I/O interference)
+- Connection reuse requires SCADA to keep connections alive
+- Idle timeout set to 2 seconds for Modbus TCP compatibility
+
+---
+
+**Last Updated:** 2025-10-13
+**Version:** Net0=v2.81, Net1=v2.80
 **Contact:** PhD Research Project - seL4 ICS Security Gateway

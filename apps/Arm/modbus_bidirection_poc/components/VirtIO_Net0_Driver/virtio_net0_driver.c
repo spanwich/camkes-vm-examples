@@ -1787,7 +1787,18 @@ static void tcp_echo_err(void *arg, err_t err)
 static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err)
 {
     if (p == NULL) {
-        /* Connection closed gracefully by remote peer */
+        /* v2.81: CRITICAL FIX - Connection closed by remote peer
+         * MUST return ERR_ABRT WITHOUT calling tcp_close()!
+         *
+         * Bug Analysis (v2.80 crash at 0x10):
+         * - Old code: tcp_close(pcb); return ERR_OK;
+         * - Problem: lwIP frees PCB but we return ERR_OK (means "continue")
+         * - Later sys_check_timeouts() accesses freed PCB → crash at 0x10
+         *
+         * Correct lwIP protocol (same fix as Net1 v2.57):
+         * - Return ERR_ABRT → lwIP handles cleanup internally
+         * - Do NOT call tcp_close() or tcp_abort() ourselves
+         */
 
         /* v2.75: Only decrement if counter is positive (prevent underflow)
          * lwIP may call both err callback and recv(p=NULL) for the same connection */
@@ -1808,14 +1819,11 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
                COMPONENT_NAME, active_connections, total_connections_created, total_connections_closed);
         #endif
 
-        /* Clear PCB pointer in metadata before closing */
-        struct connection_metadata *meta = connection_lookup_by_pcb(pcb);
-        if (meta != NULL && meta->active) {
-            meta->pcb = NULL;
-        }
+        /* Clean up connection metadata before lwIP frees PCB */
+        connection_remove(pcb);
 
-        tcp_close(pcb);
-        return ERR_OK;
+        /* v2.81: Return ERR_ABRT - lwIP handles tcp_abort() internally */
+        return ERR_ABRT;
     }
 
     if (err != ERR_OK) {
@@ -2840,7 +2848,7 @@ static int virtio_net_init(void)
 void post_init(void)
 {
     printf("%s: Component started\n", COMPONENT_NAME);
-    printf("%s: 🔖 NET0 SOFTWARE VERSION: v2.80-pbuf-double-free-debug (2025-10-13)\n", COMPONENT_NAME);
+    printf("%s: 🔖 NET0 SOFTWARE VERSION: v2.81-fix-lwip-callback-protocol (2025-10-13)\n", COMPONENT_NAME);
     printf("%s: 🔧 MODE: PRODUCTION with fast cleanup (every 100 iterations)\n", COMPONENT_NAME);
     printf("%s: ✅ FIX: Connection table exhaustion resolved\n\n", COMPONENT_NAME);
 

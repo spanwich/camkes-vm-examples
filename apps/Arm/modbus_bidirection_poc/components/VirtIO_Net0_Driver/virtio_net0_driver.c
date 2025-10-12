@@ -3088,7 +3088,7 @@ static int virtio_net_init(void)
 void post_init(void)
 {
     printf("%s: Component started\n", COMPONENT_NAME);
-    printf("%s: 🔖 NET0 SOFTWARE VERSION: v2.95-fix-crash-at-offset-0x10 (2025-10-13)\n", COMPONENT_NAME);
+    printf("%s: 🔖 NET0 SOFTWARE VERSION: v2.96-remove-all-pcb-field-access (2025-10-13)\n", COMPONENT_NAME);
     printf("%s: 🔧 MODE: PRODUCTION with fast cleanup (every 100 iterations)\n", COMPONENT_NAME);
     printf("%s: ✅ FIX 1: awaiting_response flag prevents premature metadata cleanup!\n", COMPONENT_NAME);
     printf("%s: ✅ FIX 2: Send close notification to Net1 when SCADA closes\n", COMPONENT_NAME);

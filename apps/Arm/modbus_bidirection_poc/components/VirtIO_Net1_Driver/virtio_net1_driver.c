@@ -2763,43 +2763,37 @@ void inbound_ready_handle(void)
 
         struct tcp_pcb *existing_pcb = existing_meta->pcb;
 
-        printf("%s: 🔍 Found existing connection for SCADA %u.%u.%u.%u:%u (PCB=%p, state=%d)\n",
+        printf("%s: 🔍 Found existing connection for SCADA %u.%u.%u.%u:%u (PCB=%p)\n",
                COMPONENT_NAME,
                (ics_msg->metadata.src_ip >> 24) & 0xFF,
                (ics_msg->metadata.src_ip >> 16) & 0xFF,
                (ics_msg->metadata.src_ip >> 8) & 0xFF,
                ics_msg->metadata.src_ip & 0xFF,
                ics_msg->metadata.src_port,
-               (void*)existing_pcb, existing_pcb->state);
+               (void*)existing_pcb);
 
-        /* ─────────────────────────────────────────────────────────────────────
-         * VALIDATION LAYER 1: TCP Sequence Number Check (detects port reuse)
-         * ───────────────────────────────────────────────────────────────────── */
-        if (existing_pcb->snd_nxt != existing_meta->tcp_seq_num) {
-            printf("%s:   ❌ Sequence mismatch (expected 0x%08x, got 0x%08x) - PORT REUSED!\n",
-                   COMPONENT_NAME, existing_meta->tcp_seq_num, existing_pcb->snd_nxt);
-            printf("%s:   → Creating new connection for new TCP session\n", COMPONENT_NAME);
-            goto cleanup_and_create_new;
-        }
+        /* v2.96: CRITICAL FIX - DO NOT ACCESS PCB FIELDS! (Same as Net0 v2.95)
+         * ═══════════════════════════════════════════════════════════════════
+         * BUG: Lines 2773-2800 accessed pcb->state, pcb->snd_nxt, pcb->local_port
+         * Problem: PCB might be freed by lwIP between metadata lookup and access
+         * Result: Page fault at offset 0x10 (accessing freed memory)
+         *
+         * Root Cause (same as Net0):
+         * 1. First connection closes → tcp_close() called, metadata kept alive
+         * 2. lwIP eventually frees PCB (callback not fired yet)
+         * 3. Second request finds existing metadata with PCB pointer
+         * 4. We access pcb->state → CRASH at offset 0x10!
+         *
+         * Solution: Don't validate PCB fields - assume it needs cleanup
+         * If existing_pcb exists but might be stale → always create new connection
+         *
+         * This is SAFER than trying to validate - lwIP will clean up old PCB
+         * through callbacks, and we create a fresh connection for the new request.
+         */
 
-        /* ─────────────────────────────────────────────────────────────────────
-         * VALIDATION LAYER 2: PCB State Check (connection alive?)
-         * ───────────────────────────────────────────────────────────────────── */
-        if (existing_pcb->state != ESTABLISHED) {
-            printf("%s:   ❌ Connection not ESTABLISHED (state=%d)\n", COMPONENT_NAME, existing_pcb->state);
-            printf("%s:   → Cleaning up dead connection\n", COMPONENT_NAME);
-            goto cleanup_and_create_new;
-        }
-
-        /* ─────────────────────────────────────────────────────────────────────
-         * VALIDATION LAYER 3: Sanity Checks (valid PCB?)
-         * ───────────────────────────────────────────────────────────────────── */
-        if (existing_pcb->local_port == 0 || existing_pcb->remote_port != ics_msg->metadata.dst_port) {
-            printf("%s:   ❌ Invalid PCB (local_port=%u, remote_port=%u, expected=%u)\n",
-                   COMPONENT_NAME, existing_pcb->local_port, existing_pcb->remote_port,
-                   ics_msg->metadata.dst_port);
-            goto cleanup_and_create_new;
-        }
+        printf("%s:   → Found existing metadata - cleaning up old connection\n", COMPONENT_NAME);
+        printf("%s:   → Creating new connection for this request (safer than reuse)\n", COMPONENT_NAME);
+        goto cleanup_and_create_new;
 
         /* ═══════════════════════════════════════════════════════════════════
          * ✅ ALL VALIDATION PASSED - SAFE TO REUSE CONNECTION!
@@ -3095,17 +3089,13 @@ cleanup_and_create_new:
 
                     struct tcp_pcb *stale_pcb = connection_table[i].pcb;
 
-                    /* Only clean up if PCB is NULL or in non-ESTABLISHED state */
-                    if (stale_pcb == NULL || stale_pcb->state != ESTABLISHED) {
-                        printf("%s:   🧹 Cleaning stale connection [%d] to PLC (PCB=%p, state=%d)\n",
-                               COMPONENT_NAME, i, (void*)stale_pcb,
-                               stale_pcb ? stale_pcb->state : -1);
+                    /* v2.96: Only clean up if PCB is NULL (already freed by lwIP)
+                     * DO NOT access pcb->state - causes crash at offset 0x10!
+                     * DO NOT call tcp_abort() from main loop - lwIP will clean up via callbacks */
+                    if (stale_pcb == NULL) {
+                        printf("%s:   🧹 Cleaning stale connection [%d] to PLC (PCB=NULL)\n",
+                               COMPONENT_NAME, i);
 
-                        if (stale_pcb != NULL) {
-                            tcp_abort(stale_pcb);
-                        }
-
-                        connection_table[i].pcb = NULL;
                         connection_table[i].active = false;
                         if (connection_count > 0) {
                             connection_count--;
@@ -3791,7 +3781,7 @@ static int virtio_net_init(void)
 void post_init(void)
 {
     printf("%s: Component started\n", COMPONENT_NAME);
-    printf("%s: 🔖 NET1 SOFTWARE VERSION: v2.95-fix-crash-at-offset-0x10 (2025-10-13)\n", COMPONENT_NAME);
+    printf("%s: 🔖 NET1 SOFTWARE VERSION: v2.96-remove-all-pcb-field-access (2025-10-13)\n", COMPONENT_NAME);
     printf("%s: 🔧 MODE: PRODUCTION-READY with Multi-Layer Validation\n", COMPONENT_NAME);
     printf("%s: ✅ FIX 1: payload_data buffer (prevents dataport corruption)\n", COMPONENT_NAME);
     printf("%s: ✅ FIX 2: tcp_abort() removed from callbacks (crash at 0x38a9c fixed!)\n", COMPONENT_NAME);

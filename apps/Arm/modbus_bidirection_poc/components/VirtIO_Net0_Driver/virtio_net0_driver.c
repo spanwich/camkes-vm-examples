@@ -52,9 +52,9 @@
 /* ═══════════════════════════════════════════════════════════════ */
 /* DEBUG OUTPUT CONTROL - Set ONE level to 1                        */
 /* ═══════════════════════════════════════════════════════════════ */
-#define DEBUG_LEVEL_SILENT   1  /* Testing: NO output - validates memory barriers */
+#define DEBUG_LEVEL_SILENT   0  /* Testing: NO output - validates memory barriers */
 #define DEBUG_LEVEL_QUIET    0  /* Production: Only errors and warnings */
-#define DEBUG_LEVEL_NORMAL   0  /* Default: Connection lifecycle + traffic flow */
+#define DEBUG_LEVEL_NORMAL   1  /* Default: Connection lifecycle + traffic flow - REQUIRED FOR STABILITY */
 #define DEBUG_LEVEL_VERBOSE  0  /* Development: Full packet details */
 
 #if DEBUG_LEVEL_SILENT
@@ -2703,9 +2703,9 @@ static int virtio_net_init(void)
 void post_init(void)
 {
     printf("%s: Component started\n", COMPONENT_NAME);
-    printf("%s: 🔖 NET0 SOFTWARE VERSION: v2.42-SILENT-TEST (2025-10-12)\n", COMPONENT_NAME);
-    printf("%s: 🔧 CRITICAL FIX: Memory barriers for cache coherency (OUTBOUND path)\n", COMPONENT_NAME);
-    printf("%s: 🔧 Features: Production QUIET mode - errors/warnings only\n\n", COMPONENT_NAME);
+    printf("%s: 🔖 NET0 SOFTWARE VERSION: v2.42-stable-with-debug (2025-10-12)\n", COMPONENT_NAME);
+    printf("%s: 🔧 CRITICAL: Memory barriers + DEBUG_NORMAL required for stability\n", COMPONENT_NAME);
+    printf("%s: ⚠️  WARNING: Heisenbug - crashes without debug output (see README)\n\n", COMPONENT_NAME);
 
     /* Initialize connection tracking table */
     memset(connection_table, 0, sizeof(connection_table));

@@ -52,28 +52,31 @@
 /* ═══════════════════════════════════════════════════════════════ */
 /* DEBUG OUTPUT CONTROL - Set ONE level to 1                        */
 /* ═══════════════════════════════════════════════════════════════ */
+#define DEBUG_LEVEL_SILENT   1  /* Testing: NO output - validates memory barriers */
 #define DEBUG_LEVEL_QUIET    0  /* Production: Only errors and warnings */
-#define DEBUG_LEVEL_NORMAL   1  /* Default: Connection lifecycle + traffic flow */
+#define DEBUG_LEVEL_NORMAL   0  /* Default: Connection lifecycle + traffic flow */
 #define DEBUG_LEVEL_VERBOSE  0  /* Development: Full packet details */
 
-#if DEBUG_LEVEL_QUIET
+#if DEBUG_LEVEL_SILENT
+    #define DEBUG_CRITICAL      0
+    #define DEBUG_TRAFFIC       0
+    #define DEBUG_METADATA      0
+    #define DEBUG_PACKET_DETAIL 0
+#elif DEBUG_LEVEL_QUIET
     #define DEBUG_CRITICAL      1
     #define DEBUG_TRAFFIC       0
     #define DEBUG_METADATA      0
     #define DEBUG_PACKET_DETAIL 0
-    #define DEBUG_PACKET_DETAIL  0
 #elif DEBUG_LEVEL_NORMAL
     #define DEBUG_CRITICAL      1
     #define DEBUG_TRAFFIC       1
     #define DEBUG_METADATA      1  /* Keep for v2.36 validation */
     #define DEBUG_PACKET_DETAIL 0
-    #define DEBUG_PACKET_DETAIL  0
 #elif DEBUG_LEVEL_VERBOSE
     #define DEBUG_CRITICAL      1
     #define DEBUG_TRAFFIC       1
     #define DEBUG_METADATA      1
     #define DEBUG_PACKET_DETAIL 1
-    #define DEBUG_PACKET_DETAIL  1
 #else
     #error "No debug level selected"
 #endif
@@ -2700,7 +2703,7 @@ static int virtio_net_init(void)
 void post_init(void)
 {
     printf("%s: Component started\n", COMPONENT_NAME);
-    printf("%s: 🔖 NET0 SOFTWARE VERSION: v2.42-cache-coherency-barriers (2025-10-12)\n", COMPONENT_NAME);
+    printf("%s: 🔖 NET0 SOFTWARE VERSION: v2.42-SILENT-TEST (2025-10-12)\n", COMPONENT_NAME);
     printf("%s: 🔧 CRITICAL FIX: Memory barriers for cache coherency (OUTBOUND path)\n", COMPONENT_NAME);
     printf("%s: 🔧 Features: Production QUIET mode - errors/warnings only\n\n", COMPONENT_NAME);
 

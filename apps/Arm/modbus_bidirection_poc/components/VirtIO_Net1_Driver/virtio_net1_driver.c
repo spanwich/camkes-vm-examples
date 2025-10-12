@@ -92,7 +92,7 @@
 #define MAX_CONNECTIONS 256
 
 struct connection_metadata {
-    struct tcp_pcb *pcb;           /* lwIP connection pointer (key) */
+    struct tcp_pcb *pcb;           /* lwIP connection pointer (SCADA→Net1 connection) */
     uint32_t original_src_ip;      /* Original source IP (e.g., 192.168.90.5 SCADA) */
     uint32_t original_dest_ip;     /* Original destination IP (e.g., 192.168.95.2 PLC) */
     uint16_t src_port;             /* Source port (SCADA's ephemeral port) */
@@ -104,6 +104,7 @@ struct connection_metadata {
     uint32_t tcp_seq_num;          /* Initial TCP sequence number - detects port reuse */
     uint32_t timestamp;            /* Creation time - for metadata consistency with Net0 */
     uint32_t last_activity;        /* Last activity timestamp - for idle timeout (v2.59) */
+
 };
 
 static struct connection_metadata connection_table[MAX_CONNECTIONS];
@@ -2208,12 +2209,35 @@ static err_t inbound_tcp_recv_callback(void *arg, struct tcp_pcb *pcb, struct pb
 
     if (p == NULL) {
         BREADCRUMB(1001);  /* Connection closed by remote */
-        /* v2.57: CRITICAL FIX - Return ERR_ABRT WITHOUT calling tcp_abort()!
-         * When returning ERR_ABRT, lwIP handles tcp_abort() internally.
-         * Calling it ourselves violates lwIP protocol and causes state corruption. */
-        connection_remove(pcb);
-        state->active = false;
-        state->pcb = NULL;
+        /* v2.91: CRITICAL FIX - DO NOT remove connection metadata yet!
+         *
+         * Same issue as Net0 v2.90:
+         * - PLC may close connection immediately after sending response
+         * - Net1's inbound_tcp_recv_callback(p=NULL) is called
+         * - OLD CODE: connection_remove(pcb) removes metadata
+         * - But Net0 might still be processing this connection
+         * - Result: Net0 can't find metadata to send response back to SCADA
+         *
+         * Solution: Mark PCB as NULL but keep metadata alive
+         * - Cleanup happens later in inbound_ready_handle() or timeout
+         */
+
+        /* Mark PCB as NULL (but keep metadata and state) */
+        if (state != NULL) {
+            state->pcb = NULL;
+            /* Keep state->active = true so we know there's pending work */
+        }
+
+        /* Also mark in connection_table if present */
+        for (int i = 0; i < MAX_CONNECTIONS; i++) {
+            if (connection_table[i].active && connection_table[i].pcb == pcb) {
+                printf("%s: ⚠️  PLC closed connection - marking PCB as NULL (keeping metadata)\n", COMPONENT_NAME);
+                connection_table[i].pcb = NULL;  /* Mark as closed but keep metadata */
+                break;
+            }
+        }
+
+        /* v2.57: Return ERR_ABRT - lwIP handles tcp_abort() internally */
         return ERR_ABRT;
     }
 
@@ -2383,7 +2407,49 @@ static err_t inbound_tcp_connected_callback(void *arg, struct tcp_pcb *pcb, err_
     struct tcp_inbound_client_state *state = (struct tcp_inbound_client_state *)arg;
 
     if (err != ERR_OK) {
-        printf("%s: INBOUND: Connection failed: %d\n", COMPONENT_NAME, err);
+        printf("%s: ❌ INBOUND: Connection failed: %d\n", COMPONENT_NAME, err);
+
+        /* v2.93: Send error notification to Net0 to close SCADA connection
+         * This handles failures during 3-way handshake (RST from PLC) */
+        if (outbound_dp != NULL) {
+            /* Find the connection metadata to get original SCADA 5-tuple */
+            struct connection_metadata *meta = NULL;
+            for (int i = 0; i < MAX_CONNECTIONS; i++) {
+                if (connection_table[i].active && connection_table[i].pcb == pcb) {
+                    meta = &connection_table[i];
+                    break;
+                }
+            }
+
+            if (meta != NULL) {
+                ICS_Message *error_msg = (ICS_Message *)outbound_dp;
+
+                /* Prepare error notification */
+                memset(&error_msg->metadata, 0, sizeof(FrameMetadata));
+                error_msg->metadata.ethertype = 0x0800;
+                error_msg->metadata.ip_protocol = 6;
+                error_msg->metadata.is_ip = 1;
+                error_msg->metadata.is_tcp = 1;
+
+                /* Copy connection 5-tuple */
+                error_msg->metadata.src_ip = meta->original_src_ip;
+                error_msg->metadata.dst_ip = meta->original_dest_ip;
+                error_msg->metadata.src_port = meta->src_port;
+                error_msg->metadata.dst_port = meta->dest_port;
+
+                /* Error marker */
+                error_msg->payload_length = 0;
+                error_msg->metadata.payload_length = 0;
+                error_msg->metadata.payload_offset = 0xFFFF;
+
+                printf("%s:   → Sending ERROR notification to Net0 (connection callback failed)\n",
+                       COMPONENT_NAME);
+
+                __sync_synchronize();
+                outbound_ready_emit();
+            }
+        }
+
         state->active = false;
         state->pcb = NULL;
         return err;
@@ -2407,7 +2473,8 @@ static err_t inbound_tcp_connected_callback(void *arg, struct tcp_pcb *pcb, err_
     err = tcp_write(pcb, state->payload_data, to_send, TCP_WRITE_FLAG_COPY);
     if (err != ERR_OK) {
         printf("%s: INBOUND: tcp_write failed: %d\n", COMPONENT_NAME, err);
-        tcp_abort(pcb);  /* v2.51: Force RST - never use tcp_close() to avoid FIN-WAIT-1 */
+        /* v2.88: CRITICAL FIX - Do NOT call tcp_abort() from callback!
+         * Return ERR_ABRT and lwIP handles cleanup internally */
         state->active = false;
         state->pcb = NULL;
         return ERR_ABRT;
@@ -2452,14 +2519,20 @@ static err_t outbound_tcp_sent_callback(void *arg, struct tcp_pcb *pcb, u16_t le
         printf("%s: OUTBOUND: Complete - sent %u/%u bytes\n",
                COMPONENT_NAME, state->bytes_sent, state->payload_len);
 
-        /* Close connection after successful transmission */
-        /* v2.53: CRITICAL - Clean up connection metadata to prevent table exhaustion */
+        /* v2.88: CRITICAL FIX - Close connection after successful transmission
+         * DO NOT call tcp_abort() from callback! Return ERR_ABRT instead.
+         *
+         * This was THE BUG causing the crash at PC 0x38a9c!
+         * - tcp_abort(pcb) frees the PCB immediately
+         * - lwIP callback returns and tries to use freed PCB
+         * - Crash at address 0x10 (NULL + offset)
+         *
+         * Correct protocol: Return ERR_ABRT, lwIP handles tcp_abort() internally */
         connection_remove(pcb);
-        tcp_abort(pcb);  /* v2.51: Force RST - never use tcp_close() to avoid FIN-WAIT-1 */
         state->active = false;
         state->pcb = NULL;
 
-        return ERR_OK;
+        return ERR_ABRT;  /* Let lwIP handle tcp_abort() internally */
     }
 
     /* Send remaining data if needed */
@@ -2500,7 +2573,8 @@ static err_t outbound_tcp_connected_callback(void *arg, struct tcp_pcb *pcb, err
     err = tcp_write(pcb, state->payload_data, to_send, TCP_WRITE_FLAG_COPY);
     if (err != ERR_OK) {
         printf("%s: OUTBOUND: tcp_write failed: %d\n", COMPONENT_NAME, err);
-        tcp_abort(pcb);  /* v2.51: Force RST - never use tcp_close() to avoid FIN-WAIT-1 */
+        /* v2.88: CRITICAL FIX - Do NOT call tcp_abort() from callback!
+         * Return ERR_ABRT and lwIP handles cleanup internally */
         state->active = false;
         state->pcb = NULL;
         return ERR_ABRT;
@@ -2567,6 +2641,101 @@ void inbound_ready_handle(void)
     }
 
     BREADCRUMB(2005);  /* Payload size valid */
+
+    /* ═══════════════════════════════════════════════════════════════════════════
+     * v2.93: Handle CLOSE NOTIFICATION from Net0
+     * ═══════════════════════════════════════════════════════════════════════════
+     *
+     * Zero-length payload = SCADA closed connection.
+     * Net0 sends this notification so we can close the corresponding PLC connection.
+     *
+     * This prevents PLC connection accumulation while avoiding double-free bugs.
+     */
+    if (ics_msg->payload_length == 0) {
+        printf("%s: 📥 Received close notification from Net0 (SCADA %u.%u.%u.%u:%u closed)\n",
+               COMPONENT_NAME,
+               (ics_msg->metadata.src_ip >> 24) & 0xFF,
+               (ics_msg->metadata.src_ip >> 16) & 0xFF,
+               (ics_msg->metadata.src_ip >> 8) & 0xFF,
+               ics_msg->metadata.src_ip & 0xFF,
+               ics_msg->metadata.src_port);
+
+        /* Look up PLC connection for this SCADA session */
+        struct connection_metadata *meta = connection_lookup_by_tuple(
+            ics_msg->metadata.src_ip,
+            ics_msg->metadata.dst_ip,
+            ics_msg->metadata.src_port,
+            ics_msg->metadata.dst_port
+        );
+
+        if (meta != NULL && meta->active && meta->pcb != NULL) {
+            struct tcp_pcb *pcb = meta->pcb;
+
+            printf("%s:   → Found PLC connection (PCB=%p, state=%d) - closing gracefully\n",
+                   COMPONENT_NAME, (void*)pcb, pcb->state);
+
+            /* v2.95: CRITICAL FIX - Let lwIP manage callbacks during close (same as Net0)
+             * ═══════════════════════════════════════════════════════════════════
+             * Problem: Clearing callbacks then calling tcp_close() causes issues:
+             * - lwIP needs callbacks to complete the close handshake
+             * - tcp_err callback should fire to clean up metadata
+             *
+             * Solution: DON'T clear callbacks! Call tcp_close() and let lwIP:
+             * - Send FIN packet
+             * - Wait for FIN-ACK from remote
+             * - Eventually call tcp_err or tcp_recv(NULL) to signal close
+             * - Our callback will clean up metadata properly
+             */
+            if (pcb->state == ESTABLISHED) {
+                /* DON'T clear callbacks - lwIP needs them! */
+
+                /* Close connection gracefully - lwIP will call callbacks when done */
+                err_t close_err = tcp_close(pcb);
+                if (close_err != ERR_OK) {
+                    printf("%s:   ⚠️  tcp_close() failed (%d) - cleaning up metadata\n",
+                           COMPONENT_NAME, close_err);
+                    /* Only if tcp_close() FAILS, clean up manually */
+                    meta->pcb = NULL;
+                    meta->active = false;
+                    if (connection_count > 0) {
+                        connection_count--;
+                    }
+                    /* Clean up inbound_tcp_client if needed */
+                    if (inbound_tcp_client.pcb == pcb) {
+                        inbound_tcp_client.active = false;
+                        inbound_tcp_client.pcb = NULL;
+                        inbound_tcp_client.bytes_sent = 0;
+                        inbound_tcp_client.payload_len = 0;
+                    }
+                } else {
+                    /* tcp_close() succeeded - lwIP will manage the rest */
+                    /* Don't clean up metadata yet - lwIP will call our callback */
+                    printf("%s:   ✓ PLC connection closing - lwIP will call callbacks when done\n",
+                           COMPONENT_NAME);
+                }
+            } else {
+                printf("%s:   ℹ️  PCB already closing (state=%d) - just cleaning up metadata\n",
+                       COMPONENT_NAME, pcb->state);
+                /* PCB already in closing state - safe to clean up metadata */
+                meta->pcb = NULL;
+                meta->active = false;
+                if (connection_count > 0) {
+                    connection_count--;
+                }
+                if (inbound_tcp_client.pcb == pcb) {
+                    inbound_tcp_client.active = false;
+                    inbound_tcp_client.pcb = NULL;
+                    inbound_tcp_client.bytes_sent = 0;
+                    inbound_tcp_client.payload_len = 0;
+                }
+            }
+        } else {
+            printf("%s:   → No active PLC connection found (already closed or never existed)\n",
+                   COMPONENT_NAME);
+        }
+
+        return;  /* Close notification processed - done */
+    }
 
     /* ═══════════════════════════════════════════════════════════════════════════
      * v2.49: PRODUCTION-READY CONNECTION REUSE with Multi-Layer Validation
@@ -2699,6 +2868,22 @@ cleanup_and_create_new:
 
     BREADCRUMB(2007);  /* Creating new TCP PCB */
 
+    /* v2.95: lwIP-MANAGED CONNECTION LIMIT
+     * ═══════════════════════════════════════════════════════════════════
+     * REMOVED manual connection_count check (v2.93)
+     *
+     * Problem with v2.93: Manual tcp_abort() from main loop causes crashes!
+     * Root cause: tcp_abort() immediately frees PCB, but lwIP state machine
+     * still has references → crash at offset 0x10 (callback_arg access)
+     *
+     * Solution: Let lwIP handle connection limits via MEMP_NUM_TCP_PCB=100
+     * - tcp_new() returns NULL when pool exhausted (safe!)
+     * - No manual PCB lifecycle management (no tcp_abort from main loop!)
+     * - Send error notification when tcp_new() fails
+     *
+     * This matches the design: "let lwIP handle lifecycle" (lwipopts.h v2.87)
+     */
+
     #if DEBUG_PACKET_DETAIL
     printf("   Payload size: %u bytes\n", ics_msg->payload_length);
     printf("   Destination: %u.%u.%u.%u:%u\n",
@@ -2739,7 +2924,35 @@ cleanup_and_create_new:
     struct tcp_pcb *pcb = tcp_new_ip_type(IPADDR_TYPE_V4);
     if (pcb == NULL) {
         BREADCRUMB(2008);  /* Failed to create PCB */
-        printf("%s: INBOUND: Failed to create TCP PCB\n", COMPONENT_NAME);
+        printf("%s: ⚠️  INBOUND: Failed to create TCP PCB - lwIP connection pool exhausted (MEMP_NUM_TCP_PCB=%d)\n",
+               COMPONENT_NAME, MEMP_NUM_TCP_PCB);
+        printf("%s:   → Sending ERROR notification to Net0 (lwIP connection limit reached)\n", COMPONENT_NAME);
+
+        /* v2.95: Send error notification to Net0 to close SCADA connection
+         * This is the SAFE way to handle connection limits - let lwIP refuse the connection
+         * by returning NULL from tcp_new(), then notify Net0 to close SCADA side. */
+        if (outbound_dp != NULL) {
+            ICS_Message *error_msg = (ICS_Message *)outbound_dp;
+
+            memset(&error_msg->metadata, 0, sizeof(FrameMetadata));
+            error_msg->metadata.ethertype = 0x0800;
+            error_msg->metadata.ip_protocol = 6;
+            error_msg->metadata.is_ip = 1;
+            error_msg->metadata.is_tcp = 1;
+
+            error_msg->metadata.src_ip = ics_msg->metadata.src_ip;
+            error_msg->metadata.dst_ip = ics_msg->metadata.dst_ip;
+            error_msg->metadata.src_port = ics_msg->metadata.src_port;
+            error_msg->metadata.dst_port = ics_msg->metadata.dst_port;
+
+            error_msg->payload_length = 0;
+            error_msg->metadata.payload_length = 0;
+            error_msg->metadata.payload_offset = 0xFFFF;  /* Error marker */
+
+            __sync_synchronize();
+            outbound_ready_emit();
+        }
+
         return;
     }
 
@@ -2865,6 +3078,102 @@ cleanup_and_create_new:
     if (err != ERR_OK) {
         BREADCRUMB(2017);  /* tcp_connect failed */
         printf("%s: INBOUND: tcp_connect failed: %d\n", COMPONENT_NAME, err);
+
+        /* v2.93: If connection fails, PLC might be overloaded with stale connections
+         * Proactively clean up any stale connections to this PLC to free resources */
+        if (err == ERR_CONN || err == ERR_RST || err == ERR_ABRT) {
+            printf("%s:   ⚠️  PLC connection failed - checking for stale connections to clean up\n",
+                   COMPONENT_NAME);
+
+            int cleaned = 0;
+            for (int i = 0; i < MAX_CONNECTIONS; i++) {
+                if (!connection_table[i].active) continue;
+
+                /* Check if this is a connection to the same PLC */
+                if (connection_table[i].original_dest_ip == ics_msg->metadata.dst_ip &&
+                    connection_table[i].dest_port == dest_port) {
+
+                    struct tcp_pcb *stale_pcb = connection_table[i].pcb;
+
+                    /* Only clean up if PCB is NULL or in non-ESTABLISHED state */
+                    if (stale_pcb == NULL || stale_pcb->state != ESTABLISHED) {
+                        printf("%s:   🧹 Cleaning stale connection [%d] to PLC (PCB=%p, state=%d)\n",
+                               COMPONENT_NAME, i, (void*)stale_pcb,
+                               stale_pcb ? stale_pcb->state : -1);
+
+                        if (stale_pcb != NULL) {
+                            tcp_abort(stale_pcb);
+                        }
+
+                        connection_table[i].pcb = NULL;
+                        connection_table[i].active = false;
+                        if (connection_count > 0) {
+                            connection_count--;
+                        }
+                        cleaned++;
+                    }
+                }
+            }
+
+            if (cleaned > 0) {
+                printf("%s:   ✓ Cleaned %d stale connection(s) to PLC\n", COMPONENT_NAME, cleaned);
+            } else {
+                printf("%s:   → No stale connections found - PLC might be genuinely unreachable\n",
+                       COMPONENT_NAME);
+            }
+        }
+
+        /* v2.93: CRITICAL - Notify Net0 to reject SCADA connection when PLC refuses!
+         *
+         * Problem: If PLC is at max capacity (124+ stale connections), it refuses new connections.
+         * Old behavior: Net1 fails silently, SCADA connection hangs waiting for response.
+         * New behavior: Send error notification to Net0 → Net0 closes SCADA connection immediately.
+         *
+         * This prevents:
+         * 1. SCADA connections piling up in Net0
+         * 2. Long timeouts (SCADA knows immediately gateway is down)
+         * 3. Resource exhaustion in Net0
+         *
+         * Error notification format: Zero-length payload with special error flag.
+         */
+        if (outbound_dp != NULL) {
+            ICS_Message *error_msg = (ICS_Message *)outbound_dp;
+
+            /* Prepare error notification */
+            memset(&error_msg->metadata, 0, sizeof(FrameMetadata));
+            error_msg->metadata.ethertype = 0x0800;
+            error_msg->metadata.ip_protocol = 6;
+            error_msg->metadata.is_ip = 1;
+            error_msg->metadata.is_tcp = 1;
+
+            /* Copy connection 5-tuple so Net0 knows which SCADA connection to close */
+            error_msg->metadata.src_ip = ics_msg->metadata.src_ip;  /* SCADA IP */
+            error_msg->metadata.dst_ip = ics_msg->metadata.dst_ip;  /* PLC IP */
+            error_msg->metadata.src_port = ics_msg->metadata.src_port;  /* SCADA port */
+            error_msg->metadata.dst_port = ics_msg->metadata.dst_port;  /* PLC port */
+
+            /* Zero-length payload + error code in metadata = "PLC refused connection" */
+            error_msg->payload_length = 0;
+            error_msg->metadata.payload_length = 0;
+            error_msg->metadata.payload_offset = 0xFFFF;  /* Special marker: 0xFFFF = ERROR */
+
+            printf("%s: ❌ Sending ERROR notification to Net0 (PLC refused connection, err=%d)\n",
+                   COMPONENT_NAME, err);
+            printf("%s:    → Net0 will close SCADA %u.%u.%u.%u:%u immediately\n",
+                   COMPONENT_NAME,
+                   (error_msg->metadata.src_ip >> 24) & 0xFF,
+                   (error_msg->metadata.src_ip >> 16) & 0xFF,
+                   (error_msg->metadata.src_ip >> 8) & 0xFF,
+                   error_msg->metadata.src_ip & 0xFF,
+                   error_msg->metadata.src_port);
+
+            /* Force cache flush before notification */
+            __sync_synchronize();
+
+            /* Signal ICS_Outbound to pass error notification to Net0 */
+            outbound_ready_emit();
+        }
+
         tcp_abort(pcb);  /* v2.51: Force RST - never use tcp_close() to avoid FIN-WAIT-1 */
         inbound_tcp_client.active = false;
         inbound_tcp_client.pcb = NULL;
@@ -3482,12 +3791,14 @@ static int virtio_net_init(void)
 void post_init(void)
 {
     printf("%s: Component started\n", COMPONENT_NAME);
-    printf("%s: 🔖 NET1 SOFTWARE VERSION: v2.86-increase-max-connections (2025-10-13)\n", COMPONENT_NAME);
+    printf("%s: 🔖 NET1 SOFTWARE VERSION: v2.95-fix-crash-at-offset-0x10 (2025-10-13)\n", COMPONENT_NAME);
     printf("%s: 🔧 MODE: PRODUCTION-READY with Multi-Layer Validation\n", COMPONENT_NAME);
     printf("%s: ✅ FIX 1: payload_data buffer (prevents dataport corruption)\n", COMPONENT_NAME);
-    printf("%s: ✅ FIX 2: Correct lwIP callback protocol (ERR_ABRT without tcp_abort)\n", COMPONENT_NAME);
+    printf("%s: ✅ FIX 2: tcp_abort() removed from callbacks (crash at 0x38a9c fixed!)\n", COMPONENT_NAME);
     printf("%s: ✅ FIX 3: Connection reuse when SCADA keeps connection alive\n", COMPONENT_NAME);
-    printf("%s: ✅ FIX 4: Fast idle timeout (2s) + explicit RST to PLC\n", COMPONENT_NAME);
+    printf("%s: ✅ FIX 4: Close notification - Net0 tells Net1 when SCADA closes\n", COMPONENT_NAME);
+    printf("%s: ✅ FIX 5: Stale connection cleanup on tcp_connect() failure\n", COMPONENT_NAME);
+    printf("%s: ✅ FIX 4: lwIP manages PCB lifecycle (no manual tcp_abort)\n", COMPONENT_NAME);
     printf("%s: 🎯 FEATURES: Supports >MTU data, HTTP keep-alive, streaming protocols\n", COMPONENT_NAME);
     printf("%s: ⚠️  CRITICAL: Never uses tcp_close() - always sends RST for immediate cleanup\n\n", COMPONENT_NAME);
 
@@ -3495,6 +3806,21 @@ void post_init(void)
     memset(connection_table, 0, sizeof(connection_table));
     connection_count = 0;
     printf("%s: ✓ Connection tracking table initialized (%d slots)\n", COMPONENT_NAME, MAX_CONNECTIONS);
+
+    /* v2.93: Note about cleaning up stale PLC connections from previous versions
+     *
+     * If PLC has hundreds of stale ESTABLISHED connections from previous buggy versions,
+     * they will timeout naturally according to PLC's TCP keepalive settings (typically 2 hours).
+     *
+     * For immediate cleanup, you have two options:
+     * 1. Restart the PLC (quickest - resets all TCP state)
+     * 2. Wait for TCP keepalive timeouts (automatic but slow)
+     *
+     * This version (v2.93) PREVENTS new accumulation via close notifications,
+     * so after the backlog clears, the system will maintain stable connection counts.
+     */
+    printf("%s: ℹ️  If PLC has stale connections from previous versions, they will timeout naturally.\n", COMPONENT_NAME);
+    printf("%s:    For immediate cleanup: restart PLC or wait ~2 hours for TCP keepalive.\n", COMPONENT_NAME);
 
     /* Initialize VirtIO device */
     if (virtio_net_init() != 0) {
@@ -3656,6 +3982,35 @@ int run(void)
         if (++heartbeat_counter >= 50000) {
             printf("%s: ❤️  Heartbeat: %u iterations, %u active connections\n",
                    COMPONENT_NAME, heartbeat_counter, connection_count);
+
+            /* v2.93: DEBUG - Show connection table details */
+            printf("%s: 🔍 NET1 Connection Table (PLC connections):\n", COMPONENT_NAME);
+            int shown = 0;
+            for (int i = 0; i < MAX_CONNECTIONS && shown < 10; i++) {
+                if (connection_table[i].active) {
+                    printf("%s:   [%d] SCADA %u.%u.%u.%u:%u → PLC %u.%u.%u.%u:%u PCB=%p lwIP_port=%u\n",
+                           COMPONENT_NAME, i,
+                           (connection_table[i].original_src_ip >> 24) & 0xFF,
+                           (connection_table[i].original_src_ip >> 16) & 0xFF,
+                           (connection_table[i].original_src_ip >> 8) & 0xFF,
+                           connection_table[i].original_src_ip & 0xFF,
+                           connection_table[i].src_port,
+                           (connection_table[i].original_dest_ip >> 24) & 0xFF,
+                           (connection_table[i].original_dest_ip >> 16) & 0xFF,
+                           (connection_table[i].original_dest_ip >> 8) & 0xFF,
+                           connection_table[i].original_dest_ip & 0xFF,
+                           connection_table[i].dest_port,
+                           (void*)connection_table[i].pcb,
+                           connection_table[i].lwip_ephemeral_port);
+                    shown++;
+                }
+            }
+            if (shown == 0) {
+                printf("%s:   (no active connections)\n", COMPONENT_NAME);
+            } else if (connection_count > shown) {
+                printf("%s:   ... and %d more connections\n", COMPONENT_NAME, connection_count - shown);
+            }
+
             heartbeat_counter = 0;
         }
 

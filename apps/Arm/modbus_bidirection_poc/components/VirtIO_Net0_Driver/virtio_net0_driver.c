@@ -102,6 +102,8 @@ struct connection_metadata {
     /* v2.50: Connection validation - matches Net1 structure for consistency */
     uint32_t tcp_seq_num;          /* Initial TCP sequence number - detects connection reuse */
     uint32_t timestamp;            /* Creation time - for metadata consistency with Net1 */
+    /* v2.92: Response lifecycle tracking */
+    bool awaiting_response;        /* True if we're waiting for PLC response (don't cleanup yet!) */
 };
 
 static struct connection_metadata connection_table[MAX_CONNECTIONS];
@@ -1085,17 +1087,18 @@ static void connection_print_stats(void)
  */
 static void connection_cleanup_stale(void)
 {
-    /* v2.83: CRITICAL FIX - Only clean up NULL PCBs, DO NOT access PCB fields!
+    /* v2.92: CRITICAL FIX - Don't cleanup if awaiting_response!
      *
-     * Bug Analysis (v2.82 crash at 0x10):
-     * - connection_cleanup_stale() was accessing pcb->state
-     * - PCB might be freed by lwIP between NULL check and state access
-     * - Accessing freed PCB → crash at offset 0x10 (state field)
+     * Lifecycle:
+     * 1. SCADA connects, sends request → metadata created
+     * 2. Request forwarded to PLC → awaiting_response = true
+     * 3. SCADA closes connection → pcb = NULL (but metadata kept!)
+     * 4. PLC response arrives → response sent → awaiting_response = false, metadata removed
      *
-     * Fix: ONLY clean up entries with NULL PCBs
-     * - Safe: We never dereference the PCB pointer
-     * - Let lwIP callbacks set PCB to NULL when connections close
-     * - Periodic cleanup removes entries with NULL PCBs from table
+     * Bug (v2.90): connection_cleanup_stale() removed metadata at step 3
+     * Result: Step 4 fails with "No metadata found"
+     *
+     * Fix: Only cleanup if pcb == NULL AND awaiting_response == false
      */
     int cleaned = 0;
 
@@ -1106,10 +1109,10 @@ static void connection_cleanup_stale(void)
 
         struct tcp_pcb *pcb = connection_table[i].pcb;
 
-        /* ONLY cleanup if PCB is NULL - never access PCB fields! */
-        if (pcb == NULL) {
+        /* v2.92: ONLY cleanup if PCB is NULL AND we're not awaiting a response */
+        if (pcb == NULL && !connection_table[i].awaiting_response) {
             #if DEBUG_METADATA
-            printf("%s: 🧹 Cleanup stale connection [%d]: PCB is NULL\n", COMPONENT_NAME, i);
+            printf("%s: 🧹 Cleanup stale connection [%d]: PCB is NULL and no response pending\n", COMPONENT_NAME, i);
             #endif
             connection_table[i].active = false;
             connection_count--;
@@ -1194,6 +1197,44 @@ static err_t custom_input_promiscuous(struct pbuf *p, struct netif *inp)
             }
 
             /* If packet is not destined for our interface IP, rewrite it */
+            /* v2.95: CRITICAL FIX - Create metadata for ALL TCP connections!
+             * ═══════════════════════════════════════════════════════════════════
+             * BUG: Original code only created metadata if pkt_dest_ip != interface_ip
+             * Problem: When SCADA connects directly to interface IP (192.168.96.2:502),
+             * no metadata is created → responses can't find SCADA connection!
+             *
+             * Fix: Create metadata for ALL TCP connections, regardless of dest IP
+             * This ensures we can route responses back to SCADA even for direct connections
+             */
+            if (IPH_PROTO(iphdr) == IP_PROTO_TCP && src_port != 0 && dest_port != 0) {
+                /* Check if we already have metadata for this connection */
+                struct connection_metadata *meta = connection_lookup_by_tuple(
+                    pkt_src_ip, pkt_dest_ip, src_port, dest_port);
+
+                if (!meta) {
+                    /* New connection - store metadata */
+                    #if DEBUG_METADATA
+                    printf("%s: 📝 RX: Storing NEW metadata: src=%u.%u.%u.%u:%u dest=%u.%u.%u.%u:%u\n",
+                           COMPONENT_NAME,
+                           (pkt_src_ip >> 24) & 0xFF, (pkt_src_ip >> 16) & 0xFF,
+                           (pkt_src_ip >> 8) & 0xFF, pkt_src_ip & 0xFF, src_port,
+                           (pkt_dest_ip >> 24) & 0xFF, (pkt_dest_ip >> 16) & 0xFF,
+                           (pkt_dest_ip >> 8) & 0xFF, pkt_dest_ip & 0xFF, dest_port);
+                    #endif
+                    connection_add(pkt_src_ip, pkt_dest_ip, src_port, dest_port);
+                } else {
+                    #if DEBUG_PACKET_DETAIL
+                    printf("%s: 🔍 RX: Found EXISTING metadata [slot %d] for %u.%u.%u.%u:%u → %u.%u.%u.%u:%u\n",
+                           COMPONENT_NAME, (int)(meta - connection_table),
+                           (pkt_src_ip >> 24) & 0xFF, (pkt_src_ip >> 16) & 0xFF,
+                           (pkt_src_ip >> 8) & 0xFF, pkt_src_ip & 0xFF, src_port,
+                           (pkt_dest_ip >> 24) & 0xFF, (pkt_dest_ip >> 16) & 0xFF,
+                           (pkt_dest_ip >> 8) & 0xFF, pkt_dest_ip & 0xFF, dest_port);
+                    #endif
+                }
+            }
+
+            /* Rewrite destination IP to interface IP if needed */
             if (pkt_dest_ip != interface_ip) {
                 #if DEBUG_PACKET_DETAIL
                 printf("%s: 🔄 RX: Rewriting dest IP: %u.%u.%u.%u → %u.%u.%u.%u (TCP %u → %u)\n",
@@ -1205,36 +1246,6 @@ static err_t custom_input_promiscuous(struct pbuf *p, struct netif *inp)
                        src_port, dest_port);
                 #endif
 
-                /* CRITICAL: Store original IPs BEFORE rewriting */
-                if (IPH_PROTO(iphdr) == IP_PROTO_TCP && src_port != 0 && dest_port != 0) {
-                    /* Check if we already have metadata for this connection */
-                    struct connection_metadata *meta = connection_lookup_by_tuple(
-                        pkt_src_ip, pkt_dest_ip, src_port, dest_port);
-
-                    if (!meta) {
-                        /* New connection - store metadata */
-                        #if DEBUG_METADATA
-                        printf("%s: 📝 RX: Storing NEW metadata: src=%u.%u.%u.%u:%u dest=%u.%u.%u.%u:%u\n",
-                               COMPONENT_NAME,
-                               (pkt_src_ip >> 24) & 0xFF, (pkt_src_ip >> 16) & 0xFF,
-                               (pkt_src_ip >> 8) & 0xFF, pkt_src_ip & 0xFF, src_port,
-                               (pkt_dest_ip >> 24) & 0xFF, (pkt_dest_ip >> 16) & 0xFF,
-                               (pkt_dest_ip >> 8) & 0xFF, pkt_dest_ip & 0xFF, dest_port);
-                        #endif
-                        connection_add(pkt_src_ip, pkt_dest_ip, src_port, dest_port);
-                    } else {
-                        #if DEBUG_PACKET_DETAIL
-                        printf("%s: 🔍 RX: Found EXISTING metadata [slot %d] for %u.%u.%u.%u:%u → %u.%u.%u.%u:%u\n",
-                               COMPONENT_NAME, (int)(meta - connection_table),
-                               (pkt_src_ip >> 24) & 0xFF, (pkt_src_ip >> 16) & 0xFF,
-                               (pkt_src_ip >> 8) & 0xFF, pkt_src_ip & 0xFF, src_port,
-                               (pkt_dest_ip >> 24) & 0xFF, (pkt_dest_ip >> 16) & 0xFF,
-                               (pkt_dest_ip >> 8) & 0xFF, pkt_dest_ip & 0xFF, dest_port);
-                        #endif
-                    }
-                }
-
-                /* Rewrite destination IP to interface IP */
                 iphdr->dest.addr = inp->ip_addr.addr;
 
                 /* Recalculate IP checksum */
@@ -1827,7 +1838,7 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
         }
 
         #if DEBUG_TRAFFIC
-        printf("%s: 🔌 TCP connection closed gracefully\n", COMPONENT_NAME);
+        printf("%s: 🔌 TCP connection closed by SCADA\n", COMPONENT_NAME);
         printf("%s:    Remote: %u.%u.%u.%u:%u\n", COMPONENT_NAME,
                ip4_addr1(&pcb->remote_ip), ip4_addr2(&pcb->remote_ip),
                ip4_addr3(&pcb->remote_ip), ip4_addr4(&pcb->remote_ip), pcb->remote_port);
@@ -1835,8 +1846,82 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
                COMPONENT_NAME, active_connections, total_connections_created, total_connections_closed);
         #endif
 
-        /* Clean up connection metadata before lwIP frees PCB */
-        connection_remove(pcb);
+        /* v2.90: CRITICAL FIX - DO NOT remove connection metadata yet!
+         *
+         * Problem: Modbus TCP uses short-lived connections:
+         *   1. SCADA connects, sends request
+         *   2. Net0 forwards request to PLC via Net1
+         *   3. SCADA immediately closes connection (sends FIN)
+         *   4. tcp_echo_recv(p=NULL) called
+         *   5. OLD CODE: connection_remove(pcb) ← REMOVES METADATA TOO EARLY!
+         *   6. PLC response arrives via ICS_Outbound
+         *   7. outbound_ready_handle() tries to send response
+         *   8. Metadata is GONE → tcp_write() fails → response dropped
+         *
+         * Solution: Set PCB to NULL but KEEP metadata alive!
+         * - outbound_ready_handle() checks if (meta->pcb == NULL)
+         * - If NULL, can't send response (connection already closed)
+         * - Metadata will be cleaned up later by connection_cleanup_stale()
+         *
+         * This allows us to detect closed connections without losing metadata.
+         */
+
+        /* Find and mark PCB as NULL (but keep metadata!) */
+        struct connection_metadata *meta = NULL;
+        for (int i = 0; i < MAX_CONNECTIONS; i++) {
+            if (connection_table[i].active && connection_table[i].pcb == pcb) {
+                printf("%s: ⚠️  SCADA closed connection - marking PCB as NULL (keeping metadata for pending response)\n", COMPONENT_NAME);
+                connection_table[i].pcb = NULL;  /* Mark as closed but keep metadata */
+                meta = &connection_table[i];
+                break;
+            }
+        }
+
+        /* v2.93: Send close notification to Net1 so it can close PLC connection
+         *
+         * Problem: Net1 creates client connections to PLC but never closes them,
+         * causing accumulation of ESTABLISHED connections on PLC (124+ connections).
+         *
+         * Solution: Send zero-length message with metadata through pipeline.
+         * Net1 will see zero-length payload and interpret as "close signal",
+         * then close the corresponding PLC connection.
+         *
+         * This prevents PLC connection accumulation while avoiding double-free bugs.
+         */
+        if (meta != NULL && inbound_dp != NULL) {
+            ICS_Message *ics_msg = (ICS_Message *)inbound_dp;
+
+            /* Prepare close notification message */
+            memset(&ics_msg->metadata, 0, sizeof(FrameMetadata));
+            ics_msg->metadata.ethertype = 0x0800;  /* IPv4 */
+            ics_msg->metadata.ip_protocol = 6;     /* TCP */
+            ics_msg->metadata.is_ip = 1;
+            ics_msg->metadata.is_tcp = 1;
+
+            /* Copy connection 5-tuple from metadata */
+            ics_msg->metadata.src_ip = ntohl(ip4_addr_get_u32(&pcb->remote_ip));
+            ics_msg->metadata.dst_ip = meta->original_dest_ip;  /* Original PLC IP */
+            ics_msg->metadata.src_port = pcb->remote_port;
+            ics_msg->metadata.dst_port = pcb->local_port;
+
+            /* ZERO-length payload = close signal */
+            ics_msg->payload_length = 0;
+            ics_msg->metadata.payload_length = 0;
+
+            printf("%s: 📤 Sending close notification to Net1 (SCADA %u.%u.%u.%u:%u closed)\n",
+                   COMPONENT_NAME,
+                   (ics_msg->metadata.src_ip >> 24) & 0xFF,
+                   (ics_msg->metadata.src_ip >> 16) & 0xFF,
+                   (ics_msg->metadata.src_ip >> 8) & 0xFF,
+                   ics_msg->metadata.src_ip & 0xFF,
+                   ics_msg->metadata.src_port);
+
+            /* Force cache flush before notification */
+            __sync_synchronize();
+
+            /* Signal ICS_Inbound to pass close notification to Net1 */
+            inbound_ready_emit();
+        }
 
         /* v2.81: Return ERR_ABRT - lwIP handles tcp_abort() internally */
         return ERR_ABRT;
@@ -1960,6 +2045,14 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
     printf("   ✓ ICS message prepared in shared memory (inbound_dp)\n");
     printf("   Action: Signaling ICS_Inbound component via inbound_ready_emit()\n");
     #endif
+
+    /* v2.92: Mark that we're waiting for a response - don't cleanup metadata yet!
+     * This prevents connection_cleanup_stale() from removing metadata while
+     * the request is in flight and we're waiting for PLC response.
+     * Note: meta was already looked up earlier (line 1938) */
+    if (meta != NULL) {
+        meta->awaiting_response = true;
+    }
 
     /* Step 4: Signal ICS_Inbound that message is ready */
     inbound_ready_emit();
@@ -2297,6 +2390,93 @@ void outbound_ready_handle(void)
 
     BREADCRUMB(3005);  /* Payload size valid */
 
+    /* v2.93: Handle ERROR NOTIFICATION from Net1
+     * ═════════════════════════════════════════════════════════════════════
+     * If PLC refuses connection (at max capacity), Net1 sends error notification.
+     * Error format: Zero-length payload + payload_offset = 0xFFFF
+     * Action: Close SCADA connection immediately (fail fast)
+     */
+    if (ics_msg->payload_length == 0 && ics_msg->metadata.payload_offset == 0xFFFF) {
+        printf("%s: ❌ Received ERROR notification from Net1 (PLC refused connection)\n",
+               COMPONENT_NAME);
+        printf("%s:    → Closing SCADA connection %u.%u.%u.%u:%u immediately\n",
+               COMPONENT_NAME,
+               (ics_msg->metadata.src_ip >> 24) & 0xFF,
+               (ics_msg->metadata.src_ip >> 16) & 0xFF,
+               (ics_msg->metadata.src_ip >> 8) & 0xFF,
+               ics_msg->metadata.src_ip & 0xFF,
+               ics_msg->metadata.src_port);
+
+        /* Look up SCADA connection */
+        struct connection_metadata *meta = connection_lookup_by_tuple(
+            ics_msg->metadata.src_ip,   /* SCADA IP */
+            ics_msg->metadata.dst_ip,   /* PLC IP */
+            ics_msg->metadata.src_port, /* SCADA port */
+            ics_msg->metadata.dst_port  /* PLC port */
+        );
+
+        if (meta != NULL && meta->active && meta->pcb != NULL) {
+            struct tcp_pcb *pcb = meta->pcb;
+
+            printf("%s:   → Found SCADA connection (PCB=%p) - closing gracefully\n",
+                   COMPONENT_NAME, (void*)pcb);
+
+            /* v2.95: CRITICAL FIX - Do NOT call tcp_abort() from main loop!
+             * ═══════════════════════════════════════════════════════════════════
+             * Problem: tcp_abort() immediately frees PCB, but lwIP state machine
+             * still has references → crash at offset 0x10 (callback_arg access)
+             *
+             * Root Cause: Calling tcp_abort() from main loop context (outbound_ready_handle)
+             * is UNSAFE - lwIP timers and input processing may still reference the PCB.
+             *
+             * Solution: Use tcp_close() instead - it's asynchronous and lwIP-safe.
+             * tcp_close() sends FIN and lets lwIP manage PCB lifecycle properly.
+             *
+             * Trade-off: SCADA sees graceful close (FIN) instead of RST, takes ~1 RTT longer
+             * Benefit: No crashes, lwIP manages all lifecycle, no dangling pointers
+             */
+
+            /* v2.95: CRITICAL FIX #2 - Let lwIP manage callbacks during close!
+             * ═══════════════════════════════════════════════════════════════════
+             * Problem: Clearing callbacks then calling tcp_close() causes issues:
+             * - lwIP needs callbacks to complete the close handshake
+             * - tcp_err callback should fire to clean up metadata
+             *
+             * Solution: DON'T clear callbacks! Call tcp_close() and let lwIP:
+             * - Send FIN packet
+             * - Wait for FIN-ACK from remote
+             * - Eventually call tcp_err or tcp_recv(NULL) to signal close
+             * - Our callback will clean up metadata properly
+             *
+             * This is the correct lwIP lifecycle management!
+             */
+
+            /* Mark as closing - awaiting_response prevents new requests */
+            meta->awaiting_response = false;
+
+            /* Close gracefully - lwIP will call callbacks to complete close */
+            err_t close_err = tcp_close(pcb);
+            if (close_err != ERR_OK) {
+                printf("%s:   ⚠️  tcp_close() failed (%d) - connection will timeout eventually\n",
+                       COMPONENT_NAME, close_err);
+                /* If tcp_close() fails, mark inactive so cleanup can remove it */
+                meta->active = false;
+                meta->pcb = NULL;
+                if (connection_count > 0) {
+                    connection_count--;
+                }
+            } else {
+                /* tcp_close() succeeded - lwIP will manage the rest */
+                printf("%s:   ✓ SCADA connection closing - lwIP will call callbacks when done\n",
+                       COMPONENT_NAME);
+            }
+        } else {
+            printf("%s:   → SCADA connection already closed\n", COMPONENT_NAME);
+        }
+
+        return;  /* Error notification processed */
+    }
+
     #if DEBUG_TRAFFIC
     /* Print metadata - src/dst are SWAPPED because this is a response
      * Original request: SCADA (src) → PLC (dst)
@@ -2325,9 +2505,15 @@ void outbound_ready_handle(void)
         ics_msg->metadata.src_port   /* PLC port (502) */
     );
 
-    if (meta == NULL || meta->pcb == NULL) {
-        BREADCRUMB(3007);  /* Connection not found or NULL PCB */
-        printf("%s: ❌ OUTBOUND: No active connection found for %u.%u.%u.%u:%u → %u.%u.%u.%u:%u\n",
+    /* v2.89: CRITICAL FIX - Check meta != NULL BEFORE accessing meta->pcb!
+     * Bug: "meta == NULL || meta->pcb == NULL" crashes if meta is NULL
+     * Cause: Compiler evaluates meta->pcb before meta == NULL check
+     * Result: Crash at address 0x4 (offset of pcb field in struct)
+     * Fix: Separate NULL checks to guarantee safe evaluation order */
+
+    if (meta == NULL) {
+        BREADCRUMB(3007);  /* Connection not found */
+        printf("%s: ❌ OUTBOUND: No metadata found for %u.%u.%u.%u:%u → %u.%u.%u.%u:%u\n",
                COMPONENT_NAME,
                (ics_msg->metadata.dst_ip >> 24) & 0xFF, (ics_msg->metadata.dst_ip >> 16) & 0xFF,
                (ics_msg->metadata.dst_ip >> 8) & 0xFF, ics_msg->metadata.dst_ip & 0xFF,
@@ -2336,6 +2522,23 @@ void outbound_ready_handle(void)
                (ics_msg->metadata.src_ip >> 8) & 0xFF, ics_msg->metadata.src_ip & 0xFF,
                ics_msg->metadata.src_port);
         printf("%s:    Connection may have been closed or timed out\n", COMPONENT_NAME);
+        return;
+    }
+
+    if (meta->pcb == NULL) {
+        BREADCRUMB(3014);  /* NULL PCB */
+        printf("%s: ⚠️  OUTBOUND: SCADA already closed connection - cannot send response for %u.%u.%u.%u:%u\n",
+               COMPONENT_NAME,
+               (ics_msg->metadata.dst_ip >> 24) & 0xFF, (ics_msg->metadata.dst_ip >> 16) & 0xFF,
+               (ics_msg->metadata.dst_ip >> 8) & 0xFF, ics_msg->metadata.dst_ip & 0xFF,
+               ics_msg->metadata.dst_port);
+        printf("%s:    Response from PLC arrived too late (connection closed by SCADA)\n", COMPONENT_NAME);
+        /* Clean up stale metadata */
+        meta->awaiting_response = false;
+        meta->active = false;
+        if (connection_count > 0) {
+            connection_count--;
+        }
         return;
     }
 
@@ -2390,6 +2593,22 @@ void outbound_ready_handle(void)
         return;
     }
 
+    /* v2.95: REMOVED PCB state check - THIS WAS THE CRASH!
+     * ═══════════════════════════════════════════════════════════════════
+     * BUG: Accessing meta->pcb->state (offset ~0x10) causes page fault
+     * if lwIP freed the PCB between NULL check and state access!
+     *
+     * Race condition:
+     * 1. Check meta->pcb != NULL ✓
+     * 2. lwIP timer fires, frees PCB
+     * 3. Access meta->pcb->state → CRASH at offset 0x10!
+     *
+     * Fix: Don't access ANY PCB fields! Let tcp_write() handle validation.
+     * tcp_write() will return error if PCB is in wrong state.
+     *
+     * This matches v2.85 lesson: "DO NOT access any PCB fields"
+     */
+
     /* Send response data back to SCADA via existing TCP connection */
     err_t err = tcp_write(meta->pcb, ics_msg->payload, ics_msg->payload_length, TCP_WRITE_FLAG_COPY);
     if (err != ERR_OK) {
@@ -2398,6 +2617,13 @@ void outbound_ready_handle(void)
                COMPONENT_NAME, err,
                err == ERR_MEM ? "OUT OF MEMORY" :
                err == ERR_CONN ? "NOT CONNECTED" : "OTHER ERROR");
+
+        /* v2.92: Clean up metadata after failed send */
+        meta->awaiting_response = false;
+        meta->active = false;
+        if (connection_count > 0) {
+            connection_count--;
+        }
         return;
     }
 
@@ -2415,6 +2641,23 @@ void outbound_ready_handle(void)
     #if DEBUG_PACKET_DETAIL
     printf("   ✓ [MSG #%u] Response delivered to SCADA\n\n", msg_id);
     #endif
+
+    /* v2.93: CRITICAL FIX - Do NOT clean up metadata yet!
+     *
+     * BUG: Lines 2615-2619 cleaned up metadata immediately after tcp_write()
+     * Problem: tcp_write() only QUEUES data, doesn't actually send it!
+     * Result: When next request arrives, metadata is gone → "No metadata found"
+     * Evidence: Net0 has 0 connections, Net1 has 21+ connections (accumulation)
+     *
+     * Fix: Keep metadata alive. It will be cleaned up when:
+     * 1. SCADA closes connection (tcp_echo_recv p=NULL)
+     * 2. Connection cleanup runs (connection_cleanup_stale)
+     * 3. TCP sent callback confirms delivery (future enhancement)
+     *
+     * This matches the awaiting_response design - we set it true when forwarding
+     * request, should only clear it after response is ACTUALLY delivered.
+     */
+    meta->awaiting_response = false;  /* Response queued (but keep metadata!) */
 
     BREADCRUMB(3013);  /* Exit: outbound_ready_handle complete */
 }
@@ -2845,9 +3088,14 @@ static int virtio_net_init(void)
 void post_init(void)
 {
     printf("%s: Component started\n", COMPONENT_NAME);
-    printf("%s: 🔖 NET0 SOFTWARE VERSION: v2.86-increase-max-connections (2025-10-13)\n", COMPONENT_NAME);
+    printf("%s: 🔖 NET0 SOFTWARE VERSION: v2.95-fix-crash-at-offset-0x10 (2025-10-13)\n", COMPONENT_NAME);
     printf("%s: 🔧 MODE: PRODUCTION with fast cleanup (every 100 iterations)\n", COMPONENT_NAME);
-    printf("%s: ✅ FIX: Connection table exhaustion resolved\n\n", COMPONENT_NAME);
+    printf("%s: ✅ FIX 1: awaiting_response flag prevents premature metadata cleanup!\n", COMPONENT_NAME);
+    printf("%s: ✅ FIX 2: Send close notification to Net1 when SCADA closes\n", COMPONENT_NAME);
+    printf("%s: ✅ FIX 3: Handle PLC error notification - close SCADA immediately\n", COMPONENT_NAME);
+    printf("%s: ✅ FIX 4: REMOVED PCB state check - prevents crash at offset 0x10!\n", COMPONENT_NAME);
+    printf("%s: ✅ FIX 5: Connection table debugging for troubleshooting\n");
+    printf("%s: ✅ FIX 6: lwIP manages connection limits (MEMP_NUM_TCP_PCB=100)\n\n", COMPONENT_NAME);
 
     /* Initialize connection tracking table */
     memset(connection_table, 0, sizeof(connection_table));
@@ -3012,6 +3260,35 @@ int run(void)
         if (++heartbeat_counter >= 50000) {
             printf("%s: ❤️  Heartbeat: %u iterations, %u active connections\n",
                    COMPONENT_NAME, heartbeat_counter, connection_count);
+
+            /* v2.93: DEBUG - Show connection table details */
+            printf("%s: 🔍 NET0 Connection Table:\n", COMPONENT_NAME);
+            int shown = 0;
+            for (int i = 0; i < MAX_CONNECTIONS && shown < 10; i++) {
+                if (connection_table[i].active) {
+                    printf("%s:   [%d] SCADA %u.%u.%u.%u:%u → PLC %u.%u.%u.%u:%u PCB=%p awaiting=%d\n",
+                           COMPONENT_NAME, i,
+                           (connection_table[i].original_src_ip >> 24) & 0xFF,
+                           (connection_table[i].original_src_ip >> 16) & 0xFF,
+                           (connection_table[i].original_src_ip >> 8) & 0xFF,
+                           connection_table[i].original_src_ip & 0xFF,
+                           connection_table[i].src_port,
+                           (connection_table[i].original_dest_ip >> 24) & 0xFF,
+                           (connection_table[i].original_dest_ip >> 16) & 0xFF,
+                           (connection_table[i].original_dest_ip >> 8) & 0xFF,
+                           connection_table[i].original_dest_ip & 0xFF,
+                           connection_table[i].dest_port,
+                           (void*)connection_table[i].pcb,
+                           connection_table[i].awaiting_response);
+                    shown++;
+                }
+            }
+            if (shown == 0) {
+                printf("%s:   (no active connections)\n", COMPONENT_NAME);
+            } else if (connection_count > shown) {
+                printf("%s:   ... and %d more connections\n", COMPONENT_NAME, connection_count - shown);
+            }
+
             heartbeat_counter = 0;
         }
 

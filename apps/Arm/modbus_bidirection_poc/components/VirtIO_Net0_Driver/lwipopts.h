@@ -15,7 +15,7 @@
 
 /* Memory configuration */
 #define MEM_ALIGNMENT                   4
-#define MEM_SIZE                        (64 * 1024)  /* 64KB heap */
+#define MEM_SIZE                        (128 * 1024)  /* v2.87: 128KB heap to support 256 PCBs */
 
 /* v2.78: Use static memory pools instead of malloc to prevent cross-component contamination */
 #define MEM_LIBC_MALLOC                 0       /* DO NOT use system malloc */
@@ -46,7 +46,7 @@
 #define LWIP_WND_SCALE                  1
 #define TCP_RCV_SCALE                   2
 #define MEMP_NUM_TCP_SEG                TCP_SND_QUEUELEN
-#define MEMP_NUM_TCP_PCB                128     /* Max TCP connections (increased from 8) */
+#define MEMP_NUM_TCP_PCB                256     /* v2.87: Match MAX_CONNECTIONS, let lwIP handle lifecycle */
 #define MEMP_NUM_TCP_PCB_LISTEN         16      /* Max listening sockets (increased from 4) */
 
 /* UDP configuration */

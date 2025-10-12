@@ -1131,43 +1131,16 @@ static void connection_cleanup_stale(void)
         if (pcb->state == ESTABLISHED) {
             uint32_t idle_time = now - connection_table[i].last_activity;
             if (idle_time > IDLE_TIMEOUT_MS) {
-                printf("%s: ⏱️  Closing idle connection [%d]: idle for %u ms (timeout=%u ms)\n",
-                       COMPONENT_NAME, i, idle_time, IDLE_TIMEOUT_MS);
-                printf("%s:    Connection: %u.%u.%u.%u:%u → %u.%u.%u.%u:%u\n",
-                       COMPONENT_NAME,
-                       (connection_table[i].original_src_ip >> 24) & 0xFF,
-                       (connection_table[i].original_src_ip >> 16) & 0xFF,
-                       (connection_table[i].original_src_ip >> 8) & 0xFF,
-                       connection_table[i].original_src_ip & 0xFF,
-                       connection_table[i].src_port,
-                       (connection_table[i].original_dest_ip >> 24) & 0xFF,
-                       (connection_table[i].original_dest_ip >> 16) & 0xFF,
-                       (connection_table[i].original_dest_ip >> 8) & 0xFF,
-                       connection_table[i].original_dest_ip & 0xFF,
-                       connection_table[i].dest_port);
-
-                /* v2.61: CRITICAL FIX - tcp_abort() should send RST
+                /* v2.63: Idle timeout triggered - close connection and send RST
                  *
-                 * Problem: tcp_abort() generates RST but may not transmit it reliably
-                 * User observation: "even when gateway is closed, connections stay ESTABLISHED"
+                 * tcp_abort() behavior:
+                 * - Clears callbacks to prevent re-entry
+                 * - Sends RST packet to PLC
+                 * - Frees PCB memory
                  *
-                 * Solution: Ensure tcp_abort() is called while PCB is valid
-                 * - Clear callbacks to prevent re-entry
-                 * - tcp_abort() sends RST and frees PCB
-                 * - PLC should receive RST and close connection
-                 *
-                 * Note: lwIP doesn't expose tcp_rst() directly - tcp_abort() is the
-                 * correct API for sending RST. If RST doesn't reach PLC, it's a
-                 * network issue, not a code issue.
+                 * Note: This may create dangling pointer in Net0's metadata.
+                 * Net0 v2.62 handles this by checking PCB state before dereferencing.
                  */
-
-                printf("%s:    → Closing idle connection and sending RST to PLC (%u.%u.%u.%u:%u)\n",
-                       COMPONENT_NAME,
-                       (connection_table[i].original_dest_ip >> 24) & 0xFF,
-                       (connection_table[i].original_dest_ip >> 16) & 0xFF,
-                       (connection_table[i].original_dest_ip >> 8) & 0xFF,
-                       connection_table[i].original_dest_ip & 0xFF,
-                       connection_table[i].dest_port);
 
                 /* Clear callbacks first to prevent re-entry during abort */
                 tcp_recv(pcb, NULL);
@@ -3426,7 +3399,7 @@ static int virtio_net_init(void)
 void post_init(void)
 {
     printf("%s: Component started\n", COMPONENT_NAME);
-    printf("%s: 🔖 NET1 SOFTWARE VERSION: v2.61-send-rst (2025-10-13)\n", COMPONENT_NAME);
+    printf("%s: 🔖 NET1 SOFTWARE VERSION: v2.63-minimal-output (2025-10-13)\n", COMPONENT_NAME);
     printf("%s: 🔧 MODE: PRODUCTION-READY with Multi-Layer Validation\n", COMPONENT_NAME);
     printf("%s: ✅ FIX 1: payload_data buffer (prevents dataport corruption)\n", COMPONENT_NAME);
     printf("%s: ✅ FIX 2: Correct lwIP callback protocol (ERR_ABRT without tcp_abort)\n", COMPONENT_NAME);

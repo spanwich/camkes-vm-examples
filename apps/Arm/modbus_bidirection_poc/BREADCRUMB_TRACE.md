@@ -77,6 +77,10 @@ Edit `components/include/common.h`:
 - 3011: tcp_write succeeded, flushing output
 - 3012: tcp_output complete
 - 3013: Exit - outbound_ready_handle complete
+- 3014: **Stale PCB detected** (v2.62: dangling pointer cleanup)
+  - ⚠️ Condition: PCB state != ESTABLISHED (connection closed by Net1)
+  - 🧹 Action: Removes stale metadata, prevents crash
+  - 🛡️ Protection: Catches freed PCB before dereferencing other fields
 
 ### Reserved Ranges
 

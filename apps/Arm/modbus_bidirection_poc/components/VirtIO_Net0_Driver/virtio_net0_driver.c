@@ -2318,11 +2318,10 @@ void outbound_ready_handle(void)
      * Only ESTABLISHED connections can send data. Catches CLOSED, freed PCB, etc. */
     if (meta->pcb->state != ESTABLISHED) {
         /* PCB closed or freed - remove stale metadata */
-        printf("%s: ⚠️  OUTBOUND: Connection closed (state=%d) - removing stale metadata\n",
-               COMPONENT_NAME, meta->pcb->state);
+        BREADCRUMB(3014);  /* Stale PCB detected - removing metadata */
         meta->active = false;
         meta->pcb = NULL;
-        return;  /* Silent drop - breadcrumb B3008 indicates validation point */
+        return;  /* Silent drop after cleanup */
     }
 
     /* VALIDATION LAYER 2: TCP Sequence Number Check

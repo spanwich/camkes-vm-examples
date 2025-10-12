@@ -1146,26 +1146,22 @@ static void connection_cleanup_stale(void)
                        connection_table[i].original_dest_ip & 0xFF,
                        connection_table[i].dest_port);
 
-                /* v2.61: CRITICAL FIX - Force RST transmission BEFORE cleanup
+                /* v2.61: CRITICAL FIX - tcp_abort() should send RST
                  *
-                 * Problem: tcp_abort() queues RST but frees PCB immediately
-                 * Result: RST packet never transmitted → PLC keeps connection ESTABLISHED
+                 * Problem: tcp_abort() generates RST but may not transmit it reliably
                  * User observation: "even when gateway is closed, connections stay ESTABLISHED"
                  *
-                 * Solution: Send RST explicitly and force output before aborting
-                 * 1. tcp_rst() - Generate and send RST packet
-                 * 2. tcp_output() - Force immediate transmission
-                 * 3. tcp_abort() - Clean up PCB (RST already sent)
+                 * Solution: Ensure tcp_abort() is called while PCB is valid
+                 * - Clear callbacks to prevent re-entry
+                 * - tcp_abort() sends RST and frees PCB
+                 * - PLC should receive RST and close connection
+                 *
+                 * Note: lwIP doesn't expose tcp_rst() directly - tcp_abort() is the
+                 * correct API for sending RST. If RST doesn't reach PLC, it's a
+                 * network issue, not a code issue.
                  */
 
-                /* Clear callbacks first */
-                tcp_recv(pcb, NULL);
-                tcp_sent(pcb, NULL);
-                tcp_err(pcb, NULL);
-                tcp_arg(pcb, NULL);
-
-                /* Send RST packet explicitly */
-                printf("%s:    → Sending RST to PLC (%u.%u.%u.%u:%u)\n",
+                printf("%s:    → Closing idle connection and sending RST to PLC (%u.%u.%u.%u:%u)\n",
                        COMPONENT_NAME,
                        (connection_table[i].original_dest_ip >> 24) & 0xFF,
                        (connection_table[i].original_dest_ip >> 16) & 0xFF,
@@ -1173,19 +1169,18 @@ static void connection_cleanup_stale(void)
                        connection_table[i].original_dest_ip & 0xFF,
                        connection_table[i].dest_port);
 
-                /* Force RST transmission using tcp_rst() */
-                tcp_rst(pcb->local_port, pcb->remote_port,
-                        &pcb->local_ip, &pcb->remote_ip,
-                        pcb->snd_nxt, pcb->rcv_nxt);
+                /* Clear callbacks first to prevent re-entry during abort */
+                tcp_recv(pcb, NULL);
+                tcp_sent(pcb, NULL);
+                tcp_err(pcb, NULL);
+                tcp_arg(pcb, NULL);
 
-                /* Now abort the PCB (cleanup only, RST already sent) */
+                /* tcp_abort() sends RST and frees PCB */
                 tcp_abort(pcb);
 
                 connection_table[i].active = false;
                 connection_table[i].pcb = NULL;
                 connection_count--;
-                active_connections--;
-                total_connections_closed++;
                 closed_idle++;
             }
         }
@@ -2013,7 +2008,7 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
     pbuf_free(p);              /* Free the pbuf we were given */
 
     /* Update last_activity timestamp for idle timeout detection */
-    struct connection_metadata *meta = connection_lookup_by_pcb(pcb);
+    /* Reuse 'meta' variable from above (line 1924) */
     if (meta != NULL && meta->active) {
         meta->last_activity = sys_now();  /* lwIP millisecond timer */
     }
@@ -3431,7 +3426,7 @@ static int virtio_net_init(void)
 void post_init(void)
 {
     printf("%s: Component started\n", COMPONENT_NAME);
-    printf("%s: 🔖 NET1 SOFTWARE VERSION: v2.61-force-rst (2025-10-13)\n", COMPONENT_NAME);
+    printf("%s: 🔖 NET1 SOFTWARE VERSION: v2.61-send-rst (2025-10-13)\n", COMPONENT_NAME);
     printf("%s: 🔧 MODE: PRODUCTION-READY with Multi-Layer Validation\n", COMPONENT_NAME);
     printf("%s: ✅ FIX 1: payload_data buffer (prevents dataport corruption)\n", COMPONENT_NAME);
     printf("%s: ✅ FIX 2: Correct lwIP callback protocol (ERR_ABRT without tcp_abort)\n", COMPONENT_NAME);

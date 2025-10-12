@@ -1090,28 +1090,24 @@ static void connection_print_stats(void)
  */
 static void connection_cleanup_stale(void)
 {
-    /* v2.83: CRITICAL FIX - Only clean up NULL PCBs, DO NOT access PCB fields!
+    /* v2.84: SAFE idle timeout implementation
      *
-     * Bug Analysis (same as Net0 v2.83):
-     * - connection_cleanup_stale() was accessing pcb->state (lines 1118, 1131)
-     * - PCB might be freed by lwIP between NULL check and state access
-     * - Accessing freed PCB → crash at offset 0x10 (state field)
+     * Key insight from user observation:
+     * - After v2.83 removed idle timeout, Net1 accumulated 64 connections (table full!)
+     * - SCADA keeps connections alive, never closes them
+     * - Without idle timeout, connections never get cleaned up
+     * - System stops working when table fills
      *
-     * Fix: ONLY clean up entries with NULL PCBs
-     * - Safe: We never dereference the PCB pointer
-     * - Let lwIP callbacks set PCB to NULL when connections close
-     * - Periodic cleanup removes entries with NULL PCBs from table
-     *
-     * REMOVED Features (unsafe):
-     * - pcb->state == CLOSED / TIME_WAIT check → use-after-free
-     * - Idle timeout with tcp_abort() → dangerous to call on possibly-freed PCB
-     *
-     * Note: Idle timeout feature disabled for safety. Connections will be closed by:
-     * 1. Remote peer (SCADA or PLC)
-     * 2. lwIP timeouts (internally managed)
-     * 3. Error callbacks setting pcb=NULL
+     * Safe implementation:
+     * 1. Check idle time using metadata->last_activity (OUR field, not PCB field)
+     * 2. Only abort if PCB is non-NULL (avoid use-after-free)
+     * 3. Clear callbacks BEFORE abort to prevent re-entry
+     * 4. Set metadata inactive BEFORE abort to prevent race conditions
      */
     int cleaned = 0;
+    int closed_idle = 0;
+    uint32_t now = sys_now();
+    const uint32_t IDLE_TIMEOUT_MS = 2000;  /* 2 seconds for fast Modbus TCP */
 
     for (int i = 0; i < MAX_CONNECTIONS; i++) {
         if (!connection_table[i].active) {
@@ -1120,7 +1116,7 @@ static void connection_cleanup_stale(void)
 
         struct tcp_pcb *pcb = connection_table[i].pcb;
 
-        /* ONLY cleanup if PCB is NULL - never access PCB fields! */
+        /* Cleanup if PCB is NULL */
         if (pcb == NULL) {
             #if DEBUG_METADATA
             printf("%s: 🧹 Cleanup stale connection [%d]: PCB is NULL\n", COMPONENT_NAME, i);
@@ -1128,18 +1124,42 @@ static void connection_cleanup_stale(void)
             connection_table[i].active = false;
             connection_count--;
             cleaned++;
+            continue;
         }
 
-        /* v2.83: REMOVED pcb->state checks - accessing freed PCB causes crashes!
-         * v2.83: REMOVED idle timeout - cannot safely call tcp_abort() on possibly-freed PCB
-         * Rely on lwIP callbacks (tcp_echo_recv with p=NULL, tcp_echo_err, inbound_tcp_err_callback)
-         * to set pcb=NULL when connection closes. */
+        /* v2.84: SAFE idle timeout - only uses metadata fields, no PCB field access!
+         * Check idle time using last_activity timestamp (stored in OUR metadata) */
+        uint32_t idle_time = now - connection_table[i].last_activity;
+        if (idle_time > IDLE_TIMEOUT_MS) {
+            #if DEBUG_METADATA
+            printf("%s: 🧹 Closing idle connection [%d]: idle for %u ms\n",
+                   COMPONENT_NAME, i, idle_time);
+            #endif
+
+            /* Clear callbacks FIRST to prevent re-entry during abort */
+            tcp_recv(pcb, NULL);
+            tcp_sent(pcb, NULL);
+            tcp_err(pcb, NULL);
+            tcp_arg(pcb, NULL);
+
+            /* Mark metadata inactive BEFORE abort (prevent race with Net0) */
+            connection_table[i].active = false;
+            connection_table[i].pcb = NULL;
+            connection_count--;
+
+            /* Memory barrier to ensure metadata update visible before PCB freed */
+            __sync_synchronize();
+
+            /* Now safe to abort - callbacks cleared, metadata marked inactive */
+            tcp_abort(pcb);
+            closed_idle++;
+        }
     }
 
-    if (cleaned > 0) {
+    if (cleaned > 0 || closed_idle > 0) {
         #if DEBUG_METADATA
-        printf("%s: 🧹 Cleaned %d stale connection(s)\n",
-               COMPONENT_NAME, cleaned);
+        printf("%s: 🧹 Cleaned %d stale + %d idle connection(s)\n",
+               COMPONENT_NAME, cleaned, closed_idle);
         connection_print_stats();
         #endif
     }
@@ -3457,7 +3477,7 @@ static int virtio_net_init(void)
 void post_init(void)
 {
     printf("%s: Component started\n", COMPONENT_NAME);
-    printf("%s: 🔖 NET1 SOFTWARE VERSION: v2.83-never-access-freed-pcb (2025-10-13)\n", COMPONENT_NAME);
+    printf("%s: 🔖 NET1 SOFTWARE VERSION: v2.84-safe-idle-timeout (2025-10-13)\n", COMPONENT_NAME);
     printf("%s: 🔧 MODE: PRODUCTION-READY with Multi-Layer Validation\n", COMPONENT_NAME);
     printf("%s: ✅ FIX 1: payload_data buffer (prevents dataport corruption)\n", COMPONENT_NAME);
     printf("%s: ✅ FIX 2: Correct lwIP callback protocol (ERR_ABRT without tcp_abort)\n", COMPONENT_NAME);

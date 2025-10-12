@@ -2302,19 +2302,32 @@ void outbound_ready_handle(void)
 
     BREADCRUMB(3008);  /* Connection found */
 
-    /* v2.50: Connection validation before tcp_write() - defensive check
-     * Unlike Net1 which CREATES connections, Net0 only VALIDATES existing SCADA connections
-     * before sending PLC responses back. This catches dead/reused connections early. */
+    /* v2.62: CRITICAL FIX - Check PCB state FIRST before dereferencing other fields
+     *
+     * Problem: Net1 closes idle connections by calling tcp_abort(), which frees PCB.
+     * But Net0 still has metadata with dangling PCB pointer.
+     * Crash: meta->pcb points to freed memory, accessing meta->pcb->snd_nxt = page fault
+     *
+     * Solution: Check PCB state field FIRST. If state is CLOSED/invalid, PCB was freed.
+     * State field is at offset 0, so it's safe to check even if PCB is partially freed.
+     *
+     * This catches dangling pointers before they cause crashes.
+     */
 
-    /* VALIDATION LAYER 1: TCP Sequence Number Check
-     * Detects if SCADA closed and reopened connection (OS reused same port with new seq) */
-    if (meta->pcb->snd_nxt != meta->tcp_seq_num) {
+    /* VALIDATION LAYER 1: PCB State Check (MUST BE FIRST!)
+     * Only ESTABLISHED connections can send data. Catches CLOSED, freed PCB, etc. */
+    if (meta->pcb->state != ESTABLISHED) {
+        /* PCB closed or freed - remove stale metadata */
+        printf("%s: ⚠️  OUTBOUND: Connection closed (state=%d) - removing stale metadata\n",
+               COMPONENT_NAME, meta->pcb->state);
+        meta->active = false;
+        meta->pcb = NULL;
         return;  /* Silent drop - breadcrumb B3008 indicates validation point */
     }
 
-    /* VALIDATION LAYER 2: PCB State Check
-     * Only ESTABLISHED connections can send data. Catches CLOSED, TIME_WAIT, etc. */
-    if (meta->pcb->state != ESTABLISHED) {
+    /* VALIDATION LAYER 2: TCP Sequence Number Check
+     * Detects if SCADA closed and reopened connection (OS reused same port with new seq) */
+    if (meta->pcb->snd_nxt != meta->tcp_seq_num) {
         return;  /* Silent drop - breadcrumb B3008 indicates validation point */
     }
 
@@ -2783,7 +2796,7 @@ static int virtio_net_init(void)
 void post_init(void)
 {
     printf("%s: Component started\n", COMPONENT_NAME);
-    printf("%s: 🔖 NET0 SOFTWARE VERSION: v2.50-connection-validation (2025-10-13)\n", COMPONENT_NAME);
+    printf("%s: 🔖 NET0 SOFTWARE VERSION: v2.62-dangling-pcb-fix (2025-10-13)\n", COMPONENT_NAME);
     printf("%s: 🔧 MODE: SILENT + BREADCRUMB_TRACE (minimal debug output)\n", COMPONENT_NAME);
     printf("%s: ⚠️  WARNING: Testing race condition with breadcrumbs only\n\n", COMPONENT_NAME);
 

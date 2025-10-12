@@ -1022,6 +1022,149 @@ VirtIO_Net0_Driver: Sent 9 bytes to SCADA (appears from PLC)
 
 ---
 
+## Cache Coherency Fix (v2.42)
+
+### Problem: NULL Pointer Crashes with Race Condition (Heisenbug)
+
+**Version:** v2.42-cache-coherency-barriers (October 2025)
+
+#### Symptom
+- v2.40 worked reliably with verbose debug output enabled
+- Switching to production quiet mode caused immediate NULL pointer crashes
+- Crashes at addresses 0x8, 0x10 (different from v2.40's dangling pointer issue)
+- **Heisenbug**: Race condition accidentally masked by printf() timing delays
+- Error message: `"TX: No metadata found for TCP port 64023 → 502"`
+
+#### Root Cause Analysis
+
+**Cache Coherency Issue in seL4/CAmkES Dataport Communication**
+
+seL4/CAmkES uses shared memory (dataports) for inter-component communication. Without proper memory barriers, CPU cache coherency failures cause data corruption:
+
+1. **OUTBOUND Path (ICS_Outbound → Net0)**
+   - ICS_Outbound writes PLC response to shared dataport
+   - ICS_Outbound emits notification
+   - Net0 immediately polls and reads dataport
+   - **Problem**: CPU cache not synchronized - Net0 reads stale/corrupt data
+   - Result: NULL pointer dereference at offset 0x8
+
+2. **INBOUND Path (Net1 metadata storage)**
+   - Net1 stores ephemeral port in metadata: `meta->lwip_ephemeral_port = pcb->local_port;`
+   - lwIP's `tcp_connect()` can **immediately trigger callbacks** synchronously
+   - Callback calls `netif_output()` which looks up metadata by ephemeral port
+   - **Problem**: CPU cache not flushed - lookup sees incomplete metadata
+   - Result: "No metadata found" warning, then NULL pointer crash
+
+3. **Why Verbose Debug Masked the Bug**
+   - `printf()` performs I/O operations that implicitly flush CPU caches
+   - Added ~millisecond delays between operations
+   - Race condition window closed by accident
+   - System worked reliably in debug mode but failed in production
+
+#### Solution Implemented
+
+**Memory Barriers at Critical Synchronization Points**
+
+Added `__sync_synchronize()` full memory barriers using publication/subscription pattern:
+
+**Fix 1: ICS_Outbound Dataport Publication (OUTBOUND path)**
+
+```c
+/* Forward to output dataport */
+ICS_Message *out_msg = (ICS_Message *)out_dp;
+memcpy(out_msg, in_msg, sizeof(FrameMetadata) + sizeof(uint16_t) + in_msg->payload_length);
+
+/* CRITICAL: Force cache flush before notification */
+__sync_synchronize();
+
+/* Signal VirtIO_Net0_Driver */
+out_ntfy_emit();
+```
+
+**Fix 2: Net0 Dataport Subscription (OUTBOUND path)**
+
+```c
+/* Check for OUTBOUND notifications from ICS_Outbound (non-blocking) */
+if (outbound_ready_poll()) {
+    /* CRITICAL: Ensure we see latest dataport writes */
+    __sync_synchronize();
+    outbound_ready_handle();
+}
+```
+
+**Fix 3: Net1 Metadata Publication (INBOUND path)**
+
+```c
+/* Store lwIP's ephemeral port after tcp_connect() */
+meta->lwip_ephemeral_port = pcb->local_port;
+
+/* CRITICAL: Memory barrier to ensure ephemeral port write is visible before callbacks fire */
+__sync_synchronize();
+
+/* Now safe for tcp_connect() callbacks to fire and lookup metadata */
+```
+
+#### Technical Details
+
+**Memory Barrier Semantics:**
+- `__sync_synchronize()` is a full memory barrier (acquire + release semantics)
+- **Writer side (publication)**: Forces all pending writes to complete and become visible to other CPUs
+- **Reader side (subscription)**: Forces reload of all cached values to see latest writes
+- Required for correct operation in multi-component seL4 systems with shared memory
+
+**Why This Was Needed:**
+- seL4/CAmkES dataports use **cached memory** by default for performance
+- Without barriers, each CPU's cache has independent view of shared memory
+- Notifications don't provide memory ordering guarantees
+- ARM architecture allows aggressive reordering of memory operations
+
+#### Impact
+
+**Before (v2.40 quiet mode):**
+- ❌ NULL pointer crash at address 0x8 in Net0
+- ❌ "No metadata found" errors in Net1
+- ❌ System halts after first request
+- ✅ Worked with verbose debug (Heisenbug)
+
+**After (v2.42):**
+- ✅ No crashes with production quiet mode
+- ✅ Metadata lookups succeed reliably
+- ✅ Full bidirectional communication working
+- ✅ SCADA can see PLC responses without crashes
+- ✅ Ready for stability testing
+
+#### Verification
+
+Monitor QEMU console - should see clean flow without crashes:
+
+```bash
+VirtIO_Net0_Driver: 📖 NET0 SOFTWARE VERSION: v2.42-cache-coherency-barriers
+VirtIO_Net1_Driver: 📖 NET1 SOFTWARE VERSION: v2.42-cache-coherency-barriers
+
+# SCADA → PLC request (INBOUND path)
+VirtIO_Net0_Driver: NEW connection from SCADA 192.168.90.5:59082
+ICS_Inbound: ✅ ALLOW - Modbus request validated
+VirtIO_Net1_Driver: Connected to PLC 192.168.95.2:502
+
+# PLC → SCADA response (OUTBOUND path)
+VirtIO_Net1_Driver: ✅ Received 9 bytes from PLC
+ICS_Outbound: ✅ ALLOW - Modbus response validated
+VirtIO_Net0_Driver: Sent 9 bytes to SCADA (appears from PLC)
+
+# NO crashes, NO "metadata not found" warnings
+```
+
+**Files Modified:**
+- [ICS_Outbound.c](components/ICS_Outbound/ICS_Outbound.c) - Memory barrier before notification emit
+- [virtio_net0_driver.c](components/VirtIO_Net0_Driver/virtio_net0_driver.c) - Memory barrier after notification poll
+- [virtio_net1_driver.c](components/VirtIO_Net1_Driver/virtio_net1_driver.c) - Memory barrier after metadata storage
+
+**Debug Level:** Production QUIET mode (errors/warnings only)
+
+**Deployment Status:** ✅ Ready for stability testing on production server with GRFICS ICS simulator
+
+---
+
 **Last Updated:** 2025-10-12
-**Version:** 2.40
+**Version:** 2.42
 **Contact:** PhD Research Project - seL4 ICS Security Gateway

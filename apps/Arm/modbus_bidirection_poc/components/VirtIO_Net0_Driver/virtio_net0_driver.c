@@ -1043,6 +1043,7 @@ static void connection_remove(struct tcp_pcb *pcb)
  */
 static void connection_print_stats(void)
 {
+    /* v2.83: CRITICAL FIX - Do NOT access pcb->state (can crash on freed PCB) */
     int active = 0;
     int pcb_linked = 0;
     int stale = 0;
@@ -1052,11 +1053,7 @@ static void connection_print_stats(void)
             active++;
             if (connection_table[i].pcb != NULL) {
                 pcb_linked++;
-                /* Check if PCB is in closed state */
-                if (connection_table[i].pcb->state == CLOSED ||
-                    connection_table[i].pcb->state == TIME_WAIT) {
-                    stale++;
-                }
+                /* v2.83: REMOVED pcb->state check - accessing freed PCB causes crashes! */
             } else {
                 stale++;
             }
@@ -1081,6 +1078,18 @@ static void connection_print_stats(void)
  */
 static void connection_cleanup_stale(void)
 {
+    /* v2.83: CRITICAL FIX - Only clean up NULL PCBs, DO NOT access PCB fields!
+     *
+     * Bug Analysis (v2.82 crash at 0x10):
+     * - connection_cleanup_stale() was accessing pcb->state
+     * - PCB might be freed by lwIP between NULL check and state access
+     * - Accessing freed PCB → crash at offset 0x10 (state field)
+     *
+     * Fix: ONLY clean up entries with NULL PCBs
+     * - Safe: We never dereference the PCB pointer
+     * - Let lwIP callbacks set PCB to NULL when connections close
+     * - Periodic cleanup removes entries with NULL PCBs from table
+     */
     int cleaned = 0;
 
     for (int i = 0; i < MAX_CONNECTIONS; i++) {
@@ -1090,7 +1099,7 @@ static void connection_cleanup_stale(void)
 
         struct tcp_pcb *pcb = connection_table[i].pcb;
 
-        /* Cleanup if PCB is NULL */
+        /* ONLY cleanup if PCB is NULL - never access PCB fields! */
         if (pcb == NULL) {
             #if DEBUG_METADATA
             printf("%s: 🧹 Cleanup stale connection [%d]: PCB is NULL\n", COMPONENT_NAME, i);
@@ -1098,20 +1107,11 @@ static void connection_cleanup_stale(void)
             connection_table[i].active = false;
             connection_count--;
             cleaned++;
-            continue;
         }
 
-        /* Cleanup if PCB state is CLOSED or TIME_WAIT */
-        if (pcb->state == CLOSED || pcb->state == TIME_WAIT) {
-            #if DEBUG_METADATA
-            printf("%s: 🧹 Cleanup stale connection [%d]: PCB state=%d (CLOSED=%d, TIME_WAIT=%d)\n",
-                   COMPONENT_NAME, i, pcb->state, CLOSED, TIME_WAIT);
-            #endif
-            connection_table[i].active = false;
-            connection_table[i].pcb = NULL;
-            connection_count--;
-            cleaned++;
-        }
+        /* v2.83: REMOVED pcb->state check - accessing freed PCB causes crashes!
+         * Rely on lwIP callbacks (tcp_echo_recv with p=NULL, tcp_echo_err)
+         * to set pcb=NULL when connection closes. */
     }
 
     if (cleaned > 0) {
@@ -1774,11 +1774,20 @@ static void tcp_echo_err(void *arg, err_t err)
     printf("%s:    → Active connections: %u | Total created: %u | Total closed: %u\n",
            COMPONENT_NAME, active_connections, total_connections_created, total_connections_closed);
 
-    /* PCB is already freed by lwIP when err callback is called - don't access it! */
-
-    /* Trigger cleanup of stale connections to recover table slots */
-    printf("%s: 🧹 TCP error triggered - running connection cleanup...\n", COMPONENT_NAME);
-    connection_cleanup_stale();
+    /* v2.83: CRITICAL FIX - Do NOT call connection_cleanup_stale() from error callback!
+     *
+     * Bug Analysis (v2.82 crash at 0x10 in Net0):
+     * - tcp_echo_err() is called DURING lwIP's error handling
+     * - lwIP may have freed MULTIPLE PCBs in the same batch
+     * - connection_cleanup_stale() iterates ALL connections and accesses pcb->state
+     * - If it accesses a recently-freed PCB → crash at offset 0x10 (state field)
+     *
+     * Fix: Let main loop's periodic cleanup handle stale entries
+     * Error callback should ONLY handle its own connection cleanup
+     *
+     * NOTE: PCB is already freed by lwIP when err callback is called - don't access it!
+     * The periodic cleanup in main loop (every 100 iterations) will clean up stale entries safely.
+     */
 }
 
 /*
@@ -2848,7 +2857,7 @@ static int virtio_net_init(void)
 void post_init(void)
 {
     printf("%s: Component started\n", COMPONENT_NAME);
-    printf("%s: 🔖 NET0 SOFTWARE VERSION: v2.81-fix-lwip-callback-protocol (2025-10-13)\n", COMPONENT_NAME);
+    printf("%s: 🔖 NET0 SOFTWARE VERSION: v2.83-never-access-freed-pcb (2025-10-13)\n", COMPONENT_NAME);
     printf("%s: 🔧 MODE: PRODUCTION with fast cleanup (every 100 iterations)\n", COMPONENT_NAME);
     printf("%s: ✅ FIX: Connection table exhaustion resolved\n\n", COMPONENT_NAME);
 

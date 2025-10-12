@@ -852,6 +852,176 @@ This is research software developed for PhD research on formally verified ICS se
 
 ---
 
-**Last Updated:** 2025-10-11
-**Version:** 2.0
+## Recent Critical Fixes (v2.38 - v2.40)
+
+### Problem: PLC Responses Not Reaching SCADA
+
+**Versions:** v2.38 - v2.40 (October 2025)
+
+#### Symptom
+- SCADA requests successfully reached PLC through gateway
+- PLC sent valid Modbus responses back to gateway
+- Gateway sent TCP ACK to SCADA but **did not forward PLC response data**
+- SCADA never received the actual Modbus response payload
+
+#### Root Cause Analysis
+
+Three critical bugs prevented bidirectional communication:
+
+1. **Missing TCP Receive Callback (v2.37)**
+   - Net1 driver (PLC-facing) established TCP connections but immediately closed them after sending requests
+   - No `tcp_recv()` callback was registered to receive PLC responses
+   - Connection closed before PLC could send response
+
+2. **Dangling PCB Pointers (v2.38 → v2.39)**
+   - After successful first transaction, system crashed on subsequent requests
+   - Data faults at addresses 0x4, 0xc, 0x10 (NULL pointer dereferences)
+   - Root cause: `tcp_close()` freed PCB memory, but metadata table still held PCB pointers
+   - IRQ handler tried to use freed pointers → crash
+
+3. **Metadata Lookup Timing Issue (v2.39 → v2.40)**
+   - Warning: "TX: No metadata found for TCP port 64033 → 502"
+   - Race condition: `tcp_connect()` immediately sends SYN packet before ephemeral port is stored
+   - Sequence: `tcp_connect()` → `netif_output()` called → lookup fails → THEN port stored
+   - Result: SYN packets had no metadata during transmission
+
+#### Solutions Implemented
+
+**Fix 1: Implement TCP Receive Callback (v2.38)**
+
+Added `inbound_tcp_recv_callback()` in Net1 driver:
+
+```c
+static err_t inbound_tcp_recv_callback(void *arg, struct tcp_pcb *pcb,
+                                       struct pbuf *p, err_t err)
+{
+    struct tcp_inbound_client_state *state = (struct tcp_inbound_client_state *)arg;
+
+    if (p == NULL) {
+        tcp_close(pcb);
+        state->active = false;
+        state->pcb = NULL;
+        return ERR_OK;
+    }
+
+    // Extract PLC response payload
+    ICS_Message *ics_msg = (ICS_Message *)outbound_dp;
+
+    // Lookup original SCADA IP from connection metadata
+    struct connection_metadata *meta = connection_lookup_by_pcb(pcb);
+    if (meta != NULL && meta->active) {
+        ics_msg->metadata.dst_ip = meta->original_src_ip;
+        ics_msg->metadata.dst_port = meta->src_port;
+    }
+
+    // Copy PLC response and forward to ICS_Outbound component
+    memcpy(ics_msg->payload, p->payload, p->len);
+    outbound_ready_emit();
+
+    tcp_recved(pcb, p->len);
+    pbuf_free(p);
+
+    return ERR_OK;
+}
+```
+
+Registered callback: `tcp_recv(pcb, inbound_tcp_recv_callback);`
+
+Removed premature `tcp_close()` from `inbound_tcp_sent_callback()`
+
+**Fix 2: Clear Dangling PCB Pointers (v2.40)**
+
+Clear PCB pointer **before** calling `tcp_close()`:
+
+```c
+// In inbound_tcp_recv_callback() - after forwarding payload
+struct connection_metadata *meta = connection_lookup_by_pcb(pcb);
+if (meta != NULL && meta->active) {
+    meta->pcb = NULL;  /* CRITICAL: Prevent dangling pointer */
+}
+
+tcp_close(pcb);  /* Now safe - no stale pointers */
+state->active = false;
+state->pcb = NULL;
+```
+
+Applied to both Net0 and Net1 drivers in all connection close paths.
+
+**Fix 3: Dual-Method Metadata Lookup (v2.40)**
+
+Enhanced `netif_output()` to handle SYN packet timing:
+
+```c
+// Store PCB pointer BEFORE tcp_connect()
+meta->pcb = pcb;
+
+err_t result = tcp_connect(pcb, &remote_ip, dest_port,
+                          inbound_tcp_connected_callback);
+
+// Enhanced lookup in netif_output()
+if (connection_table[i].active) {
+    /* Try two lookup methods:
+     * 1. By ephemeral port (works after tcp_connect() assigns port)
+     * 2. By dest_port match (fallback for SYN packets before port assignment) */
+    if ((connection_table[i].lwip_ephemeral_port == src_port &&
+         connection_table[i].src_port == dest_port) ||
+        (connection_table[i].lwip_ephemeral_port == 0 &&
+         connection_table[i].dest_port == dest_port)) {
+        meta = &connection_table[i];
+        break;
+    }
+}
+```
+
+#### Impact
+
+**Before (v2.37):**
+- ❌ SCADA requests reached PLC
+- ❌ PLC responses lost (no receive callback)
+- ❌ SCADA never received Modbus data
+
+**After (v2.38):**
+- ✅ SCADA requests reached PLC
+- ✅ PLC responses received by gateway
+- ❌ System crashed on second transaction (dangling pointers)
+
+**After (v2.40):**
+- ✅ SCADA requests reach PLC reliably
+- ✅ PLC responses reach SCADA reliably
+- ✅ Multiple polling cycles work without crashes
+- ✅ Full bidirectional Modbus TCP communication established
+
+#### Verification
+
+Test with SCADA polling cycles:
+
+```bash
+# Monitor QEMU console for complete flow:
+
+VirtIO_Net0_Driver: NEW connection from SCADA 192.168.90.5:35012
+VirtIO_Net0_Driver: 🔄 Connection tracking: Stored metadata
+VirtIO_Net0_Driver: INBOUND: Forwarding 12 bytes to ICS_Inbound
+ICS_Inbound: ✅ ALLOW - Modbus request validated
+
+VirtIO_Net1_Driver: Connecting to PLC 192.168.95.2:502
+VirtIO_Net1_Driver: Connected - sending 12 bytes
+VirtIO_Net1_Driver: ✅ Received 9 bytes from PLC
+VirtIO_Net1_Driver: OUTBOUND: Forwarding to ICS_Outbound
+ICS_Outbound: ✅ ALLOW - Modbus response validated
+
+VirtIO_Net0_Driver: 🔄 TX: Metadata found for port 502
+VirtIO_Net0_Driver: 🔄 TX: Restored source IP 192.168.95.2
+VirtIO_Net0_Driver: Sent 9 bytes to SCADA (appears from PLC)
+```
+
+**Files Modified:**
+- [virtio_net1_driver.c](components/VirtIO_Net1_Driver/virtio_net1_driver.c) - TCP receive callback, dangling pointer fixes, metadata lookup timing
+- [virtio_net0_driver.c](components/VirtIO_Net0_Driver/virtio_net0_driver.c) - Dangling pointer fixes
+
+**Debug Level:** Both drivers set to `DEBUG_LEVEL_QUIET` (errors and warnings only)
+
+---
+
+**Last Updated:** 2025-10-12
+**Version:** 2.40
 **Contact:** PhD Research Project - seL4 ICS Security Gateway

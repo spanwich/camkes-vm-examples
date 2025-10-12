@@ -2700,8 +2700,8 @@ static int virtio_net_init(void)
 void post_init(void)
 {
     printf("%s: Component started\n", COMPONENT_NAME);
-    printf("%s: 🔖 NET0 SOFTWARE VERSION: v2.41-quiet-mode (2025-10-12)\n", COMPONENT_NAME);
-    printf("%s: 🔧 CRITICAL FIX: Clear PCB pointer in metadata before tcp_close()\n", COMPONENT_NAME);
+    printf("%s: 🔖 NET0 SOFTWARE VERSION: v2.42-cache-coherency-barriers (2025-10-12)\n", COMPONENT_NAME);
+    printf("%s: 🔧 CRITICAL FIX: Memory barriers for cache coherency (OUTBOUND path)\n", COMPONENT_NAME);
     printf("%s: 🔧 Features: Production QUIET mode - errors/warnings only\n\n", COMPONENT_NAME);
 
     /* Initialize connection tracking table */
@@ -2864,6 +2864,8 @@ int run(void)
     while (1) {
         /* Check for OUTBOUND notifications from ICS_Outbound (non-blocking) */
         if (outbound_ready_poll()) {
+            /* CRITICAL: Ensure we see latest dataport writes from ICS_Outbound */
+            __sync_synchronize();
             outbound_ready_handle();
         }
 

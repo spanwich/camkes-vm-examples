@@ -133,6 +133,9 @@ static bool process_message(void) {
     ICS_Message *out_msg = (ICS_Message *)out_dp;
     memcpy(out_msg, in_msg, sizeof(FrameMetadata) + sizeof(uint16_t) + in_msg->payload_length);
 
+    /* CRITICAL: Force cache flush before notification to ensure Net0 sees latest data */
+    __sync_synchronize();
+
     /* Signal VirtIO_Net0_Driver */
     out_ntfy_emit();
 

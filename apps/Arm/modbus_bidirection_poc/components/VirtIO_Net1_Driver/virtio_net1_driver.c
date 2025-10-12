@@ -2483,6 +2483,9 @@ void inbound_ready_handle(void)
      */
     meta->lwip_ephemeral_port = pcb->local_port;
 
+    /* CRITICAL: Memory barrier to ensure ephemeral port write is visible before callbacks fire */
+    __sync_synchronize();
+
     #if DEBUG_METADATA
     printf("%s: 📝 Stored metadata [slot %d]: SCADA %u.%u.%u.%u:%u → PLC %u.%u.%u.%u:%u (lwIP port: %u)\n",
            COMPONENT_NAME, (int)(meta - connection_table),
@@ -3050,9 +3053,9 @@ static int virtio_net_init(void)
 void post_init(void)
 {
     printf("%s: Component started\n", COMPONENT_NAME);
-    printf("%s: 🔖 NET1 SOFTWARE VERSION: v2.42-pcb-metadata-race-fix (2025-10-12)\n", COMPONENT_NAME);
-    printf("%s: 🔧 CRITICAL FIX: PCB-based metadata lookup eliminates race condition\n", COMPONENT_NAME);
-    printf("%s: 🔧 Features: QUIET mode + opportunistic ephemeral port storage\n\n", COMPONENT_NAME);
+    printf("%s: 🔖 NET1 SOFTWARE VERSION: v2.42-cache-coherency-barriers (2025-10-12)\n", COMPONENT_NAME);
+    printf("%s: 🔧 CRITICAL FIX: Memory barriers for cache coherency (INBOUND + OUTBOUND paths)\n", COMPONENT_NAME);
+    printf("%s: 🔧 Features: QUIET mode + PCB-based metadata lookup\n\n", COMPONENT_NAME);
 
     /* Initialize connection tracking table */
     memset(connection_table, 0, sizeof(connection_table));

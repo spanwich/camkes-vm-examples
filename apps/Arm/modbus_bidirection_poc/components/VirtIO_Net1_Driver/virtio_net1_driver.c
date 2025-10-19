@@ -2233,6 +2233,24 @@ static err_t inbound_tcp_recv_callback(void *arg, struct tcp_pcb *pcb, struct pb
             if (connection_table[i].active && connection_table[i].pcb == pcb) {
                 printf("%s: ⚠️  PLC closed connection - marking PCB as NULL (keeping metadata)\n", COMPONENT_NAME);
                 connection_table[i].pcb = NULL;  /* Mark as closed but keep metadata */
+
+                /* v2.97: CRITICAL FIX - Memory barrier to prevent crash in Net0!
+                 * ═══════════════════════════════════════════════════════════════════
+                 * Bug: Net1 sets pcb=NULL but Net0 doesn't see the update due to CPU cache
+                 * Result: Net0 accesses stale PCB pointer → crash at address 0x10
+                 *
+                 * Evidence from crash log (2025-10-20):
+                 * - Net1: "PLC closed connection - marking PCB as NULL"
+                 * - Net0: Crashes at 0x10 (accessing freed PCB)
+                 * - No memory barrier between NULL write and Net0's access
+                 *
+                 * Fix: Force cache flush so Net0 sees the NULL immediately
+                 * This prevents Net0 from accessing a freed PCB that lwIP already freed.
+                 *
+                 * Publication pattern: Write → Barrier → Read (Net0)
+                 */
+                __sync_synchronize();
+
                 break;
             }
         }
@@ -3781,7 +3799,7 @@ static int virtio_net_init(void)
 void post_init(void)
 {
     printf("%s: Component started\n", COMPONENT_NAME);
-    printf("%s: 🔖 NET1 SOFTWARE VERSION: v2.96-remove-all-pcb-field-access (2025-10-13)\n", COMPONENT_NAME);
+    printf("%s: 🔖 NET1 SOFTWARE VERSION: v2.97-memory-barrier-pcb-null (2025-10-20)\n", COMPONENT_NAME);
     printf("%s: 🔧 MODE: PRODUCTION-READY with Multi-Layer Validation\n", COMPONENT_NAME);
     printf("%s: ✅ FIX 1: payload_data buffer (prevents dataport corruption)\n", COMPONENT_NAME);
     printf("%s: ✅ FIX 2: tcp_abort() removed from callbacks (crash at 0x38a9c fixed!)\n", COMPONENT_NAME);

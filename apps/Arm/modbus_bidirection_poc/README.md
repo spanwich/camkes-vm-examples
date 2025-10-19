@@ -4,6 +4,7 @@
 **Architecture**: Dual-NIC transparent security gateway with policy-based routing
 **Platform**: seL4/CAmkES with dual VirtIO network drivers
 **Status**: ✅ Production-ready deployment with GRFICS ICS simulator
+**Version**: v2.96-remove-all-pcb-field-access (2025-10-13) - **First stable version (10+ minutes runtime without crashes!)**
 
 ## Project Objective
 

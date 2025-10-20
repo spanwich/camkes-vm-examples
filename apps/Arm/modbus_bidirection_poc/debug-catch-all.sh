@@ -43,7 +43,7 @@ echo "Log will be saved to: gdb-fault-log.txt"
 echo
 
 # Launch GDB with both kernel symbols and application image
-arm-none-eabi-gdb \
+gdb-multiarch \
     -ex "add-symbol-file kernel/kernel.elf" \
     -x gdb-catch-all-faults.txt \
     images/capdl-loader-image-arm-qemu-arm-virt

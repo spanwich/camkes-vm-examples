@@ -104,7 +104,7 @@ tmux send-keys -t modbus-debug:0.1 "echo ''  " C-m
 tmux send-keys -t modbus-debug:0.1 "echo 'Type \"continue\" or \"c\" to start execution'" C-m
 tmux send-keys -t modbus-debug:0.1 "echo 'GDB will stop BEFORE any crash occurs'" C-m
 tmux send-keys -t modbus-debug:0.1 "sleep 3" C-m
-tmux send-keys -t modbus-debug:0.1 "arm-none-eabi-gdb -ex 'add-symbol-file kernel/kernel.elf' -ex 'set logging file ${GDBLOG}' -x gdb-catch-all-faults.txt ${KERNEL_IMAGE}" C-m
+tmux send-keys -t modbus-debug:0.1 "gdb-multiarch -ex 'add-symbol-file kernel/kernel.elf' -ex 'set logging file ${GDBLOG}' -x gdb-catch-all-faults.txt ${KERNEL_IMAGE}" C-m
 
 # Pane 2 (bottom): Live console log tail
 tmux send-keys -t modbus-debug:0.2 "cd /home/qemu/phd/camkes-vm-examples/build_modbus" C-m

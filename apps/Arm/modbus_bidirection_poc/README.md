@@ -21,6 +21,7 @@ This proof-of-concept demonstrates a **transparent, drop-in ICS security gateway
 - [Deployment Steps](#deployment-steps)
 - [Configuration Reference](#configuration-reference)
 - [Testing](#testing)
+- [Debugging](#debugging)
 - [Troubleshooting](#troubleshooting)
 - [Security Properties](#security-properties)
 - [Performance](#performance)
@@ -51,7 +52,7 @@ This proof-of-concept demonstrates a **transparent, drop-in ICS security gateway
 ### Build
 
 ```bash
-cd /home/iamfo470/phd/camkes-vm-examples
+cd ~/phd/camkes-vm-examples
 mkdir -p build_modbus && cd build_modbus
 
 ../init-build.sh -DPLATFORM=qemu-arm-virt \
@@ -631,6 +632,93 @@ VirtIO_Net0_Driver: Sent X bytes to SCADA (appears from 192.168.95.2)
 - [ ] Traffic appears in QEMU logs
 - [ ] Modbus commands validated and forwarded
 - [ ] Responses flow back correctly
+
+---
+
+## Debugging
+
+### GDB Debugging with Persistent Sessions
+
+For debugging seL4 VM faults, race conditions, and crashes that occur after extended runtime:
+
+**📖 See [GDB-DEBUG-GUIDE.md](GDB-DEBUG-GUIDE.md) for complete documentation.**
+
+#### Quick Start
+
+```bash
+cd ~/phd/camkes-vm-examples/build_modbus
+
+# Start persistent GDB debug session
+./start-persistent-debug.sh
+```
+
+This creates a tmux session with:
+- **QEMU + GDB server** (with proven network configuration)
+- **Interactive GDB client** (set breakpoints, inspect state)
+- **Live console log** (real-time monitoring)
+
+#### Key Features
+
+- ✅ **Persistent sessions** - Survives SSH disconnection
+- ✅ **GDB watchpoints** - Catches VM faults before seL4's fault handler
+- ✅ **Automatic logging** - All debug sessions logged to `logs/`
+- ✅ **Interactive debugging** - Set breakpoints, inspect memory, analyze crashes
+- ✅ **Week-long runtime** - Designed for catching rare race conditions
+
+#### Files
+
+| File | Purpose |
+|------|---------|
+| `start-persistent-debug.sh` | Main launcher (tmux + GDB + logging) |
+| `run-remote-gdb.sh` | QEMU with GDB server + network |
+| `gdb-sel4-debug.txt` | GDB initialization with fault watchpoints |
+| `check-debug-status.sh` | Check session status while detached |
+
+#### Example: Catching Fault at Address 0x10
+
+From production logs:
+```
+FAULT HANDLER: data fault on address 0x10, pc = 0x38308
+```
+
+The GDB setup automatically sets a watchpoint on `0x10` to catch this fault **before** it reaches seL4's fault handler.
+
+When fault occurs, GDB logs:
+- Exact PC location
+- Full register dump
+- Complete backtrace
+- Stack contents
+- Disassembly
+
+All saved to: `logs/gdb-<timestamp>.log`
+
+### Console Log Analysis
+
+For post-mortem crash analysis:
+
+```bash
+# View recent crashes
+grep -i "fault" logs/console-*.log
+
+# Analyze crash context
+tail -100 logs/console-<timestamp>.log
+
+# Extract fault details
+grep -A 20 "FAULT HANDLER" logs/console-*.log
+```
+
+### Crash Capture (Alternative Method)
+
+For automated crash capture without GDB interaction:
+
+```bash
+cd ~/phd/camkes-vm-examples/projects/vm-examples/apps/Arm/modbus_bidirection_poc
+
+# Run with automatic crash capture
+./scripts/run-with-crash-capture.sh
+```
+
+See [CRASH-CAPTURE-USAGE.md](CRASH-CAPTURE-USAGE.md) for details.
 
 ---
 

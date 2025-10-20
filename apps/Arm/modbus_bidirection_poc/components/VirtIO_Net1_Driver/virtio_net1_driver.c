@@ -2689,63 +2689,53 @@ void inbound_ready_handle(void)
         if (meta != NULL && meta->active && meta->pcb != NULL) {
             struct tcp_pcb *pcb = meta->pcb;
 
-            printf("%s:   → Found PLC connection (PCB=%p, state=%d) - closing gracefully\n",
-                   COMPONENT_NAME, (void*)pcb, pcb->state);
+            printf("%s:   → Found PLC connection (PCB=%p) - closing gracefully\n",
+                   COMPONENT_NAME, (void*)pcb);
 
-            /* v2.95: CRITICAL FIX - Let lwIP manage callbacks during close (same as Net0)
+            /* v2.98: CRITICAL FIX - Always call tcp_close() regardless of state
              * ═══════════════════════════════════════════════════════════════════
-             * Problem: Clearing callbacks then calling tcp_close() causes issues:
-             * - lwIP needs callbacks to complete the close handshake
-             * - tcp_err callback should fire to clean up metadata
+             * Previous bug (v2.97): Checked pcb->state and only called tcp_close()
+             * if state == ESTABLISHED. When PCB was already in CLOSE_WAIT (state=2),
+             * code only cleaned metadata but never called any lwIP function.
+             * Result: PCB never freed → zombie connections → memory leak.
              *
-             * Solution: DON'T clear callbacks! Call tcp_close() and let lwIP:
-             * - Send FIN packet
-             * - Wait for FIN-ACK from remote
-             * - Eventually call tcp_err or tcp_recv(NULL) to signal close
-             * - Our callback will clean up metadata properly
+             * Solution per CRITICAL_LESSON_PCB_ACCESS.md:
+             * - NEVER access pcb->state or any PCB fields directly
+             * - ALWAYS call tcp_close() regardless of state
+             * - Trust lwIP's error return to know what happened:
+             *   - ERR_OK: lwIP accepted the close, will call callbacks when done
+             *   - Error: Can't close (e.g. ERR_MEM), clean up metadata manually
+             *
+             * Why this works:
+             * - If PCB in ESTABLISHED → lwIP sends FIN, waits for ACK
+             * - If PCB in CLOSE_WAIT → lwIP completes close (sends FIN-ACK), frees PCB
+             * - If PCB in FIN_WAIT/CLOSING → lwIP handles state transition
+             * - lwIP will call our tcp_recv(NULL) or tcp_err callback when done
              */
-            if (pcb->state == ESTABLISHED) {
-                /* DON'T clear callbacks - lwIP needs them! */
 
-                /* Close connection gracefully - lwIP will call callbacks when done */
-                err_t close_err = tcp_close(pcb);
-                if (close_err != ERR_OK) {
-                    printf("%s:   ⚠️  tcp_close() failed (%d) - cleaning up metadata\n",
-                           COMPONENT_NAME, close_err);
-                    /* Only if tcp_close() FAILS, clean up manually */
-                    meta->pcb = NULL;
-                    meta->active = false;
-                    if (connection_count > 0) {
-                        connection_count--;
-                    }
-                    /* Clean up inbound_tcp_client if needed */
-                    if (inbound_tcp_client.pcb == pcb) {
-                        inbound_tcp_client.active = false;
-                        inbound_tcp_client.pcb = NULL;
-                        inbound_tcp_client.bytes_sent = 0;
-                        inbound_tcp_client.payload_len = 0;
-                    }
-                } else {
-                    /* tcp_close() succeeded - lwIP will manage the rest */
-                    /* Don't clean up metadata yet - lwIP will call our callback */
-                    printf("%s:   ✓ PLC connection closing - lwIP will call callbacks when done\n",
-                           COMPONENT_NAME);
-                }
-            } else {
-                printf("%s:   ℹ️  PCB already closing (state=%d) - just cleaning up metadata\n",
-                       COMPONENT_NAME, pcb->state);
-                /* PCB already in closing state - safe to clean up metadata */
+            /* DON'T check state! Always call tcp_close() and trust lwIP */
+            err_t close_err = tcp_close(pcb);
+            if (close_err != ERR_OK) {
+                printf("%s:   ⚠️  tcp_close() failed (%d) - cleaning up metadata manually\n",
+                       COMPONENT_NAME, close_err);
+                /* Only if tcp_close() FAILS, clean up manually */
                 meta->pcb = NULL;
                 meta->active = false;
                 if (connection_count > 0) {
                     connection_count--;
                 }
+                /* Clean up inbound_tcp_client if needed */
                 if (inbound_tcp_client.pcb == pcb) {
                     inbound_tcp_client.active = false;
                     inbound_tcp_client.pcb = NULL;
                     inbound_tcp_client.bytes_sent = 0;
                     inbound_tcp_client.payload_len = 0;
                 }
+            } else {
+                /* tcp_close() succeeded - lwIP will manage the rest */
+                /* Don't clean up metadata yet - lwIP will call our callback */
+                printf("%s:   ✓ tcp_close() succeeded - lwIP will call callbacks when done\n",
+                       COMPONENT_NAME);
             }
         } else {
             printf("%s:   → No active PLC connection found (already closed or never existed)\n",
@@ -3799,16 +3789,16 @@ static int virtio_net_init(void)
 void post_init(void)
 {
     printf("%s: Component started\n", COMPONENT_NAME);
-    printf("%s: 🔖 NET1 SOFTWARE VERSION: v2.97-memory-barrier-pcb-null (2025-10-20)\n", COMPONENT_NAME);
+    printf("%s: 🔖 NET1 SOFTWARE VERSION: v2.98-close-wait-memory-leak-fix (2025-10-20)\n", COMPONENT_NAME);
     printf("%s: 🔧 MODE: PRODUCTION-READY with Multi-Layer Validation\n", COMPONENT_NAME);
     printf("%s: ✅ FIX 1: payload_data buffer (prevents dataport corruption)\n", COMPONENT_NAME);
     printf("%s: ✅ FIX 2: tcp_abort() removed from callbacks (crash at 0x38a9c fixed!)\n", COMPONENT_NAME);
     printf("%s: ✅ FIX 3: Connection reuse when SCADA keeps connection alive\n", COMPONENT_NAME);
     printf("%s: ✅ FIX 4: Close notification - Net0 tells Net1 when SCADA closes\n", COMPONENT_NAME);
     printf("%s: ✅ FIX 5: Stale connection cleanup on tcp_connect() failure\n", COMPONENT_NAME);
-    printf("%s: ✅ FIX 4: lwIP manages PCB lifecycle (no manual tcp_abort)\n", COMPONENT_NAME);
+    printf("%s: ✅ FIX 6: CLOSE_WAIT memory leak - always call tcp_close() regardless of state\n", COMPONENT_NAME);
     printf("%s: 🎯 FEATURES: Supports >MTU data, HTTP keep-alive, streaming protocols\n", COMPONENT_NAME);
-    printf("%s: ⚠️  CRITICAL: Never uses tcp_close() - always sends RST for immediate cleanup\n\n", COMPONENT_NAME);
+    printf("%s: ⚠️  CRITICAL: Uses tcp_close() for graceful shutdown (FIN handshake)\n\n", COMPONENT_NAME);
 
     /* Initialize connection tracking table */
     memset(connection_table, 0, sizeof(connection_table));

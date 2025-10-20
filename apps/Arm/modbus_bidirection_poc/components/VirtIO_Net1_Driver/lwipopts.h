@@ -45,7 +45,7 @@
 #define LWIP_WND_SCALE                  1
 #define TCP_RCV_SCALE                   2
 #define MEMP_NUM_TCP_SEG                TCP_SND_QUEUELEN
-#define MEMP_NUM_TCP_PCB                100     /* v2.95: lwIP-managed connection limit - lwIP refuses new connections when exhausted */
+#define MEMP_NUM_TCP_PCB                100     /* v2.100: Match PLC connection limit to prevent orphaned connections */
 #define MEMP_NUM_TCP_PCB_LISTEN         16      /* Max listening sockets (increased from 4) */
 
 /* UDP configuration */
@@ -53,7 +53,7 @@
 #define MEMP_NUM_UDP_PCB                4
 
 /* pbuf configuration */
-#define PBUF_POOL_SIZE                  32      /* Match our packet buffer count */
+#define PBUF_POOL_SIZE                  512     /* v2.100: Support 100 connections (100×3×1.25=375 → 512) */
 #define PBUF_POOL_BUFSIZE               2048    /* Match PACKET_BUFFER_SIZE */
 
 /* Checksum configuration - let hardware handle it if possible */

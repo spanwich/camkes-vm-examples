@@ -2094,6 +2094,36 @@ static err_t tcp_echo_accept(void *arg, struct tcp_pcb *newpcb, err_t err)
         return err != ERR_OK ? err : ERR_VAL;
     }
 
+    /* v2.100: CRITICAL - Hard connection limit to prevent orphaned connections
+     *
+     * Problem (earlier versions):
+     * - Net0 accepted unlimited SCADA connections (256 PCBs available)
+     * - Net1 tried to create corresponding PLC connections
+     * - PLC has limited connection capacity
+     * - Result: Orphaned Net0 connections with no PLC connection!
+     *
+     * Solution: Reject SCADA connections if we're at capacity
+     * - Both Net0 and Net1 set MEMP_NUM_TCP_PCB = 100
+     * - Reject at 95 (leave 5-connection buffer for safety)
+     * - Ensures 1:1 mapping between SCADA and PLC connections
+     */
+    #define MAX_SAFE_CONNECTIONS 95  /* PCB limit is 100, stay 5 under */
+
+    if (active_connections >= MAX_SAFE_CONNECTIONS) {
+        printf("%s: ❌ CONNECTION LIMIT REACHED (%u/%u) - REJECTING SCADA connection\n",
+               COMPONENT_NAME, active_connections, MAX_SAFE_CONNECTIONS);
+        printf("%s:    → This prevents orphaned connections when capacity limit reached\n",
+               COMPONENT_NAME);
+        printf("%s:    → SCADA IP: %u.%u.%u.%u:%u\n",
+               COMPONENT_NAME,
+               ip4_addr1(&newpcb->remote_ip), ip4_addr2(&newpcb->remote_ip),
+               ip4_addr3(&newpcb->remote_ip), ip4_addr4(&newpcb->remote_ip),
+               newpcb->remote_port);
+
+        tcp_abort(newpcb);  /* Send RST to SCADA */
+        return ERR_ABRT;
+    }
+
     active_connections++;
     total_connections_created++;
 
@@ -3088,7 +3118,7 @@ static int virtio_net_init(void)
 void post_init(void)
 {
     printf("%s: Component started\n", COMPONENT_NAME);
-    printf("%s: 🔖 NET0 SOFTWARE VERSION: v2.97-memory-barrier-pcb-null (2025-10-20)\n", COMPONENT_NAME);
+    printf("%s: 🔖 NET0 SOFTWARE VERSION: v2.100-connection-limit-45 (2025-10-20)\n", COMPONENT_NAME);
     printf("%s: 🔧 MODE: PRODUCTION with fast cleanup (every 100 iterations)\n", COMPONENT_NAME);
     printf("%s: ✅ FIX 1: awaiting_response flag prevents premature metadata cleanup!\n", COMPONENT_NAME);
     printf("%s: ✅ FIX 2: Send close notification to Net1 when SCADA closes\n", COMPONENT_NAME);

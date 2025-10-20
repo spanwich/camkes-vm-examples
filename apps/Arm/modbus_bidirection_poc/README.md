@@ -637,9 +637,11 @@ VirtIO_Net0_Driver: Sent X bytes to SCADA (appears from 192.168.95.2)
 
 ## Debugging
 
-### GDB Debugging with Persistent Sessions
+### ⭐ GDB Catch-All Fault Debugging (Recommended)
 
-For debugging seL4 VM faults, race conditions, and crashes that occur after extended runtime:
+**The primary debugging method for this project.**
+
+For debugging **ANY** memory fault in seL4 (not just specific addresses like 0x10), use the comprehensive fault-catching system:
 
 **📖 See [GDB-DEBUG-GUIDE.md](GDB-DEBUG-GUIDE.md) for complete documentation.**
 
@@ -648,49 +650,87 @@ For debugging seL4 VM faults, race conditions, and crashes that occur after exte
 ```bash
 cd ~/phd/camkes-vm-examples/build_modbus
 
-# Start persistent GDB debug session
+# Start persistent GDB debug session with comprehensive fault catching
 ./start-persistent-debug.sh
 ```
 
 This creates a tmux session with:
 - **QEMU + GDB server** (with proven network configuration)
-- **Interactive GDB client** (set breakpoints, inspect state)
+- **GDB with multi-level fault catching** (kernel + application + watchpoints)
 - **Live console log** (real-time monitoring)
+
+In the GDB pane, type `continue` to start execution. GDB will stop automatically before any crash occurs.
 
 #### Key Features
 
+- ✅ **Catches ALL memory faults** - Not just specific addresses
+- ✅ **Kernel-level interception** - Breaks at seL4's data abort handler
 - ✅ **Persistent sessions** - Survives SSH disconnection
-- ✅ **GDB watchpoints** - Catches VM faults before seL4's fault handler
 - ✅ **Automatic logging** - All debug sessions logged to `logs/`
 - ✅ **Interactive debugging** - Set breakpoints, inspect memory, analyze crashes
 - ✅ **Week-long runtime** - Designed for catching rare race conditions
+
+#### How It Works (Multi-Level Fault Catching)
+
+**Level 1: Kernel Data Abort Handler** (Primary)
+```gdb
+break *0xe0010274    # c_handle_data_fault() in seL4 kernel
+```
+- Catches **EVERY** data abort (any address: 0x10, 0x20, 0x1000, etc.)
+- Breaks **before** seL4 prints "FAULT HANDLER:"
+- Shows exact faulting PC and fault address
+- Works regardless of seL4 memory virtualization
+
+**Level 2: Application Faulting PC**
+```gdb
+break *0x39868    # Known crash location in tcp_output
+```
+- Catches specific crash sites from production logs
+- Can be updated for new crash locations
+
+**Level 3: NULL Region Watchpoints**
+```gdb
+watch *(int*)0x0, *(int*)0x10, *(int*)0x20
+```
+- Hardware watchpoints on common NULL offsets
+- Limited to 2-4 watchpoints on ARM
 
 #### Files
 
 | File | Purpose |
 |------|---------|
-| `start-persistent-debug.sh` | Main launcher (tmux + GDB + logging) |
-| `run-remote-gdb.sh` | QEMU with GDB server + network |
-| `gdb-sel4-debug.txt` | GDB initialization with fault watchpoints |
+| `start-persistent-debug.sh` | **Main script** - Creates tmux + GDB + logging |
+| `gdb-catch-all-faults.txt` | GDB config with multi-level fault catching |
+| `debug-catch-all.sh` | Manual GDB launcher (alternative) |
 | `check-debug-status.sh` | Check session status while detached |
+| `GDB-DEBUG-GUIDE.md` | Complete documentation |
 
-#### Example: Catching Fault at Address 0x10
+All scripts are in the project directory and automatically copied to `build_modbus/` during build.
 
-From production logs:
+#### Example: Catching Fault at ANY Address
+
+The system catches faults at any address, not just 0x10:
+
 ```
-FAULT HANDLER: data fault on address 0x10, pc = 0x38308
+╔═══════════════════════════════════════════════════════╗
+║  KERNEL: c_handle_data_fault() CALLED                ║
+╚═══════════════════════════════════════════════════════╝
+
+Fault address (DFAR): 0x10    ← Can be any address
+Faulting PC (LR):     0x39868  ← Exact instruction that faulted
+
+┌─── Registers ─────────────────────────────────────────┐
+r3 = 0x0   [NULL]  ← Root cause
+lr = 0x39868       ← Where fault occurred
+pc = 0xe0010274    ← Kernel handler
+
+┌─── Call Stack ────────────────────────────────────────┐
+#0  c_handle_data_fault (kernel)
+#1  tcp_output() at virtio_net1_driver.c:2504
+#2  inbound_tcp_connected_callback()
 ```
 
-The GDB setup automatically sets a watchpoint on `0x10` to catch this fault **before** it reaches seL4's fault handler.
-
-When fault occurs, GDB logs:
-- Exact PC location
-- Full register dump
-- Complete backtrace
-- Stack contents
-- Disassembly
-
-All saved to: `logs/gdb-<timestamp>.log`
+All saved to: `logs/gdb-<timestamp>.log` and `logs/console-<timestamp>.log`
 
 ### Console Log Analysis
 

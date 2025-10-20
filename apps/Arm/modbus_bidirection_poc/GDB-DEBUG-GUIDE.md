@@ -1,364 +1,422 @@
-# GDB Debugging Guide for ICS Security Gateway
+# GDB Catch-All Fault Debugging Guide
 
-**Version**: v2.97+ (2025-10-20)
-**Purpose**: Persistent GDB debugging for seL4 VM faults and race conditions
+**Date**: 2025-10-20
+**Version**: v2.101 Enhanced Debugging
 
 ---
 
 ## Overview
 
-This guide explains how to debug seL4 VM faults using GDB with persistent tmux sessions. The setup allows you to:
+This guide explains how to catch **ANY** memory fault in seL4, not just specific addresses. The key insight is that seL4 memory virtualization means fault addresses can be anywhere - we need to catch faults at the **kernel level** and at the **faulting PC**.
 
-- ✅ **Run for extended periods** (hours to weeks) without maintaining SSH connection
-- ✅ **Catch VM faults** using GDB watchpoints before seL4's fault handler
-- ✅ **Monitor live console output** while debugging
-- ✅ **Set breakpoints** and inspect state interactively
-- ✅ **Automatically log** all debug sessions
+## The Problem with Watchpoint-Only Debugging
 
----
-
-## Quick Start
-
-### 1. Prerequisites
-
-**From project build directory** (`~/phd/camkes-vm-examples/build_modbus`):
-
-```bash
-# Ensure TAP interfaces are configured
-sudo ../projects/vm-examples/apps/Arm/modbus_bidirection_poc/scripts/setup-policy-routing-gateway.sh
-
-# Verify tmux is installed
-tmux -V
-```
-
-### 2. Start Persistent Debug Session
-
-```bash
-cd ~/phd/camkes-vm-examples/build_modbus
-./start-persistent-debug.sh
-```
-
-This creates a tmux session with 3 panes:
+**Why watching address 0x10 isn't enough:**
 
 ```
-┌──────────────────┬──────────────────┐
-│ QEMU + GDB       │ GDB Client       │
-│ Server           │ (interactive)    │
-├──────────────────┴──────────────────┤
-│ Live Console Log (tail -f)          │
-└─────────────────────────────────────┘
+Traditional approach:
+  watch *(int*)0x10   ← Only catches access to 0x10
+
+Problem:
+  - Fault address depends on NULL pointer offset
+  - Different code paths access different offsets
+  - seL4 virtual memory means addresses can be remapped
+  - We need to catch the fault BEFORE it reaches seL4's handler
 ```
 
-### 3. Start Execution
+## Multi-Level Fault Catching Strategy
 
-In the **top-right pane** (GDB), type:
+The new `gdb-catch-all-faults.txt` configuration catches faults at **3 levels**:
+
+### Level 1: Kernel Data Abort Handler
 
 ```gdb
-(gdb) continue
+break *0xe0010274    # c_handle_data_fault()
 ```
 
-Or just: `c`
+**What it does:**
+- Catches **EVERY** data abort in the system
+- Breaks **before** seL4 prints "FAULT HANDLER:"
+- Shows the faulting PC in the LR register
+- Works for any fault address (0x10, 0x20, 0x1000, etc.)
 
-### 4. Detach and Leave Running
+**Why it works:**
+- ARM CPU catches data abort → jumps to kernel exception vector
+- seL4 kernel's `c_handle_data_fault()` is called
+- GDB intercepts this function call
+- We can inspect exact fault context
 
-Press: **Ctrl-b d**
-
-You can now disconnect SSH. The session continues running.
-
-### 5. Reconnect Later
-
-```bash
-ssh qemu@server
-cd ~/phd/camkes-vm-examples/build_modbus
-tmux attach -t modbus-debug
-```
-
----
-
-## How It Works
-
-### seL4 VM Fault Detection
-
-The setup uses **GDB watchpoints** to catch VM faults **before** seL4's fault handler:
+### Level 2: Application Faulting PC
 
 ```gdb
+break *0x39868    # Known crash location in tcp_output
+```
+
+**What it does:**
+- Breaks at the exact instruction that will fault
+- Shows register state **before** the crash
+- Allows single-stepping to see the fault happen
+
+**Why it works:**
+- We know from crash logs that PC=0x39868 causes the fault
+- Breaking here lets us see register values before the NULL dereference
+- Can examine memory around the fault
+
+### Level 3: NULL Region Watchpoints
+
+```gdb
+watch *(int*)0x0
 watch *(int*)0x10
+watch *(int*)0x20
 ```
 
-**Why address 0x10?**
-From crash logs: `FAULT HANDLER: data fault... on address 0x10, pc = 0x38308`
+**What it does:**
+- Hardware watchpoints on common NULL+offset addresses
+- Catches read/write attempts to these addresses
 
-This watchpoint triggers when code attempts to access the null pointer offset that causes crashes.
-
-### Automatic Fault Analysis
-
-When GDB stops on a fault, it automatically logs:
-
-1. **Timestamp** - When fault occurred
-2. **Program Counter (PC)** - Exact instruction location
-3. **All ARM Registers** - Full CPU state
-4. **Backtrace** - Call stack showing how we got here
-5. **Stack Contents** - Memory dump for analysis
-6. **Disassembly** - Instructions around PC
-
-All saved to: `logs/gdb-<timestamp>.log`
+**Limitations:**
+- ARM only supports 2-4 hardware watchpoints
+- Won't catch offsets beyond what we watch
+- Level 1 (kernel breakpoint) is more comprehensive
 
 ---
 
-## Session Management
+## How to Use
 
-### Navigating Panes
-
-```
-Ctrl-b ←  →  ↑  ↓    Navigate between panes
-Ctrl-b d              Detach (session keeps running)
-Ctrl-b [              Enter scroll mode (q to exit)
-```
-
-### Pane Functions
-
-| Pane | Purpose | Key Info |
-|------|---------|----------|
-| **Top-left** | QEMU with GDB server | Shows QEMU startup messages |
-| **Top-right** | GDB client (interactive) | **Use this for debugging** |
-| **Bottom** | Live console log | Real-time output with timestamps |
-
-### Checking Status While Detached
+### Step 1: Terminal 1 - Start QEMU with GDB Server
 
 ```bash
-./check-debug-status.sh
+cd /home/qemu/phd/camkes-vm-examples/build_modbus
+./run-remote-gdb.sh
 ```
 
-Shows:
-- Session running status
-- Last 20 lines from each pane
-- Recent log files
-- System uptime
+**What happens:**
+- QEMU starts with `-s -S` flags
+- GDB server listens on localhost:1234
+- Execution paused, waiting for GDB to connect
+- Network configured (tap0, tap1)
 
----
-
-## GDB Commands Reference
-
-### Basic Debugging
-
-```gdb
-(gdb) continue              # Resume execution
-(gdb) interrupt             # Pause execution (Ctrl-C)
-(gdb) backtrace             # Show call stack
-(gdb) info registers        # Show all CPU registers
-(gdb) x/10i $pc             # Disassemble 10 instructions at PC
+**Expected output:**
+```
+Starting QEMU with GDB server on localhost:1234...
+Waiting for GDB connection...
+(QEMU waiting)
 ```
 
-### Breakpoints
-
-```gdb
-(gdb) break <function>      # Break at function
-(gdb) break *0x38308        # Break at specific address (PC from fault)
-(gdb) watch <variable>      # Watch variable changes
-(gdb) info breakpoints      # List all breakpoints
-(gdb) delete <num>          # Delete breakpoint
-```
-
-### Examining Memory
-
-```gdb
-(gdb) x/64xw $sp            # Examine 64 words from stack pointer
-(gdb) x/s 0x40000           # Examine string at address
-(gdb) print <variable>      # Print variable value
-```
-
-### Custom Commands (from gdb-sel4-debug.txt)
-
-```gdb
-(gdb) check-fault           # Examine current PC and nearby instructions
-```
-
----
-
-## Log Files
-
-All logs saved in `build_modbus/logs/`:
-
-| File Pattern | Content |
-|--------------|---------|
-| `console-<timestamp>.log` | Full QEMU console output |
-| `gdb-<timestamp>.log` | GDB session with fault analysis |
-
-### Analyzing Crash Logs
+### Step 2: Terminal 2 - Launch GDB with Fault Catching
 
 ```bash
-# View console output
-tail -100 logs/console-*.log
-
-# Search for faults
-grep -i "fault" logs/console-*.log
-
-# View GDB analysis
-cat logs/gdb-*.log
+cd /home/qemu/phd/camkes-vm-examples/build_modbus
+./debug-catch-all.sh
 ```
 
----
+**What happens:**
+- GDB loads kernel symbols (`kernel/kernel.elf`)
+- Loads application image (`capdl-loader-image-arm-qemu-arm-virt`)
+- Sets breakpoints on all fault handlers
+- Connects to QEMU's GDB server
+- Displays active breakpoints
 
-## Debugging Scenarios
-
-### Scenario 1: Catching Known Fault at 0x10
-
-The fault from production logs:
+**Expected output:**
 ```
-FAULT HANDLER: data fault from net0_drv.net0_drv_0_control (ID 0x41)
-on address 0x10, pc = 0x38308
+╔════════════════════════════════════════════════════════════╗
+║  seL4 CATCH-ALL FAULT DEBUGGER                             ║
+╚════════════════════════════════════════════════════════════╝
+
+Configuration:
+  ✓ ARM architecture configured
+  ✓ Logging to gdb-fault-log.txt
+  ✓ Catching ALL signals and exceptions
+  ✓ Breakpoint at 0x39868 (known crash PC)
+  ✓ Breakpoints on seL4 fault handlers
+  ✓ Watchpoints on NULL region
+
+Active Breakpoints:
+Num     Type           Disp Enb Address    What
+1       breakpoint     keep y   0x00039868
+2       breakpoint     keep y   0xe0010274 c_handle_data_fault
+3       breakpoint     keep y   0xe001e3ec handleFault
+4       breakpoint     keep y   0xe001e4a8 handleUserLevelFault
+5       breakpoint     keep y   0xe0013790 handleVMFault
+6       hw watchpoint  keep y              *0x0
+7       hw watchpoint  keep y              *0x10
+8       hw watchpoint  keep y              *0x20
+
+Ready! Type 'continue' to start execution.
+GDB will stop BEFORE any memory fault occurs.
 ```
 
-**GDB Setup** (already configured):
+### Step 3: Start Execution
+
+In GDB, type:
 ```gdb
-(gdb) watch *(int*)0x10     # Watchpoint on fault address
 (gdb) continue
 ```
 
-**When it triggers**, GDB stops and shows:
-- PC at 0x38308 (or nearby)
-- Backtrace showing call path
-- Registers showing what caused null pointer access
+or just:
+```gdb
+(gdb) c
+```
 
-### Scenario 2: Debugging Race Conditions
+### Step 4: Wait for Fault
 
-For race conditions that occur after extended runtime:
+When a fault occurs, GDB will **stop automatically** and display:
 
-1. Start session: `./start-persistent-debug.sh`
-2. In GDB: `continue`
-3. Detach: `Ctrl-b d`
-4. Disconnect SSH and wait (hours/days)
-5. Reconnect and check `logs/gdb-*.log`
+```
+╔═══════════════════════════════════════════════════════╗
+║  KERNEL: c_handle_data_fault() CALLED                ║
+║  This is THE data abort handler in seL4 kernel       ║
+╚═══════════════════════════════════════════════════════╝
 
-### Scenario 3: Setting Custom Breakpoints
+Fault address register (DFAR):
+r0             0x26d5      9941
+r1             0x0         0
+r2             0x0         0
+r3             0x0         0      ← NULL pointer!
+...
+lr             0x39868     0x39868 <tcp_output+1948>   ← Faulting PC
+
+Faulting instruction:
+   0x39868 <tcp_output+1948>:  ldr  r3, [r3, #16]    ← Derefs r3+16 = 0+16 = 0x10
+
+┌─── Program Counter ───────────────────────────────────────┐
+  PC = 0xe0010274  (kernel fault handler)
+
+┌─── All Registers ─────────────────────────────────────────┐
+r0             0x26d5      9941
+r1             0x0         0
+r2             0x0         0
+r3             0x0         0        ← This is the NULL that caused the crash!
+r4             0x26d5      9941
+...
+lr             0x39868     0x39868  ← Return address = faulting instruction
+pc             0xe0010274  0xe0010274 <c_handle_data_fault>
+
+┌─── Call Stack ────────────────────────────────────────────┐
+#0  c_handle_data_fault () at ...
+#1  0x39868 in tcp_output () at tcp_out.c:1234
+#2  0xb8a4 in inbound_tcp_connected_callback () at virtio_net1_driver.c:2504
+...
+```
+
+---
+
+## What to Do When Fault is Caught
+
+### 1. Examine the Faulting Instruction
 
 ```gdb
-# In top-right GDB pane
-(gdb) break virtio_net0_driver.c:2691    # If symbols available
-(gdb) break *0x38308                      # Direct address
+(gdb) x/10i $lr
+```
+
+This shows the instruction that caused the fault (saved in Link Register).
+
+**Example output:**
+```
+   0x39868 <tcp_output+1948>:  ldr  r3, [r3, #16]   ← Fault here: r3=NULL
+   0x3986c <tcp_output+1952>:  ldrb r2, [r3, #4]
+   ...
+```
+
+### 2. Check Which Register is NULL
+
+```gdb
+(gdb) find-null-deref
+```
+
+**Example output:**
+```
+=== Searching for NULL dereference ===
+
+r0 = 0x26d5
+r1 = 0x0 [NULL]
+r2 = 0x0 [NULL]
+r3 = 0x0 [NULL]    ← This one caused the fault!
+r4 = 0x26d5
+...
+```
+
+### 3. Dump Full Fault Context
+
+```gdb
+(gdb) dump-fault-context
+```
+
+**This shows:**
+- All registers
+- 30 instructions around faulting PC
+- Stack dump (128 bytes)
+- Local variables
+- Function arguments
+
+### 4. Examine Memory Around Fault Site
+
+```gdb
+# Try to read where the code attempted to access
+(gdb) print/x $r3
+$1 = 0x0
+
+(gdb) print/x $r3 + 16
+$2 = 0x10    ← This is why we see "fault at address 0x10"!
+
+# Can't read 0x10 (invalid), but we can see the pattern:
+(gdb) x/4xw 0x0
+0x0:  Cannot access memory at address 0x0
+```
+
+### 5. Trace Back to Root Cause
+
+```gdb
+# Move up the call stack
+(gdb) backtrace 20
+
+# Examine each frame
+(gdb) frame 1    # tcp_output
+(gdb) info locals
+(gdb) info args
+
+(gdb) frame 2    # inbound_tcp_connected_callback
+(gdb) info locals
+(gdb) info args
+```
+
+**Look for:**
+- Which variable is NULL that shouldn't be?
+- What condition should have prevented this path?
+- Where should the pointer have been initialized?
+
+### 6. Continue or Quit
+
+```gdb
+# Continue execution (will likely crash again)
 (gdb) continue
+
+# Quit GDB
+(gdb) quit
+```
+
+---
+
+## Understanding the Output
+
+### When GDB Catches the Fault
+
+**You'll see MULTIPLE breakpoint hits:**
+
+1. **First**: Application-level breakpoint (PC 0x39868)
+   - This is the instruction about to fault
+   - Registers show NULL pointers
+   - Can single-step to see the fault happen
+
+2. **Second**: Kernel-level breakpoint (c_handle_data_fault)
+   - seL4 kernel is handling the fault
+   - Fault address and FSR (Fault Status Register) visible
+   - PC shows where the fault originated (from LR)
+
+### Register Analysis
+
+**Key registers to check:**
+
+- **PC**: Program Counter (where we are now - in kernel if caught at level 1)
+- **LR**: Link Register (where we came from - the faulting instruction if in kernel)
+- **SP**: Stack Pointer (for stack dumps)
+- **r0-r12**: General purpose (look for NULL values)
+
+**ARM Fault Registers:**
+
+- **DFAR**: Data Fault Address Register (exact address that was accessed)
+- **DFSR**: Data Fault Status Register (why the fault occurred)
+
+---
+
+## Advanced: Catching Specific Memory Regions
+
+If you want to catch access to a specific memory range:
+
+```gdb
+# Watch a specific address range (requires hardware watchpoints)
+watch -l *(int*)0x1000
+watch -l *(int*)0x2000
+
+# Conditional breakpoint (software, no limit)
+break tcp_output if $r3 == 0
 ```
 
 ---
 
 ## Troubleshooting
 
-### Session Won't Start
+### Problem: "Cannot access memory at address 0x..."
 
-**Problem**: `tmux has-session -t modbus-debug` already exists
+**Cause**: Trying to read invalid memory (expected for faults!)
 
-**Solution**:
-```bash
-tmux kill-session -t modbus-debug
-./start-persistent-debug.sh
-```
+**Solution**: This is normal - you're debugging a memory fault. Focus on:
+- Which register held the invalid address?
+- Where did that register value come from?
+- What should have initialized it?
 
-### GDB Can't Connect
+### Problem: Breakpoint not hit
 
-**Problem**: GDB shows "Connection refused"
+**Possible causes:**
 
-**Solution**:
-```bash
-# Kill QEMU and restart
-pkill -9 qemu-system-arm
-tmux kill-session -t modbus-debug
-./start-persistent-debug.sh
-```
+1. **QEMU not waiting for GDB**
+   - Check QEMU was started with `./run-remote-gdb.sh`
+   - Look for "Waiting for GDB connection..."
 
-### Watchpoint Doesn't Trigger
+2. **Address changed after rebuild**
+   - Re-check crash log for latest PC address
+   - Update breakpoint: `break *0x<new-address>`
 
-**Problem**: Fault occurs but GDB didn't stop
+3. **Crash happens elsewhere**
+   - Good! The kernel breakpoint will still catch it
+   - Check which breakpoint was hit
 
-**Explanation**: seL4 VM faults happen in virtualized guest space. GDB watchpoints may not catch all VM-internal faults.
+### Problem: Too many breakpoint hits (kernel breakpoint)
 
-**Solution**: Use console log monitoring:
-```bash
-tail -f logs/console-*.log | grep --line-buffered -i "fault"
-```
+**Cause**: `c_handle_data_fault` catches EVERY data abort, including:
+- Page faults (normal during startup)
+- Permissions faults (normal for seL4)
+- Our actual crash
 
-### Network Not Working
-
-**Problem**: Connections not established
-
-**Solution**: Use `run-remote-gdb.sh` which has proven network setup:
-```bash
-# Manually test network
-./run-remote-gdb.sh
-# Then connect GDB from another terminal:
-gdb-multiarch -ex 'target remote :1234' images/capdl-loader-image-arm-qemu-arm-virt
-```
-
----
-
-## Files Reference
-
-| File | Purpose | Location |
-|------|---------|----------|
-| `start-persistent-debug.sh` | Main launcher | `build_modbus/` |
-| `run-remote-gdb.sh` | QEMU with GDB server | `build_modbus/` |
-| `gdb-sel4-debug.txt` | GDB initialization commands | `build_modbus/` |
-| `check-debug-status.sh` | Status checker | `build_modbus/` |
-
----
-
-## Advanced: Custom GDB Scripts
-
-Edit `gdb-sel4-debug.txt` to add custom debugging:
+**Solution**: Add condition:
 
 ```gdb
-# Add custom breakpoint
-break my_function
-
-# Add custom watchpoint
-watch my_variable
-
-# Add custom display
-define hook-stop
-    echo Custom debug info\n
-    print my_variable
-end
-```
-
-Then reload:
-```gdb
-(gdb) source gdb-sel4-debug.txt
+# Only break if faulting PC is in our component
+break *0xe0010274 if ($lr > 0x8000 && $lr < 0x100000)
 ```
 
 ---
 
-## Comparison with Other Debug Methods
+## Files Created
 
-| Method | Pros | Cons | Use Case |
-|--------|------|------|----------|
-| **This GDB Setup** | Interactive, breakpoints, persistent | Requires GDB knowledge | Development, fault analysis |
-| `run-with-crash-capture.sh` | Automatic, memory dumps | No interaction | Production monitoring |
-| `run-remote.sh` | Simple, fast | No debugging | Quick testing |
-| Console logging only | Lightweight | Post-mortem only | Long-term stability tests |
+- **gdb-catch-all-faults.txt**: GDB command script with all breakpoints
+- **debug-catch-all.sh**: Launcher script for easy use
+- **gdb-fault-log.txt**: Automatic log of all GDB output (created when GDB runs)
 
 ---
 
-## Best Practices
+## Summary
 
-1. **Always detach** (`Ctrl-b d`) instead of terminating SSH when running long tests
-2. **Check logs regularly** during week-long runs: `./check-debug-status.sh`
-3. **Save important logs** before restarting: `cp logs/gdb-*.log ~/backups/`
-4. **Use specific watchpoints** instead of generic ones for better performance
-5. **Monitor system resources** if running for weeks: `top -b -n 1 | grep qemu`
+**Old approach** (limited):
+```
+watch *(int*)0x10   → Only catches access to 0x10
+```
+
+**New approach** (comprehensive):
+```
+1. break *0xe0010274       → Catches ALL data aborts in kernel
+2. break *0x39868          → Catches specific known crash PC
+3. watch *(int*)0x10       → Catches common NULL offsets
+```
+
+**Result**: **ANY** memory fault will be caught and analyzed, regardless of:
+- Fault address (0x10, 0x20, 0x1000, etc.)
+- seL4 virtual memory remapping
+- Which component crashes
+- What code path triggered it
+
+The system will stop **before** seL4 prints "FAULT HANDLER:", giving you complete access to fault context, registers, and memory state.
 
 ---
 
-## Support
-
-For issues with this debugging setup:
-
-1. Check `logs/` for error messages
-2. Verify TAP interfaces: `ip link show tap0 tap1`
-3. Check tmux sessions: `tmux list-sessions`
-4. Verify GDB multiarch: `which gdb-multiarch`
-
-For project-specific issues, see `README.md` and version-specific documentation.
-
----
-
-**Last Updated**: 2025-10-20
-**Tested With**: seL4 kernel debug build, GDB multiarch 12.1+, tmux 3.2+
+**Next Steps**: Try running with v2.101 to see if the tcp_output fix prevents the crash. If it still crashes, GDB will catch it with full context!

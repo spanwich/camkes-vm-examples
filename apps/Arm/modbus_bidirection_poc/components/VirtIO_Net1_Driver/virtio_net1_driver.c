@@ -2485,8 +2485,56 @@ static err_t inbound_tcp_connected_callback(void *arg, struct tcp_pcb *pcb, err_
 
     printf("%s: ✓ Callbacks registered: recv=%p, sent=%p\n", COMPONENT_NAME, (void*)inbound_tcp_recv_callback, (void*)inbound_tcp_sent_callback);
 
+    /* v2.101: CRITICAL FIX - Check send buffer before calling tcp_output()
+     * ════════════════════════════════════════════════════════════════════
+     * Bug Discovery (2025-10-20):
+     * - Connection just established, tcp_sndbuf(pcb) returns 0 (no window yet)
+     * - to_send = 0, tcp_write(pcb, data, 0) succeeds but queues nothing
+     * - pcb->unsent remains NULL (no data queued)
+     * - tcp_output(pcb) tries to access pcb->unsent->next at offset +16
+     * - CRASH: NULL pointer dereference at address 0x10
+     *
+     * Evidence from crash log:
+     * - "TCP connection ESTABLISHED to PLC - registering callbacks"
+     * - "Callbacks registered: recv=0xb878, sent=0xbeb8"
+     * - FAULT: pc=0x39868 (inside tcp_output), address=0x10
+     * - Disassembly: ldr r3, [r3, #16] where r3=0
+     *
+     * Root Cause:
+     * - TCP connection just established but remote window not yet advertised
+     * - tcp_sndbuf() returns 0 (send buffer available but remote can't receive)
+     * - Calling tcp_output() with empty unsent queue causes NULL dereference
+     *
+     * Fix: Only call tcp_output() if data was actually queued
+     * - Check to_send > 0 before tcp_write()
+     * - lwIP will call sent callback when buffer space available
+     * - sent callback will retry transmission
+     *
+     * This is a race condition between:
+     * 1. TCP connection establishment (3-way handshake completes)
+     * 2. Remote window advertisement (may arrive slightly later)
+     * 3. Immediate data transmission attempt (before window known)
+     */
+
     /* Send the payload */
     uint16_t to_send = (state->payload_len > tcp_sndbuf(pcb)) ? tcp_sndbuf(pcb) : state->payload_len;
+
+    if (to_send == 0) {
+        /* Send buffer full - defer transmission until sent callback */
+        printf("%s: ⚠️  Send buffer full (sndbuf=%u), deferring transmission of %u bytes\n",
+               COMPONENT_NAME, tcp_sndbuf(pcb), state->payload_len);
+        printf("%s:    → Will retry in tcp_sent callback when buffer available\n", COMPONENT_NAME);
+
+        /* Keep state active - sent callback will retry when buffer space available
+         * This is safe because:
+         * 1. Connection is established (callbacks registered)
+         * 2. State is marked active with pending data
+         * 3. lwIP will call sent callback when ACKs arrive and free buffer space
+         * 4. sent callback checks state->bytes_sent < state->payload_len and retries
+         */
+        state->bytes_sent = 0;
+        return ERR_OK;
+    }
 
     err = tcp_write(pcb, state->payload_data, to_send, TCP_WRITE_FLAG_COPY);
     if (err != ERR_OK) {
@@ -2500,7 +2548,7 @@ static err_t inbound_tcp_connected_callback(void *arg, struct tcp_pcb *pcb, err_
 
     state->bytes_sent = to_send;
 
-    /* Trigger transmission */
+    /* Trigger transmission - safe now because we know data was queued */
     tcp_output(pcb);
 
     #if DEBUG_TRAFFIC

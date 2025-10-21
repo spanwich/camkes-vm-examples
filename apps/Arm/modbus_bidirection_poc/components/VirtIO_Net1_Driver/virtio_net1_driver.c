@@ -3085,11 +3085,68 @@ void inbound_ready_handle(void)
         if (was_recently_self_cleaned(ics_msg->metadata.src_ip,
                                        ics_msg->metadata.src_port,
                                        ics_msg->metadata.dst_port)) {
-            printf("%s:   → IGNORING stale notification - we cleaned this connection ourselves\n",
+
+            /* v2.117: CRITICAL FIX - Verify with Net0's state before ignoring
+             * ═══════════════════════════════════════════════════════════════════
+             * Problem: Self-cleaned tracking can give FALSE POSITIVES:
+             * - We cleaned connection A (5-tuple X)
+             * - Net0 creates NEW connection B (same 5-tuple X)
+             * - Net0 sends close notification for B
+             * - We see 5-tuple X in self-cleaned → incorrectly ignore it!
+             * - Result: We keep B alive while Net0 closed it → ASYMMETRIC STATE
+             *
+             * Solution: Check Net0's peer_state dataport
+             * - If Net0 STILL HAS the connection: This is NOT stale, don't ignore!
+             * - If Net0 DOESN'T have it: Truly stale, safe to ignore
+             * ═══════════════════════════════════════════════════════════════════
+             */
+
+            bool net0_has_connection = false;
+            if (peer_state != NULL) {
+                __sync_synchronize();  /* Memory barrier - read latest Net0 state */
+
+                printf("%s:   → Self-cleaned match found - verifying with Net0 state...\n",
+                       COMPONENT_NAME);
+
+                for (int i = 0; i < MAX_SHARED_CONNECTIONS; i++) {
+                    const struct connection_view *view = &peer_state->connections[i];
+                    if (view->active &&
+                        view->src_ip == ics_msg->metadata.src_ip &&     /* SCADA IP */
+                        view->dst_ip == ics_msg->metadata.dst_ip &&     /* PLC IP */
+                        view->src_port == ics_msg->metadata.src_port && /* SCADA port */
+                        view->dst_port == ics_msg->metadata.dst_port) { /* PLC port */
+
+                        net0_has_connection = true;
+                        printf("%s:   ✗ Net0 STILL HAS this connection (slot %d) - NOT stale!\n",
+                               COMPONENT_NAME, i);
+                        printf("%s:      → Net0 wants us to close it - processing notification\n",
+                               COMPONENT_NAME);
+                        break;
+                    }
+                }
+
+                if (!net0_has_connection) {
+                    printf("%s:   ✓ Net0 doesn't have it either - notification is truly stale\n",
+                           COMPONENT_NAME);
+                }
+            } else {
+                printf("%s:   → peer_state not available - using self-cleaned check only\n",
+                       COMPONENT_NAME);
+            }
+
+            if (!net0_has_connection) {
+                /* Net0 doesn't have it - safe to ignore */
+                printf("%s:   → IGNORING stale notification - we cleaned this connection ourselves\n",
+                       COMPONENT_NAME);
+                printf("%s:      A NEW connection may exist with same 5-tuple - must NOT close it!\n",
+                       COMPONENT_NAME);
+                return;  /* Ignore stale notification */
+            }
+
+            /* Net0 still has it - fall through to process the close notification */
+            printf("%s:   → Processing close notification despite self-cleaned match\n",
                    COMPONENT_NAME);
-            printf("%s:      A NEW connection may exist with same 5-tuple - must NOT close it!\n",
-                   COMPONENT_NAME);
-            return;  /* Ignore stale notification */
+            printf("%s:      (Net0 verification prevents false positive)\n", COMPONENT_NAME);
         }
 
         /* Look up PLC connection for this SCADA session */

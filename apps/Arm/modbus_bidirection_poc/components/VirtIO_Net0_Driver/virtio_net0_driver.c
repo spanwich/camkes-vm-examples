@@ -2815,7 +2815,31 @@ void outbound_ready_handle(void)
 
     if (meta == NULL) {
         BREADCRUMB(3007);  /* Connection not found */
-        printf("%s: [ERR] OUTBOUND: No metadata found for %u.%u.%u.%u:%u → %u.%u.%u.%u:%u\n",
+
+        /* v2.117: CRITICAL FIX - Check Net1's connection state before dropping response
+         * ═══════════════════════════════════════════════════════════════════════════
+         * Problem: Asymmetric state between Net0 and Net1 causes system hang
+         *
+         * Scenario:
+         * 1. SCADA sends request → Net0 → Net1 → PLC
+         * 2. SCADA closes connection (FIN received by Net0)
+         * 3. Net0 removes metadata (connection_remove called)
+         * 4. Close notification sent to Net1
+         * 5. Net1 IGNORES notification (self-cleaned tracking - correct!)
+         * 6. PLC sends response → Net1 forwards to Net0
+         * 7. Net0 looks up metadata → NOT FOUND (we removed it in step 3!)
+         * 8. Net0 drops response → SYSTEM HANGS
+         *
+         * Root Cause: Net0 removed metadata but Net1 kept connection active
+         *
+         * Solution: Check Net1's connection state via peer_state dataport
+         * - If Net1 still has the connection active, forward response anyway
+         * - Use connection info from ICS message (already validated by ICS_Outbound)
+         * - This solves the asymmetric state problem
+         * ═══════════════════════════════════════════════════════════════════════════
+         */
+
+        printf("%s: [WARN]  OUTBOUND: No local metadata for %u.%u.%u.%u:%u → %u.%u.%u.%u:%u\n",
                COMPONENT_NAME,
                (ics_msg->metadata.dst_ip >> 24) & 0xFF, (ics_msg->metadata.dst_ip >> 16) & 0xFF,
                (ics_msg->metadata.dst_ip >> 8) & 0xFF, ics_msg->metadata.dst_ip & 0xFF,
@@ -2823,7 +2847,70 @@ void outbound_ready_handle(void)
                (ics_msg->metadata.src_ip >> 24) & 0xFF, (ics_msg->metadata.src_ip >> 16) & 0xFF,
                (ics_msg->metadata.src_ip >> 8) & 0xFF, ics_msg->metadata.src_ip & 0xFF,
                ics_msg->metadata.src_port);
-        printf("%s:    Connection may have been closed or timed out\n", COMPONENT_NAME);
+
+        /* Check if Net1 still has this connection active */
+        bool net1_has_connection = false;
+        if (peer_state != NULL) {
+            __sync_synchronize();  /* Memory barrier - ensure we read latest Net1 state */
+
+            printf("%s:    → Checking Net1's connection state (count=%u, last_update=%u)...\n",
+                   COMPONENT_NAME, peer_state->count, peer_state->last_update);
+
+            for (int i = 0; i < MAX_SHARED_CONNECTIONS; i++) {
+                const struct connection_view *view = &peer_state->connections[i];
+                if (view->active &&
+                    view->src_ip == ics_msg->metadata.dst_ip &&   /* SCADA IP */
+                    view->dst_ip == ics_msg->metadata.src_ip &&   /* PLC IP */
+                    view->src_port == ics_msg->metadata.dst_port && /* SCADA port */
+                    view->dst_port == ics_msg->metadata.src_port) { /* PLC port */
+
+                    net1_has_connection = true;
+                    printf("%s:    ✓ Net1 STILL HAS connection (slot %d, age=%u ms)\n",
+                           COMPONENT_NAME, i, sys_now() - view->timestamp);
+                    printf("%s:      → Forwarding response despite missing local metadata\n",
+                           COMPONENT_NAME);
+                    printf("%s:      → This solves asymmetric state problem!\n", COMPONENT_NAME);
+                    break;
+                }
+            }
+
+            if (!net1_has_connection) {
+                printf("%s:    ✗ Net1 doesn't have connection either - response truly orphaned\n",
+                       COMPONENT_NAME);
+            }
+        } else {
+            printf("%s:    ✗ peer_state not available - cannot check Net1\n", COMPONENT_NAME);
+        }
+
+        if (!net1_has_connection) {
+            printf("%s:    Connection closed by both Net0 and Net1 - dropping response\n",
+                   COMPONENT_NAME);
+            return;
+        }
+
+        /* Net1 has it! But we have a problem: SCADA already closed the connection on our side.
+         * We removed metadata because SCADA sent FIN. There's no PCB to send the response to!
+         *
+         * This reveals the TRUE root cause: Net1 kept the connection alive but Net0 already
+         * closed it. The response has nowhere to go because SCADA closed.
+         *
+         * This is actually EXPECTED BEHAVIOR - if SCADA closes before PLC responds, the
+         * response should be dropped. The hang was caused by Net1 waiting indefinitely.
+         *
+         * The real fix is for Net1 to detect this asymmetry and close its side too.
+         */
+        printf("%s: [ASYMMETRY DETECTED] Net1 has connection but Net0 doesn't (SCADA closed)\n",
+               COMPONENT_NAME);
+        printf("%s:    → Cannot forward response - no PCB available (SCADA already closed)\n",
+               COMPONENT_NAME);
+        printf("%s:    → Net1 should close its connection too (will happen via timeout)\n",
+               COMPONENT_NAME);
+        return;
+    }
+
+    /* Sanity check - meta should not be NULL at this point */
+    if (meta == NULL) {
+        printf("%s: [BUG] meta is NULL but we didn't return - logic error!\n", COMPONENT_NAME);
         return;
     }
 

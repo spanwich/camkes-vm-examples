@@ -2045,7 +2045,18 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
             inbound_ready_emit();
         }
 
-        /* v2.115: STEP 4 - Close connection using correct lwIP protocol
+        /* v2.115: STEP 4 - Check PCB validity before tcp_close()
+         * CRITICAL: Callback parameter `pcb` can be NULL in error cases!
+         * Must check before calling tcp_close() or tcp_abort()
+         */
+        if (pcb == NULL) {
+            printf("%s: [WARN]  recv(p=NULL) called with NULL pcb - already freed by lwIP\n",
+                   COMPONENT_NAME);
+            /* Connection already cleaned up by lwIP - just return */
+            return ERR_OK;
+        }
+
+        /* v2.115: STEP 5 - Close connection using correct lwIP protocol
          * Try graceful close first, fall back to abort if it fails.
          */
         err_t close_err = tcp_close(pcb);

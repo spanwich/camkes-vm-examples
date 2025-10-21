@@ -254,14 +254,14 @@ assembly {
         /* ═══ v2.117: Connection State Sharing - Net0 ↔ Net1 ═══ */
         /* Net0 reads Net1's connection state (read-only) */
         connection seL4SharedData net0_reads_net1_state(
-            from net0_drv.net1_conn_state,
-            to net1_drv.net1_conn_state
+            from net1_drv.net1_conn_state,
+            to net0_drv.net1_conn_state
         );
 
         /* Net1 reads Net0's connection state (read-only) */
         connection seL4SharedData net1_reads_net0_state(
-            from net1_drv.net0_conn_state,
-            to net0_drv.net0_conn_state
+            from net0_drv.net0_conn_state,
+            to net1_drv.net0_conn_state
         );
     }
 

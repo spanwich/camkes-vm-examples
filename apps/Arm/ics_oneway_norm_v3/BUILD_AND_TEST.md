@@ -16,7 +16,7 @@
 
 ### Step 1: Clean Build
 ```bash
-cd /home/iamfo470/phd/camkes-vm-examples
+cd ~/phd/camkes-vm-examples
 rm -rf build && mkdir build && cd build
 ```
 
@@ -41,7 +41,7 @@ ninja
 ### Step 4: Run with VirtIO Network
 ```bash
 # From build directory
-cd /home/iamfo470/phd/camkes-vm-examples/ics_oneway_norm_v3
+cd ~/phd/camkes-vm-examples/ics_oneway_norm_v3
 
 # Run with VirtIO network and port forwarding
 ./simulate --extra-qemu-args="-nic user,model=virtio,mac=52:54:00:12:34:56,hostfwd=tcp::8502-:502"
@@ -168,7 +168,7 @@ echo "MODBUS_TEST" | nc localhost 8502
 **Solution:**
 ```bash
 # Check Linux images exist
-ls -la /home/iamfo470/phd/camkes-vm-examples/projects/camkes-vm-linux/linux-artifacts/qemu-arm-virt/
+ls -la ~/phd/camkes-vm-examples/projects/camkes-vm-linux/linux-artifacts/qemu-arm-virt/
 
 # Should see:
 # - linux (kernel)
@@ -176,7 +176,7 @@ ls -la /home/iamfo470/phd/camkes-vm-examples/projects/camkes-vm-linux/linux-arti
 # - rootfs.cpio.gz (filesystem)
 
 # If missing, rebuild camkes-vm-linux
-cd /home/iamfo470/phd/camkes-vm-examples
+cd ~/phd/camkes-vm-examples
 repo sync
 cd build
 ninja
@@ -273,13 +273,13 @@ To enable component debug output, edit component .c files and add:
 
 **Build:**
 ```bash
-cd /home/iamfo470/phd/camkes-vm-examples/build
+cd ~/phd/camkes-vm-examples/build
 ninja
 ```
 
 **Run:**
 ```bash
-cd /home/iamfo470/phd/camkes-vm-examples/ics_oneway_norm_v3
+cd ~/phd/camkes-vm-examples/ics_oneway_norm_v3
 ./simulate --extra-qemu-args="-nic user,model=virtio,hostfwd=tcp::8502-:502"
 ```
 

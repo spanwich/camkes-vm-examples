@@ -105,6 +105,9 @@ struct connection_metadata {
     uint32_t timestamp;            /* Creation time - for metadata consistency with Net0 */
     uint32_t last_activity;        /* Last activity timestamp - for idle timeout (v2.59) */
 
+    /* v2.107: Pool state tracking to prevent leaks */
+    struct tcp_inbound_client_state *pool_state;  /* Associated pool slot - freed when connection removed */
+
 };
 
 static struct connection_metadata connection_table[MAX_CONNECTIONS];
@@ -526,7 +529,7 @@ static void refill_rx_queue(void)
     #else
     /* Only warn if buffers are critically low */
     if (free_count > MAX_PACKETS / 2) {
-        printf("%s: ⚠️  RX buffers low: %d/%d free\n", COMPONENT_NAME, free_count, MAX_PACKETS);
+        printf("%s: [WARN]  RX buffers low: %d/%d free\n", COMPONENT_NAME, free_count, MAX_PACKETS);
     }
     #endif
 
@@ -559,13 +562,13 @@ static void refill_rx_queue(void)
 
     if (buffers_added > 0) {
         #if DEBUG_PACKET_DETAIL
-        printf("%s: ✅ Refilled RX queue with %d buffers (avail_idx now=%u)\n",
+        printf("%s: [OK] Refilled RX queue with %d buffers (avail_idx now=%u)\n",
                COMPONENT_NAME, buffers_added, vq->avail->idx);
         #endif
         /* Notify device of new buffers */
         VREG_WRITE(VIRTIO_MMIO_QUEUE_NOTIFY, VIRTIO_NET_RX_QUEUE);
     } else if (free_count > 0) {
-        printf("%s: ⚠️  WARNING: %d buffers were free but refill added 0! (avail_idx=%u)\n",
+        printf("%s: [WARN]  WARNING: %d buffers were free but refill added 0! (avail_idx=%u)\n",
                COMPONENT_NAME, free_count, vq->avail->idx);
     }
 }
@@ -592,7 +595,7 @@ static err_t netif_output(struct netif *netif, struct pbuf *p)
     if (tx_count <= 10) {
         uint32_t timestamp_ms = sys_now();
         printf("\n╔══════════════════════════════════════════════════════════╗\n");
-        printf("║  📤 OUTGOING PACKET #%u [T=%u.%03us]                      ║\n",
+        printf("║  [TX] OUTGOING PACKET #%u [T=%u.%03us]                      ║\n",
                tx_count, timestamp_ms / 1000, timestamp_ms % 1000);
         printf("╚══════════════════════════════════════════════════════════╝\n");
         printf("  Size: %u bytes\n", p->tot_len);
@@ -608,13 +611,13 @@ static err_t netif_output(struct netif *netif, struct pbuf *p)
 
     /* CRITICAL: Validate TX buffer index */
     if (tx_buf_idx < 0 || tx_buf_idx >= MAX_PACKETS) {
-        printf("%s: ❌ FATAL: Invalid TX buffer index %d (hdr_desc=%u, max=%d)\n",
+        printf("%s: [ERR] FATAL: Invalid TX buffer index %d (hdr_desc=%u, max=%d)\n",
                COMPONENT_NAME, tx_buf_idx, hdr_desc_idx, MAX_PACKETS);
         return ERR_BUF;
     }
 
     if (packet_buffers[tx_buf_idx] == NULL) {
-        printf("%s: ❌ FATAL: TX Buffer[%d] is NULL!\n", COMPONENT_NAME, tx_buf_idx);
+        printf("%s: [ERR] FATAL: TX Buffer[%d] is NULL!\n", COMPONENT_NAME, tx_buf_idx);
         return ERR_BUF;
     }
 
@@ -666,7 +669,7 @@ static err_t netif_output(struct netif *netif, struct pbuf *p)
                     for (int i = 0; i < MAX_CONNECTIONS; i++) {
                         /* Defensive check: ensure index is valid */
                         if (i >= MAX_CONNECTIONS) {
-                            printf("%s: ⚠️  TX: Invalid connection table index %d\n", COMPONENT_NAME, i);
+                            printf("%s: [WARN]  TX: Invalid connection table index %d\n", COMPONENT_NAME, i);
                             break;
                         }
 
@@ -694,7 +697,7 @@ static err_t netif_output(struct netif *netif, struct pbuf *p)
                                     /* Opportunistically store ephemeral port to avoid future lookups */
                                     meta->lwip_ephemeral_port = src_port;
                                     #if DEBUG_METADATA
-                                    printf("%s: 🔧 TX: Opportunistically stored ephemeral port %u during race window\n",
+                                    printf("%s: [FIX] TX: Opportunistically stored ephemeral port %u during race window\n",
                                            COMPONENT_NAME, src_port);
                                     #endif
                                     break;
@@ -706,13 +709,13 @@ static err_t netif_output(struct netif *netif, struct pbuf *p)
                     if (meta != NULL && meta->active) {
                         /* Double-check metadata is valid before using */
                         if (meta->original_dest_ip == 0) {
-                            printf("%s: ⚠️  TX: Invalid metadata - original_dest_ip is 0\n", COMPONENT_NAME);
+                            printf("%s: [WARN]  TX: Invalid metadata - original_dest_ip is 0\n", COMPONENT_NAME);
                         } else {
                             /* Restore original destination IP (PLC IP) as source */
                             ip->saddr = htonl(meta->original_dest_ip);  /* 192.168.95.2 */
 
                             #if DEBUG_TRAFFIC
-                            printf("%s: 🔄 TX: Restored source IP: %u.%u.%u.%u → %u.%u.%u.%u\n",
+                            printf("%s: [RETRY] TX: Restored source IP: %u.%u.%u.%u → %u.%u.%u.%u\n",
                                    COMPONENT_NAME,
                                    (current_src >> 24) & 0xFF, (current_src >> 16) & 0xFF,
                                    (current_src >> 8) & 0xFF, current_src & 0xFF,
@@ -727,7 +730,7 @@ static err_t netif_output(struct netif *netif, struct pbuf *p)
                             ip->check = new_ip_check;
 
                             #if DEBUG_TRAFFIC
-                            printf("%s: 🔧 TX: IP checksum: 0x%04x → 0x%04x\n",
+                            printf("%s: [FIX] TX: IP checksum: 0x%04x → 0x%04x\n",
                                    COMPONENT_NAME, ntohs(old_ip_check), ntohs(new_ip_check));
                             #endif
 
@@ -739,7 +742,7 @@ static err_t netif_output(struct netif *netif, struct pbuf *p)
                             tcp->check = new_tcp_check;
 
                             #if DEBUG_TRAFFIC
-                            printf("%s: 🔧 TX: TCP checksum: 0x%04x → 0x%04x\n",
+                            printf("%s: [FIX] TX: TCP checksum: 0x%04x → 0x%04x\n",
                                    COMPONENT_NAME, ntohs(old_tcp_check), ntohs(new_tcp_check));
                             #endif
                         }
@@ -747,7 +750,7 @@ static err_t netif_output(struct netif *netif, struct pbuf *p)
                         /* With PCB-based lookup, this should rarely happen.
                          * Only show in debug mode to avoid noise. */
                         #if DEBUG_METADATA
-                        printf("%s: ⚠️  TX: No metadata found for TCP port %u → %u (connection may be closed)\n",
+                        printf("%s: [WARN]  TX: No metadata found for TCP port %u → %u (connection may be closed)\n",
                                COMPONENT_NAME, src_port, dest_port);
                         #endif
                     }
@@ -961,7 +964,8 @@ static uint16_t tcp_checksum(struct iphdr *ip, struct tcphdr *tcp, uint16_t tcp_
 
 /* Store metadata for a new connection */
 static struct connection_metadata* connection_add(uint32_t orig_src, uint32_t orig_dest,
-                                                   uint16_t sport, uint16_t dport)
+                                                   uint16_t sport, uint16_t dport,
+                                                   struct tcp_inbound_client_state *pool_state)
 {
     for (int i = 0; i < MAX_CONNECTIONS; i++) {
         if (!connection_table[i].active) {
@@ -973,6 +977,7 @@ static struct connection_metadata* connection_add(uint32_t orig_src, uint32_t or
             connection_table[i].dest_port = dport;
             connection_table[i].timestamp = sys_now();  /* v2.50: For validation */
             connection_table[i].last_activity = sys_now();  /* v2.59: For idle timeout */
+            connection_table[i].pool_state = pool_state;  /* v2.107: Track pool slot */
             connection_count++;
 
             #if DEBUG_METADATA
@@ -987,7 +992,7 @@ static struct connection_metadata* connection_add(uint32_t orig_src, uint32_t or
             return &connection_table[i];
         }
     }
-    printf("%s: ⚠️  Connection table full! Dropping metadata.\n", COMPONENT_NAME);
+    printf("%s: [WARN]  Connection table full! Dropping metadata.\n", COMPONENT_NAME);
     return NULL;
 }
 
@@ -1001,13 +1006,13 @@ static void connection_link_pcb(struct tcp_pcb *pcb, uint16_t sport, uint16_t dp
             connection_table[i].pcb == NULL) {
             connection_table[i].pcb = pcb;
             #if DEBUG_METADATA
-            printf("%s: 🔗 Linked PCB to metadata [%d]\n", COMPONENT_NAME, i);
+            printf("%s: [LINK] Linked PCB to metadata [%d]\n", COMPONENT_NAME, i);
             #endif
             return;
         }
     }
     #if DEBUG_METADATA
-    printf("%s: ⚠️  No metadata found for %u → %u\n", COMPONENT_NAME, sport, dport);
+    printf("%s: [WARN]  No metadata found for %u → %u\n", COMPONENT_NAME, sport, dport);
     #endif
 }
 
@@ -1037,14 +1042,26 @@ static struct connection_metadata* connection_lookup_by_tuple(uint32_t src_ip, u
     return NULL;
 }
 
+/* Forward declaration for pool state management (defined later) */
+static void inbound_free_state(struct tcp_inbound_client_state *state);
+
 /* Remove connection metadata */
 static void connection_remove(struct tcp_pcb *pcb)
 {
     for (int i = 0; i < MAX_CONNECTIONS; i++) {
         if (connection_table[i].active && connection_table[i].pcb == pcb) {
             #if DEBUG_METADATA
-            printf("%s: 🗑️  Removing metadata [%d]\n", COMPONENT_NAME, i);
+            printf("%s: [DEL]  Removing metadata [%d]\n", COMPONENT_NAME, i);
             #endif
+
+            /* v2.107: CRITICAL FIX - Free associated pool slot when removing connection
+             * This prevents pool leaks when connections are cleaned up or reused */
+            if (connection_table[i].pool_state != NULL) {
+                BREADCRUMB(2113);  /* Freeing pool state via connection_remove */
+                inbound_free_state(connection_table[i].pool_state);
+                connection_table[i].pool_state = NULL;
+            }
+
             connection_table[i].active = false;
             connection_table[i].pcb = NULL;
             connection_count--;
@@ -1083,7 +1100,7 @@ static void connection_print_stats(void)
     int available = MAX_CONNECTIONS - active;
 
     #if DEBUG_METADATA
-    printf("%s: 📊 Connection table: %d active (%d PCB-linked, %d stale), %d available\n",
+    printf("%s: [STATS] Connection table: %d active (%d PCB-linked, %d stale), %d available\n",
            COMPONENT_NAME, active, pcb_linked, stale, available);
     #endif
 }
@@ -1128,7 +1145,7 @@ static void connection_cleanup_stale(void)
         /* Cleanup if PCB is NULL */
         if (pcb == NULL) {
             #if DEBUG_METADATA
-            printf("%s: 🧹 Cleanup stale connection [%d]: PCB is NULL\n", COMPONENT_NAME, i);
+            printf("%s: [CLEAN] Cleanup stale connection [%d]: PCB is NULL\n", COMPONENT_NAME, i);
             #endif
             connection_table[i].active = false;
             connection_count--;
@@ -1164,7 +1181,7 @@ static void connection_cleanup_stale(void)
 
     if (cleaned > 0) {
         #if DEBUG_METADATA
-        printf("%s: 🧹 Cleaned %d stale connection(s)\n",
+        printf("%s: [CLEAN] Cleaned %d stale connection(s)\n",
                COMPONENT_NAME, cleaned);
         connection_print_stats();
         #endif
@@ -1237,7 +1254,7 @@ static err_t custom_input_promiscuous(struct pbuf *p, struct netif *inp)
 
             /* If packet is not destined for our interface IP, rewrite it */
             if (pkt_dest_ip != interface_ip) {
-                printf("%s: 🔄 Rewriting dest IP: %u.%u.%u.%u → %u.%u.%u.%u\n",
+                printf("%s: [RETRY] Rewriting dest IP: %u.%u.%u.%u → %u.%u.%u.%u\n",
                        COMPONENT_NAME,
                        (pkt_dest_ip >> 24) & 0xFF, (pkt_dest_ip >> 16) & 0xFF,
                        (pkt_dest_ip >> 8) & 0xFF, pkt_dest_ip & 0xFF,
@@ -1252,7 +1269,8 @@ static err_t custom_input_promiscuous(struct pbuf *p, struct netif *inp)
 
                     if (!meta) {
                         /* New connection - store metadata */
-                        connection_add(pkt_src_ip, pkt_dest_ip, src_port, dest_port);
+                        /* Note: NULL pool_state because this is TCP server path, not client pool */
+                        connection_add(pkt_src_ip, pkt_dest_ip, src_port, dest_port, NULL);
                     }
                 }
 
@@ -1417,7 +1435,7 @@ static void process_rx_packets(void)
             }
 
             /* True desync - should never happen with proper memory barriers */
-            printf("%s: ⚠️ TRUE DESYNC: pending=%u exceeds ring_size=%u\n",
+            printf("%s: [WARN] TRUE DESYNC: pending=%u exceeds ring_size=%u\n",
                    COMPONENT_NAME, pending_packets, vq->num);
             printf("%s:   last_used_idx=%u, current_used_idx=%u\n",
                    COMPONENT_NAME, last_used_idx, current_used_idx);
@@ -1449,7 +1467,7 @@ static void process_rx_packets(void)
          * With memory barrier fix, invalid lengths should be VERY rare (real hardware corruption)
          */
         if (len < VIRTIO_NET_HDR_SIZE || len > (1514 + VIRTIO_NET_HDR_SIZE)) {
-            printf("%s: ⚠️  INVALID packet length: %u bytes (expected %u-%u)\n",
+            printf("%s: [WARN]  INVALID packet length: %u bytes (expected %u-%u)\n",
                    COMPONENT_NAME, len, VIRTIO_NET_HDR_SIZE, 1514 + VIRTIO_NET_HDR_SIZE);
             printf("%s:     desc_idx=%u, used_ring_idx=%u, last_used_idx=%u, current_used_idx=%u\n",
                    COMPONENT_NAME, desc_idx, used_ring_idx, last_used_idx, current_used_idx);
@@ -1465,7 +1483,7 @@ static void process_rx_packets(void)
 
         /* Validate descriptor index is in range */
         if (desc_idx >= MAX_PACKETS) {
-            printf("%s: ⚠️  INVALID descriptor index: %u (max %u)\n",
+            printf("%s: [WARN]  INVALID descriptor index: %u (max %u)\n",
                    COMPONENT_NAME, desc_idx, MAX_PACKETS);
             printf("%s:     Ring: used_ring_idx=%u, last_used=%u, current=%u\n",
                    COMPONENT_NAME, used_ring_idx, last_used_idx, current_used_idx);
@@ -1487,7 +1505,7 @@ static void process_rx_packets(void)
 
             // STRATEGY 2: If ring position was already free, scan for any used buffer
             if (!buffer_freed) {
-                printf("%s: ⚠️  Ring position %u already free - scanning for leaked buffers\n",
+                printf("%s: [WARN]  Ring position %u already free - scanning for leaked buffers\n",
                        COMPONENT_NAME, used_ring_idx);
 
                 for (int i = 0; i < MAX_PACKETS; i++) {
@@ -1502,7 +1520,7 @@ static void process_rx_packets(void)
             }
 
             if (!buffer_freed) {
-                printf("%s: ⚠️  No used buffers found - possible state desync!\n", COMPONENT_NAME);
+                printf("%s: [WARN]  No used buffers found - possible state desync!\n", COMPONENT_NAME);
             }
 
             last_used_idx++;
@@ -1514,7 +1532,7 @@ static void process_rx_packets(void)
 
         /* CRITICAL: Validate buffer index to prevent out-of-bounds access */
         if (buf_idx < 0 || buf_idx >= MAX_PACKETS) {
-            printf("%s: ❌ FATAL: Invalid buffer index %d (desc_idx=%u, max=%d)\n",
+            printf("%s: [ERR] FATAL: Invalid buffer index %d (desc_idx=%u, max=%d)\n",
                    COMPONENT_NAME, buf_idx, desc_idx, MAX_PACKETS);
             printf("%s:    last_used_idx=%u, RX queue full, system halting\n",
                    COMPONENT_NAME, last_used_idx);
@@ -1525,7 +1543,7 @@ static void process_rx_packets(void)
         uint8_t *buffer = packet_buffers[buf_idx];
 
         if (buffer == NULL) {
-            printf("%s: ❌ FATAL: Buffer[%d] is NULL!\n", COMPONENT_NAME, buf_idx);
+            printf("%s: [ERR] FATAL: Buffer[%d] is NULL!\n", COMPONENT_NAME, buf_idx);
             last_used_idx++;
             continue;
         }
@@ -1545,7 +1563,7 @@ static void process_rx_packets(void)
         /* Log packet arrival with detailed inspection (VERY VERBOSE - only for debugging) */
         uint32_t timestamp_ms = sys_now();
         printf("\n╔══════════════════════════════════════════════════════════╗\n");
-        printf("║  📥 [Net1] INCOMING PACKET #%u [T=%u.%03us]              ║\n",
+        printf("║  [RX] [Net1] INCOMING PACKET #%u [T=%u.%03us]              ║\n",
                packets_received, timestamp_ms / 1000, timestamp_ms % 1000);
         printf("╚══════════════════════════════════════════════════════════╝\n");
         printf("  Size: %u bytes (total %u with VirtIO header)\n", packet_len, len);
@@ -1628,7 +1646,7 @@ static void process_rx_packets(void)
                     size_t ip_hdr_len = (ip->ihl) * 4;
                     if (packet_len >= sizeof(struct ethhdr) + ip_hdr_len + sizeof(struct tcphdr)) {
                         struct tcphdr *tcp = (struct tcphdr *)(packet_data + sizeof(struct ethhdr) + ip_hdr_len);
-                        printf("📥 Net1 RX #%u: %u.%u.%u.%u:%u → %u.%u.%u.%u:%u TCP %s%s%s%s\n",
+                        printf("[RX] Net1 RX #%u: %u.%u.%u.%u:%u → %u.%u.%u.%u:%u TCP %s%s%s%s\n",
                                packets_received,
                                (saddr >> 24) & 0xFF, (saddr >> 16) & 0xFF, (saddr >> 8) & 0xFF, saddr & 0xFF, ntohs(tcp->source),
                                (daddr >> 24) & 0xFF, (daddr >> 16) & 0xFF, (daddr >> 8) & 0xFF, daddr & 0xFF, ntohs(tcp->dest),
@@ -1638,7 +1656,7 @@ static void process_rx_packets(void)
                 } else if (ip->protocol == 17) {  /* UDP */
                     #if FILTER_SHOW_UDP
                     show_packet = true;
-                    printf("📥 Net1 RX #%u: %u.%u.%u.%u → %u.%u.%u.%u UDP (%ub)\n",
+                    printf("[RX] Net1 RX #%u: %u.%u.%u.%u → %u.%u.%u.%u UDP (%ub)\n",
                            packets_received,
                            (saddr >> 24) & 0xFF, (saddr >> 16) & 0xFF, (saddr >> 8) & 0xFF, saddr & 0xFF,
                            (daddr >> 24) & 0xFF, (daddr >> 16) & 0xFF, (daddr >> 8) & 0xFF, daddr & 0xFF,
@@ -1647,7 +1665,7 @@ static void process_rx_packets(void)
                 } else if (ip->protocol == 1) {  /* ICMP */
                     #if FILTER_SHOW_ICMP
                     show_packet = true;
-                    printf("📥 Net1 RX #%u: %u.%u.%u.%u → %u.%u.%u.%u ICMP (%ub)\n",
+                    printf("[RX] Net1 RX #%u: %u.%u.%u.%u → %u.%u.%u.%u ICMP (%ub)\n",
                            packets_received,
                            (saddr >> 24) & 0xFF, (saddr >> 16) & 0xFF, (saddr >> 8) & 0xFF, saddr & 0xFF,
                            (daddr >> 24) & 0xFF, (daddr >> 16) & 0xFF, (daddr >> 8) & 0xFF, daddr & 0xFF,
@@ -1656,7 +1674,7 @@ static void process_rx_packets(void)
                 } else {
                     #if FILTER_SHOW_OTHER
                     show_packet = true;
-                    printf("📥 Net1 RX #%u: %u.%u.%u.%u → %u.%u.%u.%u proto=%u (%ub)\n",
+                    printf("[RX] Net1 RX #%u: %u.%u.%u.%u → %u.%u.%u.%u proto=%u (%ub)\n",
                            packets_received,
                            (saddr >> 24) & 0xFF, (saddr >> 16) & 0xFF, (saddr >> 8) & 0xFF, saddr & 0xFF,
                            (daddr >> 24) & 0xFF, (daddr >> 16) & 0xFF, (daddr >> 8) & 0xFF, daddr & 0xFF,
@@ -1666,17 +1684,17 @@ static void process_rx_packets(void)
             } else if (eth_proto == 0x0806) {  /* ARP */
                 #if FILTER_SHOW_ARP
                 show_packet = true;
-                printf("📥 Net1 RX #%u: ARP (%u bytes)\n", packets_received, packet_len);
+                printf("[RX] Net1 RX #%u: ARP (%u bytes)\n", packets_received, packet_len);
                 #endif
             } else if (eth_proto == 0x86dd) {  /* IPv6 */
                 #if FILTER_SHOW_IPV6
                 show_packet = true;
-                printf("📥 Net1 RX #%u: IPv6 (%u bytes)\n", packets_received, packet_len);
+                printf("[RX] Net1 RX #%u: IPv6 (%u bytes)\n", packets_received, packet_len);
                 #endif
             } else {
                 #if FILTER_SHOW_OTHER
                 show_packet = true;
-                printf("📥 Net1 RX #%u: EtherType=0x%04x (%u bytes)\n", packets_received, eth_proto, packet_len);
+                printf("[RX] Net1 RX #%u: EtherType=0x%04x (%u bytes)\n", packets_received, eth_proto, packet_len);
                 #endif
             }
         }
@@ -1696,7 +1714,7 @@ static void process_rx_packets(void)
 
             #if DEBUG_PACKET_DETAIL && DEBUG_PACKET_DETAIL
             if (show_packet) {
-                printf("   ✓ pbuf allocated, passing to lwIP input handler\n");
+                printf("   [OK] pbuf allocated, passing to lwIP input handler\n");
             }
             #endif
 
@@ -1706,7 +1724,7 @@ static void process_rx_packets(void)
             #if DEBUG_PACKET_DETAIL && DEBUG_PACKET_DETAIL
             if (show_packet) {
                 if (lwip_result == ERR_OK) {
-                    printf("   ✓ lwIP accepted packet (will route to TCP/UDP/etc.)\n");
+                    printf("   [OK] lwIP accepted packet (will route to TCP/UDP/etc.)\n");
                 } else {
                     printf("   ✗ lwIP rejected packet (err=%d)\n", lwip_result);
                 }
@@ -1728,7 +1746,7 @@ static void process_rx_packets(void)
 
                             if (tcp->syn && !tcp->ack) {
                                 /* This is a SYN packet (connection attempt) */
-                                printf("%s: 🔍 SYN packet detected: Dest IP = %u.%u.%u.%u:%u (Interface IP = 192.168.95.2)\n",
+                                printf("%s: [FIND] SYN packet detected: Dest IP = %u.%u.%u.%u:%u (Interface IP = 192.168.95.2)\n",
                                        COMPONENT_NAME,
                                        (daddr >> 24) & 0xFF, (daddr >> 16) & 0xFF, (daddr >> 8) & 0xFF, daddr & 0xFF,
                                        ntohs(tcp->dest));
@@ -1744,7 +1762,7 @@ static void process_rx_packets(void)
             }
         } else {
             /* CRITICAL: pbuf allocation failed - this means lwIP is out of memory */
-            printf("%s: ⚠️  WARNING: Failed to allocate pbuf for packet #%u - dropping (lwIP out of memory)\n",
+            printf("%s: [WARN]  WARNING: Failed to allocate pbuf for packet #%u - dropping (lwIP out of memory)\n",
                    COMPONENT_NAME, packets_received);
         }
 
@@ -1757,7 +1775,7 @@ static void process_rx_packets(void)
 
     /* Print pbuf pool statistics every 10 packets to monitor allocation/deallocation */
     if (packets_received % 10 == 0 && packets_received > 0) {
-        printf("%s: 📊 PBUF Pool Stats - Used: %u/%u, Avail: %u, Peak: %u\n",
+        printf("%s: [STATS] PBUF Pool Stats - Used: %u/%u, Avail: %u, Peak: %u\n",
                COMPONENT_NAME,
                lwip_stats.memp[MEMP_PBUF_POOL]->used,
                PBUF_POOL_SIZE,
@@ -1793,7 +1811,7 @@ static void tcp_echo_err(void *arg, err_t err)
     active_connections--;
     total_connections_closed++;
 
-    printf("%s: ⚠️  TCP connection error - err=%d (%s)\n", COMPONENT_NAME, err, err_name);
+    printf("%s: [WARN]  TCP connection error - err=%d (%s)\n", COMPONENT_NAME, err, err_name);
     printf("%s:    → Active connections: %u | Total created: %u | Total closed: %u\n",
            COMPONENT_NAME, active_connections, total_connections_created, total_connections_closed);
 
@@ -1829,12 +1847,12 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
             active_connections--;
             total_connections_closed++;
         } else {
-            printf("%s: ⚠️  BUG: active_connections already 0 in recv, not decrementing\n",
+            printf("%s: [WARN]  BUG: active_connections already 0 in recv, not decrementing\n",
                    COMPONENT_NAME);
         }
 
         #if DEBUG_TRAFFIC
-        printf("%s: 🔌 TCP connection closed gracefully\n", COMPONENT_NAME);
+        printf("%s: [INIT] TCP connection closed gracefully\n", COMPONENT_NAME);
         printf("%s:    Remote: %u.%u.%u.%u:%u\n", COMPONENT_NAME,
                ip4_addr1(&pcb->remote_ip), ip4_addr2(&pcb->remote_ip),
                ip4_addr3(&pcb->remote_ip), ip4_addr4(&pcb->remote_ip), pcb->remote_port);
@@ -1852,9 +1870,9 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
     if (err != ERR_OK) {
         /* v2.80: Pbuf double-free debugging - check ref count before free */
         if (p->ref == 0) {
-            printf("%s: 🐛 BUG: pbuf ref already 0 at ECHO_ERR path! p=%p, err=%d\n", COMPONENT_NAME, (void*)p, err);
+            printf("%s: [DEBUG] BUG: pbuf ref already 0 at ECHO_ERR path! p=%p, err=%d\n", COMPONENT_NAME, (void*)p, err);
         } else {
-            printf("%s: 🐛 Freeing pbuf at ECHO_ERR path: p=%p, ref=%d, err=%d\n", COMPONENT_NAME, (void*)p, p->ref, err);
+            printf("%s: [DEBUG] Freeing pbuf at ECHO_ERR path: p=%p, ref=%d, err=%d\n", COMPONENT_NAME, (void*)p, p->ref, err);
             pbuf_free(p);
         }
         return err;
@@ -1864,7 +1882,7 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
 
     #if DEBUG_PACKET_DETAIL
     uint32_t msg_id = ++message_id_counter;
-    printf("\n🟢 [MSG #%u] ═══ TCP: Data received from PLC (OUTBOUND response) ═══\n", msg_id);
+    printf("\n[OK] [MSG #%u] ═══ TCP: Data received from PLC (OUTBOUND response) ═══\n", msg_id);
     printf("   Connection: %u.%u.%u.%u:%u → %u.%u.%u.%u:%u\n",
            ip4_addr1(&pcb->remote_ip), ip4_addr2(&pcb->remote_ip),
            ip4_addr3(&pcb->remote_ip), ip4_addr4(&pcb->remote_ip), pcb->remote_port,
@@ -1888,13 +1906,13 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
     /* CRITICAL: Check if dataport is properly mapped by CAmkES
      * PLC responses must go through OUTBOUND path (Net1 → ICS_Outbound → Net0 → SCADA) */
     if (outbound_dp == NULL) {
-        printf("%s: ❌ FATAL: outbound_dp is NULL! CAmkES dataport not mapped\n", COMPONENT_NAME);
+        printf("%s: [ERR] FATAL: outbound_dp is NULL! CAmkES dataport not mapped\n", COMPONENT_NAME);
         printf("%s:    This indicates seL4 capability/memory allocation failure\n", COMPONENT_NAME);
         pbuf_free(p);
         return ERR_MEM;
     }
 
-    printf("%s: ✓ Dataport check: outbound_dp=%p (valid)\n", COMPONENT_NAME, (void*)outbound_dp);
+    printf("%s: [OK] Dataport check: outbound_dp=%p (valid)\n", COMPONENT_NAME, (void*)outbound_dp);
 
     /* Step 1: Create ICS message with metadata */
     ICS_Message *ics_msg = (ICS_Message *)outbound_dp;
@@ -1922,7 +1940,7 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
         ics_msg->metadata.dst_ip = meta->original_src_ip;  /* Original SCADA IP */
         ics_msg->metadata.dst_port = meta->src_port;       /* Original SCADA port */
         #if DEBUG_METADATA
-        printf("%s: 🔍 Lookup: Found metadata - using original SCADA IP %u.%u.%u.%u:%u\n",
+        printf("%s: [FIND] Lookup: Found metadata - using original SCADA IP %u.%u.%u.%u:%u\n",
                COMPONENT_NAME,
                (meta->original_src_ip >> 24) & 0xFF,
                (meta->original_src_ip >> 16) & 0xFF,
@@ -1934,7 +1952,7 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
         /* Fallback: use local IP if lookup fails (will cause Net0 to fail lookup) */
         ics_msg->metadata.dst_ip = ntohl(ip4_addr_get_u32(&pcb->local_ip));
         ics_msg->metadata.dst_port = pcb->local_port;
-        printf("%s: ⚠️  Lookup: No metadata found - using gateway IP (WRONG - Net0 won't find connection!)\n", COMPONENT_NAME);
+        printf("%s: [WARN]  Lookup: No metadata found - using gateway IP (WRONG - Net0 won't find connection!)\n", COMPONENT_NAME);
     }
 
     ics_msg->metadata.src_port = pcb->remote_port;
@@ -1963,7 +1981,7 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
     printf("\"\n");
 
     #if DEBUG_PACKET_DETAIL
-    printf("   ✓ ICS message prepared in shared memory (outbound_dp)\n");
+    printf("   [OK] ICS message prepared in shared memory (outbound_dp)\n");
     printf("   Action: Signaling ICS_Outbound component via outbound_ready_emit()\n");
     #endif
 
@@ -1971,7 +1989,7 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
     outbound_ready_emit();
 
     #if DEBUG_PACKET_DETAIL
-    printf("   ✓ Signal sent to ICS_Outbound - PLC response handoff complete\n");
+    printf("   [OK] Signal sent to ICS_Outbound - PLC response handoff complete\n");
     printf("   [MSG #%u now in OUTBOUND pipeline - forwarding to Net0]\n\n", msg_id);
     #endif
 
@@ -2003,9 +2021,9 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
 
     /* v2.80: Pbuf double-free debugging - check ref count before free */
     if (p->ref == 0) {
-        printf("%s: 🐛 BUG: pbuf ref already 0 at ECHO_NORMAL path! p=%p, len=%d\n", COMPONENT_NAME, (void*)p, p->len);
+        printf("%s: [DEBUG] BUG: pbuf ref already 0 at ECHO_NORMAL path! p=%p, len=%d\n", COMPONENT_NAME, (void*)p, p->len);
     } else {
-        printf("%s: 🐛 Freeing pbuf at ECHO_NORMAL path: p=%p, ref=%d, len=%d\n", COMPONENT_NAME, (void*)p, p->ref, p->len);
+        printf("%s: [DEBUG] Freeing pbuf at ECHO_NORMAL path: p=%p, ref=%d, len=%d\n", COMPONENT_NAME, (void*)p, p->ref, p->len);
         pbuf_free(p);              /* Free the pbuf we were given */
     }
 
@@ -2025,11 +2043,11 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
 
 static err_t tcp_echo_accept(void *arg, struct tcp_pcb *newpcb, err_t err)
 {
-    printf("%s: 🔔 tcp_echo_accept() CALLED! arg=%p, newpcb=%p, err=%d\n",
+    printf("%s: [EVENT] tcp_echo_accept() CALLED! arg=%p, newpcb=%p, err=%d\n",
            COMPONENT_NAME, arg, newpcb, err);
 
     if (err != ERR_OK || newpcb == NULL) {
-        printf("%s: ❌ TCP accept FAILED - err=%d (%s), newpcb=%p\n",
+        printf("%s: [ERR] TCP accept FAILED - err=%d (%s), newpcb=%p\n",
                COMPONENT_NAME, err,
                err == -1 ? "OUT OF MEMORY (ERR_MEM)" :
                err == -13 ? "CONNECTION ABORTED (ERR_ABRT)" : "UNKNOWN",
@@ -2045,7 +2063,7 @@ static err_t tcp_echo_accept(void *arg, struct tcp_pcb *newpcb, err_t err)
     active_connections++;
     total_connections_created++;
 
-    printf("%s: ✓ TCP connection accepted from %u.%u.%u.%u:%u (pcb=%p)\n",
+    printf("%s: [OK] TCP connection accepted from %u.%u.%u.%u:%u (pcb=%p)\n",
            COMPONENT_NAME,
            ip4_addr1(&newpcb->remote_ip), ip4_addr2(&newpcb->remote_ip),
            ip4_addr3(&newpcb->remote_ip), ip4_addr4(&newpcb->remote_ip), newpcb->remote_port,
@@ -2083,7 +2101,7 @@ static void setup_tcp_echo_server(void)
 #endif
 
     if (pcb == NULL) {
-        printf("%s: ❌ Failed to create TCP PCB\n", COMPONENT_NAME);
+        printf("%s: [ERR] Failed to create TCP PCB\n", COMPONENT_NAME);
 #if DEBUG_PACKET_DETAIL
         printf("%s: [DEBUG] TCP PCB creation returned NULL - malloc likely failed\n", COMPONENT_NAME);
         printf("%s: [DEBUG] This suggests lwIP memory allocator is not ready\n", COMPONENT_NAME);
@@ -2093,7 +2111,7 @@ static void setup_tcp_echo_server(void)
     }
 
 #if DEBUG_PACKET_DETAIL
-    printf("%s: [DEBUG] ✓ TCP PCB created successfully at %p\n", COMPONENT_NAME, (void*)pcb);
+    printf("%s: [DEBUG] [OK] TCP PCB created successfully at %p\n", COMPONENT_NAME, (void*)pcb);
     printf("%s: [DEBUG] About to call tcp_bind(pcb, IP_ADDR_ANY, %d)...\n", COMPONENT_NAME, TCP_ECHO_PORT);
     fflush(stdout);
 #endif
@@ -2107,12 +2125,12 @@ static void setup_tcp_echo_server(void)
 #endif
 
     if (err != ERR_OK) {
-        printf("%s: ❌ Failed to bind TCP port %d (err=%d)\n", COMPONENT_NAME, TCP_ECHO_PORT, err);
+        printf("%s: [ERR] Failed to bind TCP port %d (err=%d)\n", COMPONENT_NAME, TCP_ECHO_PORT, err);
         return;
     }
 
 #if DEBUG_PACKET_DETAIL
-    printf("%s: [DEBUG] ✓ Successfully bound to port %d\n", COMPONENT_NAME, TCP_ECHO_PORT);
+    printf("%s: [DEBUG] [OK] Successfully bound to port %d\n", COMPONENT_NAME, TCP_ECHO_PORT);
     printf("%s: [DEBUG] About to call tcp_listen_with_backlog(pcb, %d)...\n", COMPONENT_NAME, MAX_TCP_CONNECTIONS);
     fflush(stdout);
 #endif
@@ -2125,12 +2143,12 @@ static void setup_tcp_echo_server(void)
 #endif
 
     if (pcb == NULL) {
-        printf("%s: ❌ Failed to listen on TCP port %d\n", COMPONENT_NAME, TCP_ECHO_PORT);
+        printf("%s: [ERR] Failed to listen on TCP port %d\n", COMPONENT_NAME, TCP_ECHO_PORT);
         return;
     }
 
 #if DEBUG_PACKET_DETAIL
-    printf("%s: [DEBUG] ✓ Now listening on port %d\n", COMPONENT_NAME, TCP_ECHO_PORT);
+    printf("%s: [DEBUG] [OK] Now listening on port %d\n", COMPONENT_NAME, TCP_ECHO_PORT);
     printf("%s: [DEBUG] About to call tcp_accept(pcb, tcp_echo_accept)...\n", COMPONENT_NAME);
     fflush(stdout);
 #endif
@@ -2138,7 +2156,7 @@ static void setup_tcp_echo_server(void)
     tcp_accept(pcb, tcp_echo_accept);
 
 #if DEBUG_PACKET_DETAIL
-    printf("%s: [DEBUG] ✓ Accept callback registered\n", COMPONENT_NAME);
+    printf("%s: [DEBUG] [OK] Accept callback registered\n", COMPONENT_NAME);
     printf("%s: [DEBUG] Exiting setup_tcp_echo_server() - SUCCESS\n", COMPONENT_NAME);
     fflush(stdout);
 #endif
@@ -2147,7 +2165,7 @@ static void setup_tcp_echo_server(void)
     struct tcp_pcb_listen *lpcb = (struct tcp_pcb_listen *)pcb;
     printf("\n");
     printf("%s: ═══════════════════════════════════════════════════════════\n", COMPONENT_NAME);
-    printf("%s: ✓ TCP SERVER CONFIGURATION\n", COMPONENT_NAME);
+    printf("%s: [OK] TCP SERVER CONFIGURATION\n", COMPONENT_NAME);
     printf("%s: ═══════════════════════════════════════════════════════════\n", COMPONENT_NAME);
     printf("%s: Port:           %d\n", COMPONENT_NAME, TCP_ECHO_PORT);
     printf("%s: PCB local_ip:   %u.%u.%u.%u\n", COMPONENT_NAME,
@@ -2161,10 +2179,10 @@ static void setup_tcp_echo_server(void)
                         ip4_addr4(&lpcb->local_ip) == 0);
 
     if (is_wildcard) {
-        printf("%s: Status:         ✅ WILDCARD (0.0.0.0) - accepts ANY destination IP\n", COMPONENT_NAME);
+        printf("%s: Status:         [OK] WILDCARD (0.0.0.0) - accepts ANY destination IP\n", COMPONENT_NAME);
         printf("%s: Will accept:    Packets to 10.2.0.2, 192.168.95.2, or any IP\n", COMPONENT_NAME);
     } else {
-        printf("%s: Status:         ⚠️  SPECIFIC IP - only accepts packets to this IP\n", COMPONENT_NAME);
+        printf("%s: Status:         [WARN]  SPECIFIC IP - only accepts packets to this IP\n", COMPONENT_NAME);
         printf("%s: Will accept:    Packets to %u.%u.%u.%u ONLY\n", COMPONENT_NAME,
                ip4_addr1(&lpcb->local_ip), ip4_addr2(&lpcb->local_ip),
                ip4_addr3(&lpcb->local_ip), ip4_addr4(&lpcb->local_ip));
@@ -2192,7 +2210,91 @@ struct tcp_inbound_client_state {
     bool active;
 };
 
-static struct tcp_inbound_client_state inbound_tcp_client = {0};
+/* v2.106: CRITICAL FIX - Replace single global with connection pool
+ * ═══════════════════════════════════════════════════════════════════════════
+ * Bug Discovery (2025-10-20):
+ * - Single global `inbound_tcp_client` was shared across ALL TCP connections
+ * - When multiple SCADA requests arrived before first connection completed:
+ *   1. Request 1 arrives → sets inbound_tcp_client data → tcp_connect()
+ *   2. Request 2 arrives → OVERWRITES inbound_tcp_client data
+ *   3. Connection 1 completes → callback sees Request 2's data
+ *   4. CRASH or DATA CORRUPTION
+ *
+ * Root Cause: tcp_connect() is ASYNCHRONOUS (5-20ms to complete)
+ * - During this window, new requests can arrive and overwrite state
+ * - This was hidden by heavy printf delays in v2.97 (50-100ms)
+ * - When prints removed, race window exposed → v2.105 crash
+ *
+ * Fix: Per-connection state allocation using connection pool
+ * - Each TCP connection gets its own dedicated state slot
+ * - No sharing, no race conditions
+ * - Pool size: MUST MATCH lwIP's MEMP_NUM_TCP_PCB limit
+ *
+ * Evidence: v2.105 crash after "Callbacks registered: recv=0xb878, sent=0xbec8"
+ *           Crashed accessing state->payload_len (data corrupted by race)
+ *
+ * Pool sizing history:
+ * - v2.106-v2.107: 10 slots (arbitrary choice - BUG!)
+ * - v2.108: 50 slots (still too small)
+ * - v2.109: 100 slots (CORRECT - matches MEMP_NUM_TCP_PCB)
+ *
+ * Root Cause of Pool Exhaustion:
+ * - lwIP configured for MEMP_NUM_TCP_PCB = 100 (can create 100 TCP connections)
+ * - But MAX_INBOUND_CONNECTIONS was only 10 (application state pool)
+ * - Mismatch: lwIP creates 100 connections, but we can only track 10!
+ * - Fix: Synchronize application pool with lwIP pool
+ *
+ * Memory overhead: 100 × 2.4KB = ~240KB (0.24% of 100MB RAM - acceptable)
+ */
+#define MAX_INBOUND_CONNECTIONS 100  /* MUST match MEMP_NUM_TCP_PCB in lwipopts.h */
+static struct tcp_inbound_client_state inbound_connection_pool[MAX_INBOUND_CONNECTIONS];
+
+/* Allocate a free connection state from the pool */
+static struct tcp_inbound_client_state* inbound_alloc_state(void)
+{
+    BREADCRUMB(2100);  /* Pool allocation attempt */
+    for (int i = 0; i < MAX_INBOUND_CONNECTIONS; i++) {
+        if (!inbound_connection_pool[i].active) {
+            memset(&inbound_connection_pool[i], 0, sizeof(struct tcp_inbound_client_state));
+            inbound_connection_pool[i].active = true;
+            BREADCRUMB(2101);  /* Pool slot allocated successfully */
+            return &inbound_connection_pool[i];
+        }
+    }
+
+    /* Pool exhausted - this should be very rare with proper connection cleanup */
+    BREADCRUMB(2102);  /* Pool exhausted */
+    printf("%s: [CRITICAL] Inbound connection pool exhausted! (max=%d)\n",
+           COMPONENT_NAME, MAX_INBOUND_CONNECTIONS);
+
+    /* Debug: Show which pool slots are still active */
+    printf("%s: [DEBUG] Pool status at exhaustion:\n", COMPONENT_NAME);
+    for (int i = 0; i < MAX_INBOUND_CONNECTIONS; i++) {
+        if (inbound_connection_pool[i].active) {
+            printf("%s:   Slot %d: active=%d pcb=%p len=%u sent=%u\n",
+                   COMPONENT_NAME, i,
+                   inbound_connection_pool[i].active,
+                   (void*)inbound_connection_pool[i].pcb,
+                   inbound_connection_pool[i].payload_len,
+                   inbound_connection_pool[i].bytes_sent);
+        }
+    }
+
+    return NULL;
+}
+
+/* Free a connection state back to the pool */
+static void inbound_free_state(struct tcp_inbound_client_state *state)
+{
+    BREADCRUMB(2103);  /* Pool free called */
+    if (state != NULL) {
+        state->active = false;
+        state->pcb = NULL;
+        state->payload_len = 0;
+        state->bytes_sent = 0;
+        BREADCRUMB(2104);  /* Pool free completed */
+    }
+}
 
 /*
  * TCP client callbacks for INBOUND path
@@ -2204,7 +2306,7 @@ static struct tcp_inbound_client_state inbound_tcp_client = {0};
 static err_t inbound_tcp_recv_callback(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err)
 {
     BREADCRUMB(1000);  /* Entry: PLC response received */
-    printf("%s: 🔔 inbound_tcp_recv_callback FIRED! p=%p, err=%d\n", COMPONENT_NAME, (void*)p, err);
+    printf("%s: [EVENT] inbound_tcp_recv_callback FIRED! p=%p, err=%d\n", COMPONENT_NAME, (void*)p, err);
     struct tcp_inbound_client_state *state = (struct tcp_inbound_client_state *)arg;
 
     if (p == NULL) {
@@ -2222,17 +2324,20 @@ static err_t inbound_tcp_recv_callback(void *arg, struct tcp_pcb *pcb, struct pb
          * - Cleanup happens later in inbound_ready_handle() or timeout
          */
 
-        /* Mark PCB as NULL (but keep metadata and state) */
-        if (state != NULL) {
-            state->pcb = NULL;
-            /* Keep state->active = true so we know there's pending work */
-        }
-
-        /* Also mark in connection_table if present */
+        /* Mark PCB as NULL in connection_table (but keep metadata for debugging) */
         for (int i = 0; i < MAX_CONNECTIONS; i++) {
             if (connection_table[i].active && connection_table[i].pcb == pcb) {
-                printf("%s: ⚠️  PLC closed connection - marking PCB as NULL (keeping metadata)\n", COMPONENT_NAME);
+                printf("%s: [WARN]  PLC closed connection - marking PCB as NULL (keeping metadata)\n", COMPONENT_NAME);
                 connection_table[i].pcb = NULL;  /* Mark as closed but keep metadata */
+
+                /* v2.107: Free pool state and NULL the pointer to prevent double-free */
+                BREADCRUMB(2105);  /* PLC close path - freeing pool state */
+                if (connection_table[i].pool_state != NULL) {
+                    printf("%s: [POOL] PLC closed connection - freeing pool slot\n", COMPONENT_NAME);
+                    inbound_free_state(connection_table[i].pool_state);
+                    connection_table[i].pool_state = NULL;  /* Prevent double-free later */
+                }
+                BREADCRUMB(2106);  /* PLC close path - pool state freed */
 
                 /* v2.97: CRITICAL FIX - Memory barrier to prevent crash in Net0!
                  * ═══════════════════════════════════════════════════════════════════
@@ -2263,9 +2368,9 @@ static err_t inbound_tcp_recv_callback(void *arg, struct tcp_pcb *pcb, struct pb
         BREADCRUMB(1002);  /* Error in receive */
         /* v2.80: Pbuf double-free debugging - check ref count before free */
         if (p->ref == 0) {
-            printf("%s: 🐛 BUG: pbuf ref already 0 at ERR path! p=%p, err=%d\n", COMPONENT_NAME, (void*)p, err);
+            printf("%s: [DEBUG] BUG: pbuf ref already 0 at ERR path! p=%p, err=%d\n", COMPONENT_NAME, (void*)p, err);
         } else {
-            printf("%s: 🐛 Freeing pbuf at ERR path: p=%p, ref=%d, err=%d\n", COMPONENT_NAME, (void*)p, p->ref, err);
+            printf("%s: [DEBUG] Freeing pbuf at ERR path: p=%p, ref=%d, err=%d\n", COMPONENT_NAME, (void*)p, p->ref, err);
             pbuf_free(p);
         }
         return err;
@@ -2275,9 +2380,9 @@ static err_t inbound_tcp_recv_callback(void *arg, struct tcp_pcb *pcb, struct pb
         BREADCRUMB(1003);  /* NULL dataport */
         /* v2.80: Pbuf double-free debugging - check ref count before free */
         if (p->ref == 0) {
-            printf("%s: 🐛 BUG: pbuf ref already 0 at NULL_DP path! p=%p\n", COMPONENT_NAME, (void*)p);
+            printf("%s: [DEBUG] BUG: pbuf ref already 0 at NULL_DP path! p=%p\n", COMPONENT_NAME, (void*)p);
         } else {
-            printf("%s: 🐛 Freeing pbuf at NULL_DP path: p=%p, ref=%d\n", COMPONENT_NAME, (void*)p, p->ref);
+            printf("%s: [DEBUG] Freeing pbuf at NULL_DP path: p=%p, ref=%d\n", COMPONENT_NAME, (void*)p, p->ref);
             pbuf_free(p);
         }
         return ERR_MEM;
@@ -2314,15 +2419,21 @@ static err_t inbound_tcp_recv_callback(void *arg, struct tcp_pcb *pcb, struct pb
     ics_msg->payload_length = ics_msg->metadata.payload_length;
     memcpy(ics_msg->payload, p->payload, ics_msg->payload_length);
 
+    /* v2.104: Lightweight breadcrumb debugging for event emission
+     * BREADCRUMB 1009: About to emit outbound_ready notification
+     * BREADCRUMB 1010: outbound_ready_emit() completed successfully
+     * If Net0 doesn't receive, check CAmkES event connection */
     BREADCRUMB(1009);  /* Emitting notification */
     outbound_ready_emit();
+    BREADCRUMB(1010);  /* Emit completed */
+
     tcp_recved(pcb, p->len);
 
     /* v2.80: Pbuf double-free debugging - check ref count before free */
     if (p->ref == 0) {
-        printf("%s: 🐛 BUG: pbuf ref already 0 at NORMAL path! p=%p, len=%d\n", COMPONENT_NAME, (void*)p, p->len);
+        printf("%s: [DEBUG] BUG: pbuf ref already 0 at NORMAL path! p=%p, len=%d\n", COMPONENT_NAME, (void*)p, p->len);
     } else {
-        printf("%s: 🐛 Freeing pbuf at NORMAL path: p=%p, ref=%d, len=%d\n", COMPONENT_NAME, (void*)p, p->ref, p->len);
+        printf("%s: [DEBUG] Freeing pbuf at NORMAL path: p=%p, ref=%d, len=%d\n", COMPONENT_NAME, (void*)p, p->ref, p->len);
         pbuf_free(p);
     }
 
@@ -2403,7 +2514,7 @@ static void inbound_tcp_err_callback(void *arg, err_t err)
 {
     struct tcp_inbound_client_state *state = (struct tcp_inbound_client_state *)arg;
 
-    printf("%s: ⚠️  INBOUND TCP error - err=%d (%s)\n", COMPONENT_NAME, err,
+    printf("%s: [WARN]  INBOUND TCP error - err=%d (%s)\n", COMPONENT_NAME, err,
            err == ERR_ABRT ? "ERR_ABRT (Connection aborted)" :
            err == ERR_RST ? "ERR_RST (Connection reset)" :
            err == ERR_CLSD ? "ERR_CLSD (Connection closed)" :
@@ -2412,12 +2523,11 @@ static void inbound_tcp_err_callback(void *arg, err_t err)
 
     /* CRITICAL: PCB is already freed by lwIP when err callback is called - don't access it!
      * Clean up our state only */
-    if (state != NULL && state->active) {
-        state->active = false;
-        state->pcb = NULL;
+    if (state != NULL) {
+        inbound_free_state(state);  /* v2.106: Free connection pool slot */
     }
 
-    printf("%s: 🧹 INBOUND connection error triggered - state cleaned up\n", COMPONENT_NAME);
+    printf("%s: [CLEAN] INBOUND connection error triggered - state cleaned up\n", COMPONENT_NAME);
 }
 
 static err_t inbound_tcp_connected_callback(void *arg, struct tcp_pcb *pcb, err_t err)
@@ -2425,7 +2535,7 @@ static err_t inbound_tcp_connected_callback(void *arg, struct tcp_pcb *pcb, err_
     struct tcp_inbound_client_state *state = (struct tcp_inbound_client_state *)arg;
 
     if (err != ERR_OK) {
-        printf("%s: ❌ INBOUND: Connection failed: %d\n", COMPONENT_NAME, err);
+        printf("%s: [ERR] INBOUND: Connection failed: %d\n", COMPONENT_NAME, err);
 
         /* v2.93: Send error notification to Net0 to close SCADA connection
          * This handles failures during 3-way handshake (RST from PLC) */
@@ -2468,8 +2578,7 @@ static err_t inbound_tcp_connected_callback(void *arg, struct tcp_pcb *pcb, err_
             }
         }
 
-        state->active = false;
-        state->pcb = NULL;
+        inbound_free_state(state);  /* v2.106: Free connection pool slot */
         return err;
     }
 
@@ -2477,13 +2586,13 @@ static err_t inbound_tcp_connected_callback(void *arg, struct tcp_pcb *pcb, err_
     printf("%s: INBOUND: Connected to internal network\n", COMPONENT_NAME);
     #endif
 
-    printf("%s: 🔗 TCP connection ESTABLISHED to PLC - registering callbacks\n", COMPONENT_NAME);
+    printf("%s: [LINK] TCP connection ESTABLISHED to PLC - registering callbacks\n", COMPONENT_NAME);
 
     /* Set callbacks */
     tcp_recv(pcb, inbound_tcp_recv_callback);
     tcp_sent(pcb, inbound_tcp_sent_callback);
 
-    printf("%s: ✓ Callbacks registered: recv=%p, sent=%p\n", COMPONENT_NAME, (void*)inbound_tcp_recv_callback, (void*)inbound_tcp_sent_callback);
+    printf("%s: [OK] Callbacks registered: recv=%p, sent=%p\n", COMPONENT_NAME, (void*)inbound_tcp_recv_callback, (void*)inbound_tcp_sent_callback);
 
     /* v2.101: CRITICAL FIX - Check send buffer before calling tcp_output()
      * ════════════════════════════════════════════════════════════════════
@@ -2521,7 +2630,7 @@ static err_t inbound_tcp_connected_callback(void *arg, struct tcp_pcb *pcb, err_
 
     if (to_send == 0) {
         /* Send buffer full - defer transmission until sent callback */
-        printf("%s: ⚠️  Send buffer full (sndbuf=%u), deferring transmission of %u bytes\n",
+        printf("%s: [WARN]  Send buffer full (sndbuf=%u), deferring transmission of %u bytes\n",
                COMPONENT_NAME, tcp_sndbuf(pcb), state->payload_len);
         printf("%s:    → Will retry in tcp_sent callback when buffer available\n", COMPONENT_NAME);
 
@@ -2541,8 +2650,7 @@ static err_t inbound_tcp_connected_callback(void *arg, struct tcp_pcb *pcb, err_
         printf("%s: INBOUND: tcp_write failed: %d\n", COMPONENT_NAME, err);
         /* v2.88: CRITICAL FIX - Do NOT call tcp_abort() from callback!
          * Return ERR_ABRT and lwIP handles cleanup internally */
-        state->active = false;
-        state->pcb = NULL;
+        inbound_free_state(state);  /* v2.106: Free connection pool slot */
         return ERR_ABRT;
     }
 
@@ -2561,7 +2669,10 @@ static err_t inbound_tcp_connected_callback(void *arg, struct tcp_pcb *pcb, err_
 /* TCP client connection state for OUTBOUND forwarding */
 struct tcp_outbound_client_state {
     struct tcp_pcb *pcb;
-    uint8_t *payload_data;
+    uint8_t payload_data[MAX_PAYLOAD_SIZE];  /* v2.106: CRITICAL FIX - Use buffer, not pointer!
+                                               * Same fix as inbound v2.48
+                                               * Problem: Pointer to dataport gets overwritten by next message
+                                               * Solution: Copy payload into local buffer */
     uint16_t payload_len;
     uint16_t bytes_sent;
     bool active;
@@ -2595,8 +2706,7 @@ static err_t outbound_tcp_sent_callback(void *arg, struct tcp_pcb *pcb, u16_t le
          *
          * Correct protocol: Return ERR_ABRT, lwIP handles tcp_abort() internally */
         connection_remove(pcb);
-        state->active = false;
-        state->pcb = NULL;
+        state->active = false;  /* v2.106: Mark outbound client as free */
 
         return ERR_ABRT;  /* Let lwIP handle tcp_abort() internally */
     }
@@ -2636,6 +2746,36 @@ static err_t outbound_tcp_connected_callback(void *arg, struct tcp_pcb *pcb, err
     /* Send the payload */
     uint16_t to_send = (state->payload_len > tcp_sndbuf(pcb)) ? tcp_sndbuf(pcb) : state->payload_len;
 
+    /* v2.102: CRITICAL FIX - Check to_send > 0 before calling tcp_write()
+     * Same issue as v2.101 but in OUTBOUND path (we fixed inbound but forgot outbound!)
+     *
+     * Bug Discovery (2025-10-20):
+     * - Crash at PC 0x383e0 (tcp_write+0xbc8) with NULL pbuf
+     * - OUTBOUND connection established but remote window not yet advertised
+     * - tcp_sndbuf(pcb) returns 0, to_send = 0
+     * - tcp_write(pcb, data, 0) creates NULL pbuf
+     * - Later access to pbuf->len (offset +8) causes crash
+     *
+     * Evidence:
+     * - GDB kernel fault catcher at c_handle_data_fault
+     * - FAR_EL2 = 0x10, r3 = NULL
+     * - Disassembly: ldrh r2, [r3, #8] (loading pbuf->len)
+     *
+     * Root Cause: v2.101 only fixed inbound callback, forgot outbound!
+     *
+     * Fix: Same as v2.101 - only call tcp_write() if to_send > 0
+     */
+    if (to_send == 0) {
+        /* Send buffer full - defer transmission until sent callback */
+        printf("%s: [WARN]  OUTBOUND: Send buffer full (sndbuf=%u), deferring transmission of %u bytes\n",
+               COMPONENT_NAME, tcp_sndbuf(pcb), state->payload_len);
+        printf("%s:    → Will retry in tcp_sent callback when buffer available\n", COMPONENT_NAME);
+
+        /* Keep state active - sent callback will retry when buffer space available */
+        state->bytes_sent = 0;
+        return ERR_OK;
+    }
+
     err = tcp_write(pcb, state->payload_data, to_send, TCP_WRITE_FLAG_COPY);
     if (err != ERR_OK) {
         printf("%s: OUTBOUND: tcp_write failed: %d\n", COMPONENT_NAME, err);
@@ -2666,7 +2806,7 @@ void inbound_ready_handle(void)
 
     #if DEBUG_PACKET_DETAIL
     uint32_t msg_id = ++message_id_counter;
-    printf("\n🟡 [MSG #%u] ═══ ICS→NET: Received from ICS_Inbound ═══\n", msg_id);
+    printf("\n[MSG] [MSG #%u] ═══ ICS→NET: Received from ICS_Inbound ═══\n", msg_id);
     printf("   Source: ICS pipeline validation complete\n");
     printf("   Action: Creating TCP client to forward to internal network\n");
     #endif
@@ -2682,13 +2822,13 @@ void inbound_ready_handle(void)
     /* CRITICAL: Check if dataport is properly mapped by CAmkES */
     if (inbound_dp == NULL) {
         BREADCRUMB(2002);  /* NULL dataport */
-        printf("%s: ❌ FATAL: inbound_dp is NULL! CAmkES dataport not mapped\n", COMPONENT_NAME);
+        printf("%s: [ERR] FATAL: inbound_dp is NULL! CAmkES dataport not mapped\n", COMPONENT_NAME);
         printf("%s:    This indicates seL4 capability/memory allocation failure\n", COMPONENT_NAME);
         return;
     }
 
     #if DEBUG_TRAFFIC
-    printf("%s: ✓ Dataport check: inbound_dp=%p (valid)\n", COMPONENT_NAME, (void*)inbound_dp);
+    printf("%s: [OK] Dataport check: inbound_dp=%p (valid)\n", COMPONENT_NAME, (void*)inbound_dp);
     #endif
 
     BREADCRUMB(2003);  /* Reading ICS message */
@@ -2718,7 +2858,7 @@ void inbound_ready_handle(void)
      * This prevents PLC connection accumulation while avoiding double-free bugs.
      */
     if (ics_msg->payload_length == 0) {
-        printf("%s: 📥 Received close notification from Net0 (SCADA %u.%u.%u.%u:%u closed)\n",
+        printf("%s: [RX] Received close notification from Net0 (SCADA %u.%u.%u.%u:%u closed)\n",
                COMPONENT_NAME,
                (ics_msg->metadata.src_ip >> 24) & 0xFF,
                (ics_msg->metadata.src_ip >> 16) & 0xFF,
@@ -2764,7 +2904,7 @@ void inbound_ready_handle(void)
             /* DON'T check state! Always call tcp_close() and trust lwIP */
             err_t close_err = tcp_close(pcb);
             if (close_err != ERR_OK) {
-                printf("%s:   ⚠️  tcp_close() failed (%d) - cleaning up metadata manually\n",
+                printf("%s:   [WARN]  tcp_close() failed (%d) - cleaning up metadata manually\n",
                        COMPONENT_NAME, close_err);
                 /* Only if tcp_close() FAILS, clean up manually */
                 meta->pcb = NULL;
@@ -2772,17 +2912,12 @@ void inbound_ready_handle(void)
                 if (connection_count > 0) {
                     connection_count--;
                 }
-                /* Clean up inbound_tcp_client if needed */
-                if (inbound_tcp_client.pcb == pcb) {
-                    inbound_tcp_client.active = false;
-                    inbound_tcp_client.pcb = NULL;
-                    inbound_tcp_client.bytes_sent = 0;
-                    inbound_tcp_client.payload_len = 0;
-                }
+                /* v2.106: No global cleanup needed - using per-connection pool
+                 * Each connection has its own state, freed via callbacks */
             } else {
                 /* tcp_close() succeeded - lwIP will manage the rest */
                 /* Don't clean up metadata yet - lwIP will call our callback */
-                printf("%s:   ✓ tcp_close() succeeded - lwIP will call callbacks when done\n",
+                printf("%s:   [OK] tcp_close() succeeded - lwIP will call callbacks when done\n",
                        COMPONENT_NAME);
             }
         } else {
@@ -2819,7 +2954,7 @@ void inbound_ready_handle(void)
 
         struct tcp_pcb *existing_pcb = existing_meta->pcb;
 
-        printf("%s: 🔍 Found existing connection for SCADA %u.%u.%u.%u:%u (PCB=%p)\n",
+        printf("%s: [FIND] Found existing connection for SCADA %u.%u.%u.%u:%u (PCB=%p)\n",
                COMPONENT_NAME,
                (ics_msg->metadata.src_ip >> 24) & 0xFF,
                (ics_msg->metadata.src_ip >> 16) & 0xFF,
@@ -2851,46 +2986,40 @@ void inbound_ready_handle(void)
         printf("%s:   → Creating new connection for this request (safer than reuse)\n", COMPONENT_NAME);
         goto cleanup_and_create_new;
 
-        /* ═══════════════════════════════════════════════════════════════════
-         * ✅ ALL VALIDATION PASSED - SAFE TO REUSE CONNECTION!
-         * ═══════════════════════════════════════════════════════════════════ */
-        printf("%s:   ✅ Connection validation passed - REUSING for same SCADA session\n", COMPONENT_NAME);
+        /* v2.106: DEAD CODE - Never executed due to goto cleanup_and_create_new above
+         * Connection reuse is disabled - always create new connection
+         * Left commented out for reference
+         *
+         * ═══════════════════════════════════════════════════════════════════
+         * [OK] ALL VALIDATION PASSED - SAFE TO REUSE CONNECTION!
+         * ═══════════════════════════════════════════════════════════════════
+         *
+        printf("%s:   [OK] Connection validation passed - REUSING for same SCADA session\n", COMPONENT_NAME);
         printf("%s:   → Supports: Multi-packet responses (>MTU), HTTP keep-alive, streaming\n", COMPONENT_NAME);
 
-        /* v2.59: Update last_activity timestamp for idle timeout detection */
         existing_meta->last_activity = sys_now();
 
-        /* Validate payload size before copying */
         if (ics_msg->payload_length > MAX_PAYLOAD_SIZE) {
             printf("%s: ERROR: Payload too large (%u > %u)\n",
                    COMPONENT_NAME, ics_msg->payload_length, MAX_PAYLOAD_SIZE);
             goto cleanup_and_create_new;
         }
 
-        /* Copy new request payload and send on existing connection */
-        memcpy(inbound_tcp_client.payload_data, ics_msg->payload, ics_msg->payload_length);
-        inbound_tcp_client.payload_len = ics_msg->payload_length;
-        inbound_tcp_client.bytes_sent = 0;
-        inbound_tcp_client.pcb = existing_pcb;
-        inbound_tcp_client.active = true;
-
-        err_t err = tcp_write(existing_pcb, inbound_tcp_client.payload_data,
-                              inbound_tcp_client.payload_len, TCP_WRITE_FLAG_COPY);
-        if (err != ERR_OK) {
-            printf("%s:   ⚠️  tcp_write failed (%d) on reused connection - will recreate\n",
-                   COMPONENT_NAME, err);
-            goto cleanup_and_create_new;
-        }
+        [Connection reuse code removed - used global inbound_tcp_client]
 
         tcp_output(existing_pcb);
-        BREADCRUMB(2020);  /* Successfully reused connection */
+        BREADCRUMB(2020);
         return;
+        */
 
 cleanup_and_create_new:
         /* ─────────────────────────────────────────────────────────────────────
          * Connection validation failed - clean up and create new
          * ───────────────────────────────────────────────────────────────────── */
-        printf("%s:   🧹 Cleaning up old connection (PCB=%p)\n", COMPONENT_NAME, (void*)existing_pcb);
+        printf("%s:   [CLEAN] Cleaning up old connection (PCB=%p)\n", COMPONENT_NAME, (void*)existing_pcb);
+
+        /* v2.107: connection_remove() now handles pool state freeing automatically */
+        BREADCRUMB(2107);  /* Cleanup path - clearing callbacks */
 
         /* Clear callbacks to prevent them from firing during cleanup */
         tcp_recv(existing_pcb, NULL);
@@ -2899,21 +3028,13 @@ cleanup_and_create_new:
         tcp_arg(existing_pcb, NULL);
 
         /* Force abort connection (send RST immediately) */
+        BREADCRUMB(2108);  /* Cleanup path - about to abort and remove metadata */
         tcp_abort(existing_pcb);
 
-        /* Clear metadata */
-        existing_meta->pcb = NULL;
-        existing_meta->active = false;
+        /* v2.107: connection_remove() will automatically free the associated pool state */
+        connection_remove(existing_pcb);  /* Frees pool_state inside */
 
-        /* Clear inbound_tcp_client if it's the same PCB */
-        if (inbound_tcp_client.pcb == existing_pcb) {
-            inbound_tcp_client.active = false;
-            inbound_tcp_client.pcb = NULL;
-            inbound_tcp_client.bytes_sent = 0;
-            inbound_tcp_client.payload_len = 0;
-        }
-
-        printf("%s:   ✓ Cleanup complete - proceeding to create new connection\n", COMPONENT_NAME);
+        printf("%s:   [OK] Cleanup complete - proceeding to create new connection\n", COMPONENT_NAME);
     }
 
     BREADCRUMB(2007);  /* Creating new TCP PCB */
@@ -2974,7 +3095,7 @@ cleanup_and_create_new:
     struct tcp_pcb *pcb = tcp_new_ip_type(IPADDR_TYPE_V4);
     if (pcb == NULL) {
         BREADCRUMB(2008);  /* Failed to create PCB */
-        printf("%s: ⚠️  INBOUND: Failed to create TCP PCB - lwIP connection pool exhausted (MEMP_NUM_TCP_PCB=%d)\n",
+        printf("%s: [WARN]  INBOUND: Failed to create TCP PCB - lwIP connection pool exhausted (MEMP_NUM_TCP_PCB=%d)\n",
                COMPONENT_NAME, MEMP_NUM_TCP_PCB);
         printf("%s:   → Sending ERROR notification to Net0 (lwIP connection limit reached)\n", COMPONENT_NAME);
 
@@ -3008,6 +3129,19 @@ cleanup_and_create_new:
 
     BREADCRUMB(2009);  /* PCB created successfully */
 
+    /* v2.106: Allocate per-connection state from pool
+     * CRITICAL: Each connection must have its own state to prevent race conditions
+     * See detailed comment at inbound_connection_pool declaration for bug analysis */
+    struct tcp_inbound_client_state *state = inbound_alloc_state();
+    if (state == NULL) {
+        printf("%s: [ERROR] INBOUND: Connection pool exhausted, dropping request\n", COMPONENT_NAME);
+        tcp_abort(pcb);
+        BREADCRUMB(2111);  /* Pool exhausted - aborted PCB and returning */
+        return;
+    }
+
+    BREADCRUMB(2112);  /* Pool allocation succeeded - continue to setup */
+
     /* CRITICAL FIX v2.48: Copy payload to local buffer instead of storing pointer
      * Previously: inbound_tcp_client.payload_data = ics_msg->payload (pointer assignment)
      * Problem: ics_msg->payload is in shared CAmkES dataport that gets overwritten
@@ -3020,15 +3154,16 @@ cleanup_and_create_new:
         printf("%s: INBOUND: Payload too large (%u > %u), dropping\n",
                COMPONENT_NAME, ics_msg->payload_length, MAX_PAYLOAD_SIZE);
         tcp_abort(pcb);  /* v2.51: Force RST - never use tcp_close() to avoid FIN-WAIT-1 */
+        inbound_free_state(state);  /* v2.106: Free allocated state */
         return;
     }
 
     /* Set up client state with COPIED payload */
-    inbound_tcp_client.pcb = pcb;
-    memcpy(inbound_tcp_client.payload_data, ics_msg->payload, ics_msg->payload_length);  /* COPY, not pointer! */
-    inbound_tcp_client.payload_len = ics_msg->payload_length;
-    inbound_tcp_client.bytes_sent = 0;
-    inbound_tcp_client.active = true;
+    state->pcb = pcb;
+    memcpy(state->payload_data, ics_msg->payload, ics_msg->payload_length);  /* COPY, not pointer! */
+    state->payload_len = ics_msg->payload_length;
+    state->bytes_sent = 0;
+    /* state->active already set to true by inbound_alloc_state() */
 
     /* Extract source and destination from metadata
      * This preserves end-to-end IP addresses through the gateway
@@ -3066,8 +3201,7 @@ cleanup_and_create_new:
         BREADCRUMB(2011);  /* tcp_bind failed */
         printf("%s: INBOUND: tcp_bind failed: %d\n", COMPONENT_NAME, bind_err);
         tcp_abort(pcb);  /* v2.51: Force RST - never use tcp_close() to avoid FIN-WAIT-1 */
-        inbound_tcp_client.active = false;
-        inbound_tcp_client.pcb = NULL;
+        inbound_free_state(state);  /* v2.106: Free allocated state */
         return;
     }
 
@@ -3083,15 +3217,15 @@ cleanup_and_create_new:
         ics_msg->metadata.src_ip,   /* Original SCADA IP (e.g., 192.168.90.5) */
         ics_msg->metadata.dst_ip,   /* Original PLC IP (e.g., 192.168.95.2) */
         ics_msg->metadata.src_port, /* SCADA port */
-        ics_msg->metadata.dst_port  /* PLC port (502) */
+        ics_msg->metadata.dst_port, /* PLC port (502) */
+        state                       /* v2.107: Track pool state for cleanup */
     );
 
     if (meta == NULL) {
         BREADCRUMB(2014);  /* Metadata storage failed */
         printf("%s: INBOUND: Failed to store connection metadata (table full)\n", COMPONENT_NAME);
         tcp_abort(pcb);  /* v2.51: Force RST - never use tcp_close() to avoid FIN-WAIT-1 */
-        inbound_tcp_client.active = false;
-        inbound_tcp_client.pcb = NULL;
+        inbound_free_state(state);  /* v2.106: Free allocated state */
         return;
     }
 
@@ -3102,8 +3236,8 @@ cleanup_and_create_new:
 
     /* CRITICAL: Set callback argument BEFORE tcp_connect()
      * This prevents null pointer dereference in inbound_tcp_sent_callback
-     */
-    tcp_arg(pcb, &inbound_tcp_client);
+     * v2.106: Pass allocated state instead of global variable */
+    tcp_arg(pcb, state);
 
     /* v2.82: Register error callback BEFORE tcp_connect()
      * This is critical to handle connection failures and prevent dangling PCB access */
@@ -3132,7 +3266,7 @@ cleanup_and_create_new:
         /* v2.93: If connection fails, PLC might be overloaded with stale connections
          * Proactively clean up any stale connections to this PLC to free resources */
         if (err == ERR_CONN || err == ERR_RST || err == ERR_ABRT) {
-            printf("%s:   ⚠️  PLC connection failed - checking for stale connections to clean up\n",
+            printf("%s:   [WARN]  PLC connection failed - checking for stale connections to clean up\n",
                    COMPONENT_NAME);
 
             int cleaned = 0;
@@ -3149,7 +3283,7 @@ cleanup_and_create_new:
                      * DO NOT access pcb->state - causes crash at offset 0x10!
                      * DO NOT call tcp_abort() from main loop - lwIP will clean up via callbacks */
                     if (stale_pcb == NULL) {
-                        printf("%s:   🧹 Cleaning stale connection [%d] to PLC (PCB=NULL)\n",
+                        printf("%s:   [CLEAN] Cleaning stale connection [%d] to PLC (PCB=NULL)\n",
                                COMPONENT_NAME, i);
 
                         connection_table[i].active = false;
@@ -3162,7 +3296,7 @@ cleanup_and_create_new:
             }
 
             if (cleaned > 0) {
-                printf("%s:   ✓ Cleaned %d stale connection(s) to PLC\n", COMPONENT_NAME, cleaned);
+                printf("%s:   [OK] Cleaned %d stale connection(s) to PLC\n", COMPONENT_NAME, cleaned);
             } else {
                 printf("%s:   → No stale connections found - PLC might be genuinely unreachable\n",
                        COMPONENT_NAME);
@@ -3203,7 +3337,7 @@ cleanup_and_create_new:
             error_msg->metadata.payload_length = 0;
             error_msg->metadata.payload_offset = 0xFFFF;  /* Special marker: 0xFFFF = ERROR */
 
-            printf("%s: ❌ Sending ERROR notification to Net0 (PLC refused connection, err=%d)\n",
+            printf("%s: [ERR] Sending ERROR notification to Net0 (PLC refused connection, err=%d)\n",
                    COMPONENT_NAME, err);
             printf("%s:    → Net0 will close SCADA %u.%u.%u.%u:%u immediately\n",
                    COMPONENT_NAME,
@@ -3221,8 +3355,7 @@ cleanup_and_create_new:
         }
 
         tcp_abort(pcb);  /* v2.51: Force RST - never use tcp_close() to avoid FIN-WAIT-1 */
-        inbound_tcp_client.active = false;
-        inbound_tcp_client.pcb = NULL;
+        inbound_free_state(state);  /* v2.106: Free allocated state */
         meta->pcb = NULL;  /* Clear PCB from metadata */
         return;
     }
@@ -3272,7 +3405,7 @@ void outbound_ready_handle(void)
 {
     #if DEBUG_PACKET_DETAIL
     uint32_t msg_id = ++message_id_counter;
-    printf("\n🟡 [MSG #%u] ═══ ICS→NET: Received from ICS_Outbound ═══\n", msg_id);
+    printf("\n[MSG] [MSG #%u] ═══ ICS→NET: Received from ICS_Outbound ═══\n", msg_id);
     printf("   Source: ICS pipeline validation complete\n");
     printf("   Action: Creating TCP client to forward to external network\n");
     #endif
@@ -3285,13 +3418,13 @@ void outbound_ready_handle(void)
 
     /* CRITICAL: Check if dataport is properly mapped by CAmkES */
     if (outbound_dp == NULL) {
-        printf("%s: ❌ FATAL: outbound_dp is NULL! CAmkES dataport not mapped\n", COMPONENT_NAME);
+        printf("%s: [ERR] FATAL: outbound_dp is NULL! CAmkES dataport not mapped\n", COMPONENT_NAME);
         printf("%s:    This indicates seL4 capability/memory allocation failure\n", COMPONENT_NAME);
         return;
     }
 
     #if DEBUG_TRAFFIC
-    printf("%s: ✓ Dataport check: outbound_dp=%p (valid)\n", COMPONENT_NAME, (void*)outbound_dp);
+    printf("%s: [OK] Dataport check: outbound_dp=%p (valid)\n", COMPONENT_NAME, (void*)outbound_dp);
     #endif
 
     ICS_Message *ics_msg = (ICS_Message *)outbound_dp;
@@ -3361,9 +3494,17 @@ void outbound_ready_handle(void)
         return;
     }
 
-    /* Set up client state */
+    /* v2.106: Validate payload size before copying */
+    if (ics_msg->payload_length > MAX_PAYLOAD_SIZE) {
+        printf("%s: OUTBOUND: Payload too large (%u > %u), dropping\n",
+               COMPONENT_NAME, ics_msg->payload_length, MAX_PAYLOAD_SIZE);
+        tcp_abort(pcb);
+        return;
+    }
+
+    /* Set up client state with COPIED payload (not pointer!) */
     outbound_tcp_client.pcb = pcb;
-    outbound_tcp_client.payload_data = ics_msg->payload;
+    memcpy(outbound_tcp_client.payload_data, ics_msg->payload, ics_msg->payload_length);  /* v2.106: COPY, not pointer! */
     outbound_tcp_client.payload_len = ics_msg->payload_length;
     outbound_tcp_client.bytes_sent = 0;
     outbound_tcp_client.active = true;
@@ -3499,7 +3640,7 @@ static int virtio_net_init(void)
 
     /* CRITICAL: Check if CAmkES dataport is properly mapped */
     if (virtio_mmio_regs == NULL) {
-        printf("%s: ❌ FATAL: virtio_mmio_regs dataport is NULL!\n", COMPONENT_NAME);
+        printf("%s: [ERR] FATAL: virtio_mmio_regs dataport is NULL!\n", COMPONENT_NAME);
         printf("%s:    CAmkES failed to map hardware component net0_hw\n", COMPONENT_NAME);
         printf("%s:    Check ics_dual_nic.camkes configuration\n", COMPONENT_NAME);
         return -1;
@@ -3531,7 +3672,7 @@ static int virtio_net_init(void)
     if (version != 2) {
         printf("\n");
         printf("╔════════════════════════════════════════════════════════════════╗\n");
-        printf("║  ❌ FATAL ERROR: Legacy VirtIO Protocol Detected              ║\n");
+        printf("║  [ERR] FATAL ERROR: Legacy VirtIO Protocol Detected              ║\n");
         printf("╚════════════════════════════════════════════════════════════════╝\n");
         printf("\n");
         printf("%s: VirtIO Version=%u (expected 2 for modern protocol)\n", COMPONENT_NAME, version);
@@ -3553,10 +3694,10 @@ static int virtio_net_init(void)
         printf("    -device virtio-net-device,netdev=net1\"\n");
         printf("\n");
         printf("WHAT THIS DOES:\n");
-        printf("  ✓ Enables VirtIO 1.0+ modern protocol (Version 2)\n");
-        printf("  ✓ Fixes MMIO write issues\n");
-        printf("  ✓ Allocates devices to slots 6-7 (not 30-31)\n");
-        printf("  ✓ Makes QueueReady registers writable\n");
+        printf("  [OK] Enables VirtIO 1.0+ modern protocol (Version 2)\n");
+        printf("  [OK] Fixes MMIO write issues\n");
+        printf("  [OK] Allocates devices to slots 6-7 (not 30-31)\n");
+        printf("  [OK] Makes QueueReady registers writable\n");
         printf("\n");
         printf("DOCUMENTATION:\n");
         printf("  See: research-docs/VIRTIO-FORCE-LEGACY-REQUIREMENT.md\n");
@@ -3575,7 +3716,7 @@ static int virtio_net_init(void)
         return -1;
     }
 
-    printf("%s: ✓ Found VirtIO network device (modern protocol, Version 2)\n", COMPONENT_NAME);
+    printf("%s: [OK] Found VirtIO network device (modern protocol, Version 2)\n", COMPONENT_NAME);
 
     /* Reset device */
     VREG_WRITE(VIRTIO_MMIO_STATUS, 0);
@@ -3661,11 +3802,11 @@ static int virtio_net_init(void)
      */
     rx_virtq.num = MAX_PACKETS;
 
-    printf("%s: 🔧 RX Queue: Device offers %u descriptors, using %u (matches buffer pool)\n",
+    printf("%s: [FIX] RX Queue: Device offers %u descriptors, using %u (matches buffer pool)\n",
            COMPONENT_NAME, queue_num_max, rx_virtq.num);
 
     if (queue_num_max < MAX_PACKETS) {
-        printf("%s: ⚠️  WARNING: Device only supports %u descriptors but we need %u\n",
+        printf("%s: [WARN]  WARNING: Device only supports %u descriptors but we need %u\n",
                COMPONENT_NAME, queue_num_max, MAX_PACKETS);
         printf("%s:             This may cause issues - consider reducing MAX_PACKETS\n", COMPONENT_NAME);
     }
@@ -3722,9 +3863,9 @@ static int virtio_net_init(void)
     printf("\n%s: After writing QUEUE_READY=1:\n", COMPONENT_NAME);
     printf("  QueueReady readback: 0x%08x (expect 1 if QEMU accepted config)\n", rx_ready_after);
     if (rx_ready_after == 0) {
-        printf("  ❌ QEMU REJECTED RX queue - configuration invalid!\n");
+        printf("  [ERR] QEMU REJECTED RX queue - configuration invalid!\n");
     } else {
-        printf("  ✅ QEMU ACCEPTED RX queue\n");
+        printf("  [OK] QEMU ACCEPTED RX queue\n");
     }
 
     /* TX queue */
@@ -3738,11 +3879,11 @@ static int virtio_net_init(void)
      */
     tx_virtq.num = MAX_PACKETS;  /* Use same size as RX for consistency */
 
-    printf("%s: 🔧 TX Queue: Device offers %u descriptors, using %u (matches buffer pool)\n",
+    printf("%s: [FIX] TX Queue: Device offers %u descriptors, using %u (matches buffer pool)\n",
            COMPONENT_NAME, queue_num_max, tx_virtq.num);
 
     if (queue_num_max < MAX_PACKETS) {
-        printf("%s: ⚠️  WARNING: Device only supports %u TX descriptors but we need %u\n",
+        printf("%s: [WARN]  WARNING: Device only supports %u TX descriptors but we need %u\n",
                COMPONENT_NAME, queue_num_max, MAX_PACKETS);
     }
 
@@ -3787,14 +3928,14 @@ static int virtio_net_init(void)
     printf("\n%s: After writing QUEUE_READY=1:\n", COMPONENT_NAME);
     printf("  QueueReady readback: 0x%08x (expect 1 if QEMU accepted config)\n", tx_ready_after);
     if (tx_ready_after == 0) {
-        printf("  ❌ QEMU REJECTED TX queue - configuration invalid!\n");
+        printf("  [ERR] QEMU REJECTED TX queue - configuration invalid!\n");
     } else {
-        printf("  ✅ QEMU ACCEPTED TX queue\n");
+        printf("  [OK] QEMU ACCEPTED TX queue\n");
     }
 
     /* Device ready - activate the device */
     VREG_WRITE(VIRTIO_MMIO_STATUS, VREG_READ(VIRTIO_MMIO_STATUS) | VIRTIO_STATUS_DRIVER_OK);
-    printf("%s: ✓ VirtIO device initialized and activated\n", COMPONENT_NAME);
+    printf("%s: [OK] VirtIO device initialized and activated\n", COMPONENT_NAME);
     /* ═══ CRITICAL: Test if MMIO writes work ═══ */
     printf("\n%s: Testing MMIO write capability...\n", COMPONENT_NAME);
 
@@ -3819,14 +3960,14 @@ static int virtio_net_init(void)
     VREG_WRITE(VIRTIO_MMIO_QUEUE_READY, original_ready);
 
     if (read_back_0 != 0x0 || read_back_1 != 0x1) {
-        printf("\n%s: ❌❌❌ FATAL ERROR: MMIO WRITES DO NOT WORK! ❌❌❌\n", COMPONENT_NAME);
+        printf("\n%s: [ERR][ERR][ERR] FATAL ERROR: MMIO WRITES DO NOT WORK! [ERR][ERR][ERR]\n", COMPONENT_NAME);
         printf("%s: Device memory attributes are incorrect.\n", COMPONENT_NAME);
         printf("%s: This will cause infinite IRQ loops and duplicate packets.\n", COMPONENT_NAME);
         printf("%s: Cannot continue - terminating initialization.\n\n", COMPONENT_NAME);
         return -1;
     }
 
-    printf("%s:   ✅ MMIO writes work correctly!\n\n", COMPONENT_NAME);
+    printf("%s:   [OK] MMIO writes work correctly!\n\n", COMPONENT_NAME);
 
     return 0;
 }
@@ -3837,21 +3978,21 @@ static int virtio_net_init(void)
 void post_init(void)
 {
     printf("%s: Component started\n", COMPONENT_NAME);
-    printf("%s: 🔖 NET1 SOFTWARE VERSION: v2.100-connection-limit-45 (2025-10-20)\n", COMPONENT_NAME);
-    printf("%s: 🔧 MODE: PRODUCTION-READY with Multi-Layer Validation\n", COMPONENT_NAME);
-    printf("%s: ✅ FIX 1: payload_data buffer (prevents dataport corruption)\n", COMPONENT_NAME);
-    printf("%s: ✅ FIX 2: tcp_abort() removed from callbacks (crash at 0x38a9c fixed!)\n", COMPONENT_NAME);
-    printf("%s: ✅ FIX 3: Connection reuse when SCADA keeps connection alive\n", COMPONENT_NAME);
-    printf("%s: ✅ FIX 4: Close notification - Net0 tells Net1 when SCADA closes\n", COMPONENT_NAME);
-    printf("%s: ✅ FIX 5: Stale connection cleanup on tcp_connect() failure\n", COMPONENT_NAME);
-    printf("%s: ✅ FIX 6: CLOSE_WAIT memory leak - always call tcp_close() regardless of state\n", COMPONENT_NAME);
-    printf("%s: 🎯 FEATURES: Supports >MTU data, HTTP keep-alive, streaming protocols\n", COMPONENT_NAME);
-    printf("%s: ⚠️  CRITICAL: Uses tcp_close() for graceful shutdown (FIN handshake)\n\n", COMPONENT_NAME);
+    printf("%s: NET1 v2.110-memory-fix (2025-10-21)\n", COMPONENT_NAME);
+    printf("%s: [FIX] MODE: PRODUCTION-READY with Multi-Layer Validation\n", COMPONENT_NAME);
+    printf("%s: [OK] FIX 1: payload_data buffer (prevents dataport corruption)\n", COMPONENT_NAME);
+    printf("%s: [OK] FIX 2: tcp_abort() removed from callbacks (crash at 0x38a9c fixed!)\n", COMPONENT_NAME);
+    printf("%s: [OK] FIX 3: Connection reuse when SCADA keeps connection alive\n", COMPONENT_NAME);
+    printf("%s: [OK] FIX 4: Close notification - Net0 tells Net1 when SCADA closes\n", COMPONENT_NAME);
+    printf("%s: [OK] FIX 5: Stale connection cleanup on tcp_connect() failure\n", COMPONENT_NAME);
+    printf("%s: [OK] FIX 6: CLOSE_WAIT memory leak - always call tcp_close() regardless of state\n", COMPONENT_NAME);
+    printf("%s: [TARGET] FEATURES: Supports >MTU data, HTTP keep-alive, streaming protocols\n", COMPONENT_NAME);
+    printf("%s: [WARN]  CRITICAL: Uses tcp_close() for graceful shutdown (FIN handshake)\n\n", COMPONENT_NAME);
 
     /* Initialize connection tracking table */
     memset(connection_table, 0, sizeof(connection_table));
     connection_count = 0;
-    printf("%s: ✓ Connection tracking table initialized (%d slots)\n", COMPONENT_NAME, MAX_CONNECTIONS);
+    printf("%s: [OK] Connection tracking table initialized (%d slots)\n", COMPONENT_NAME, MAX_CONNECTIONS);
 
     /* v2.93: Note about cleaning up stale PLC connections from previous versions
      *
@@ -3885,7 +4026,7 @@ void post_init(void)
         }
         packet_buffers_paddr[i] = camkes_dma_get_paddr(packet_buffers[i]);
     }
-    printf("%s: ✓ Allocated DMA packet buffers (vaddr=%p, paddr=0x%lx)\n",
+    printf("%s: [OK] Allocated DMA packet buffers (vaddr=%p, paddr=0x%lx)\n",
            COMPONENT_NAME, packet_buffers[0], packet_buffers_paddr[0]);
 
     /* Allocate TX headers array */
@@ -3897,7 +4038,7 @@ void post_init(void)
     }
     tx_headers_paddr = camkes_dma_get_paddr(tx_headers);
     memset(tx_headers, 0, tx_headers_size);
-    printf("%s: ✓ Allocated TX headers array (vaddr=%p, paddr=0x%lx)\n",
+    printf("%s: [OK] Allocated TX headers array (vaddr=%p, paddr=0x%lx)\n",
            COMPONENT_NAME, tx_headers, tx_headers_paddr);
 
     /* Initialize packet buffers */
@@ -3944,7 +4085,7 @@ void post_init(void)
     /* Verify interface configuration */
     printf("\n");
     printf("%s: ═══════════════════════════════════════════════════════════\n", COMPONENT_NAME);
-    printf("%s: ✓ NETWORK INTERFACE CONFIGURATION\n", COMPONENT_NAME);
+    printf("%s: [OK] NETWORK INTERFACE CONFIGURATION\n", COMPONENT_NAME);
     printf("%s: ═══════════════════════════════════════════════════════════\n", COMPONENT_NAME);
     printf("%s: Interface IP:   %u.%u.%u.%u\n", COMPONENT_NAME,
            ip4_addr1(netif_ip4_addr(&netif_data)),
@@ -3973,18 +4114,18 @@ void post_init(void)
     uint8_t if_ip4 = ip4_addr4(netif_ip4_addr(&netif_data));
 
     if (if_ip1 == 192 && if_ip2 == 168 && if_ip3 == 96 && if_ip4 == 2) {
-        printf("%s: ✅ CONFIGURATION VALID: Internal gateway IP = 192.168.95.1\n", COMPONENT_NAME);
-        printf("%s: ✅ pfSense routes 192.168.95.0/24 traffic through this gateway\n", COMPONENT_NAME);
-        printf("%s: ✅ Bridge br0 forwards all traffic to/from ens224\n", COMPONENT_NAME);
+        printf("%s: [OK] CONFIGURATION VALID: Internal gateway IP = 192.168.95.1\n", COMPONENT_NAME);
+        printf("%s: [OK] pfSense routes 192.168.95.0/24 traffic through this gateway\n", COMPONENT_NAME);
+        printf("%s: [OK] Bridge br0 forwards all traffic to/from ens224\n", COMPONENT_NAME);
     } else {
-        printf("%s: ⚠️  WARNING: Interface IP (%u.%u.%u.%u) does NOT match expected (192.168.95.1)\n",
+        printf("%s: [WARN]  WARNING: Interface IP (%u.%u.%u.%u) does NOT match expected (192.168.95.1)\n",
                COMPONENT_NAME, if_ip1, if_ip2, if_ip3, if_ip4);
-        printf("%s: ⚠️  pfSense routing will FAIL!\n", COMPONENT_NAME);
+        printf("%s: [WARN]  pfSense routing will FAIL!\n", COMPONENT_NAME);
     }
     printf("\n");
 
     tcp_server_initialized = true;
-    printf("%s: ✓ Initialization complete\n", COMPONENT_NAME);
+    printf("%s: [OK] Initialization complete\n", COMPONENT_NAME);
     printf("%s: Network ready\n\n", COMPONENT_NAME);
 
     /* Mark initialization as successful */
@@ -3999,7 +4140,7 @@ int run(void)
     if (!initialization_successful) {
         printf("\n");
         printf("╔══════════════════════════════════════════════════════════╗\n");
-        printf("║  ❌ FATAL: VirtIO_Net1_Driver initialization FAILED     ║\n");
+        printf("║  [ERR] FATAL: VirtIO_Net1_Driver initialization FAILED     ║\n");
         printf("╚══════════════════════════════════════════════════════════╝\n");
         printf("\n");
         printf("%s: Initialization did not complete successfully\n", COMPONENT_NAME);
@@ -4015,7 +4156,7 @@ int run(void)
         }
     }
 
-    printf("%s: ✅ Initialization validation passed - starting main loop\n", COMPONENT_NAME);
+    printf("%s: [OK] Initialization validation passed - starting main loop\n", COMPONENT_NAME);
 
     /* Main event loop - process lwIP timers, RX packets, and ICS notifications */
     /* Note: TCP server is now initialized in RX path after first packet */
@@ -4026,11 +4167,11 @@ int run(void)
     while (1) {
         /* v2.74: Heartbeat to detect silent hangs */
         if (++heartbeat_counter >= 50000) {
-            printf("%s: ❤️  Heartbeat: %u iterations, %u active connections\n",
+            printf("%s: [HB]  Heartbeat: %u iterations, %u active connections\n",
                    COMPONENT_NAME, heartbeat_counter, connection_count);
 
             /* v2.93: DEBUG - Show connection table details */
-            printf("%s: 🔍 NET1 Connection Table (PLC connections):\n", COMPONENT_NAME);
+            printf("%s: [FIND] NET1 Connection Table (PLC connections):\n", COMPONENT_NAME);
             int shown = 0;
             for (int i = 0; i < MAX_CONNECTIONS && shown < 10; i++) {
                 if (connection_table[i].active) {

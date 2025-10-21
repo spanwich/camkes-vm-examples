@@ -5,14 +5,14 @@
 ### 1. Build the Project
 
 ```bash
-cd /home/iamfo470/phd/camkes-vm-examples/projects/vm-examples/apps/Arm/modbus_bidirection_poc/build
+cd ~/phd/camkes-vm-examples/projects/vm-examples/apps/Arm/modbus_bidirection_poc/build
 ninja
 ```
 
 ### 2. Run with Console Logging
 
 ```bash
-cd /home/iamfo470/phd/camkes-vm-examples/projects/vm-examples/apps/Arm/modbus_bidirection_poc/build
+cd ~/phd/camkes-vm-examples/projects/vm-examples/apps/Arm/modbus_bidirection_poc/build
 
 # Run with automatic logging
 ../scripts/run-remote-with-log.sh
@@ -50,7 +50,7 @@ This will show:
 cat logs/console-<timestamp>.log
 
 # Or copy to research docs
-cp logs/console-<timestamp>.log /home/iamfo470/phd/research-docs/v2.43-crash-breadcrumbs.log
+cp logs/console-<timestamp>.log ~/phd/research-docs/v2.43-crash-breadcrumbs.log
 ```
 
 ## Expected Output

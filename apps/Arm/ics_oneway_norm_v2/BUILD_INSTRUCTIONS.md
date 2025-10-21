@@ -18,7 +18,7 @@ pip3 install --break-system-packages plyplus future aenum sortedcontainers order
 
 ### 1. Navigate to repository root
 ```bash
-cd /home/iamfo470/phd/camkes-vm-examples
+cd ~/phd/camkes-vm-examples
 ```
 
 ### 2. Create and configure build directory
@@ -44,7 +44,7 @@ Build output will be in: `build_ics_v2/images/capdl-loader-image-arm-qemu-arm-vi
 
 ### Method 1: Using the generated simulate script
 ```bash
-cd /home/iamfo470/phd/camkes-vm-examples/build_ics_v2
+cd ~/phd/camkes-vm-examples/build_ics_v2
 ./simulate
 ```
 
@@ -144,7 +144,7 @@ Each slot is 512 bytes (0x200).
 
 To rebuild from scratch:
 ```bash
-cd /home/iamfo470/phd/camkes-vm-examples
+cd ~/phd/camkes-vm-examples
 rm -rf build_ics_v2
 mkdir build_ics_v2
 cd build_ics_v2
@@ -204,4 +204,4 @@ After confirming VirtIO access works:
 For issues, check:
 - seL4 documentation: https://docs.sel4.systems/
 - CAmkES manual: https://docs.sel4.systems/projects/camkes/
-- This PhD research project documentation in `/home/iamfo470/phd/research-docs/`
+- This PhD research project documentation in `~/phd/research-docs/`

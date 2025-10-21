@@ -141,7 +141,7 @@ struct MsgHeader {
 ### Building V3
 
 ```bash
-cd /home/iamfo470/phd/camkes-vm-examples
+cd ~/phd/camkes-vm-examples
 rm -rf build && mkdir build && cd build
 
 # Configure for V3
@@ -157,7 +157,7 @@ ninja
 
 **Method 1: Using simulate script (QEMU user networking)**
 ```bash
-cd /home/iamfo470/phd/camkes-vm-examples/ics_oneway_norm_v3
+cd ~/phd/camkes-vm-examples/ics_oneway_norm_v3
 ./simulate --extra-qemu-args="-nic user,model=virtio,mac=52:54:00:12:34:56,hostfwd=tcp::8502-:502"
 ```
 
@@ -262,7 +262,7 @@ IntNicDrv: Throughput: 10 msg/s, Success rate: 100%
 
 ## Implementation Status
 
-Based on the implementation plan in `/home/iamfo470/phd/research-docs/no-op-normalizer/virtio-drivers/freertos-vm-cross-vm-implementation-plan.md`:
+Based on the implementation plan in `~/phd/research-docs/no-op-normalizer/virtio-drivers/freertos-vm-cross-vm-implementation-plan.md`:
 
 ### Phase 1: FreeRTOS VM Setup with VirtIO-Net (Days 1-3)
 - [ ] Create FreeRTOSNetVM component structure
@@ -564,10 +564,10 @@ bool everparse_validate(const uint8_t* payload, size_t length) {
 
 ## Reference Documentation
 
-- **Implementation Plan**: `/home/iamfo470/phd/research-docs/no-op-normalizer/virtio-drivers/freertos-vm-cross-vm-implementation-plan.md`
+- **Implementation Plan**: `~/phd/research-docs/no-op-normalizer/virtio-drivers/freertos-vm-cross-vm-implementation-plan.md`
 - **VirtIO Spec**: https://docs.oasis-open.org/virtio/virtio/v1.2/virtio-v1.2.html
-- **vm_echo_connector**: `/home/iamfo470/phd/camkes-vm-examples/projects/vm-examples/apps/Arm/vm_echo_connector/`
-- **vm_freertos**: `/home/iamfo470/phd/camkes-vm-examples/projects/vm-examples/apps/Arm/vm_freertos/`
+- **vm_echo_connector**: `~/phd/camkes-vm-examples/projects/vm-examples/apps/Arm/vm_echo_connector/`
+- **vm_freertos**: `~/phd/camkes-vm-examples/projects/vm-examples/apps/Arm/vm_freertos/`
 - **CAmkES Manual**: https://docs.sel4.systems/projects/camkes/
 
 ---

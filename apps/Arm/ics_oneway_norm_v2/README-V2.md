@@ -84,7 +84,7 @@ V2 is working correctly when:
 ## Build Instructions
 
 ```bash
-cd /home/iamfo470/phd/camkes-vm-examples
+cd ~/phd/camkes-vm-examples
 rm -rf build && mkdir build && cd build
 
 # Configure for V2

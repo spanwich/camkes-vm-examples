@@ -94,4 +94,20 @@
 /* Lightweight protection */
 #define SYS_LIGHTWEIGHT_PROT            0
 
+/* v2.115: LWIP_PLATFORM_ASSERT override removed
+ * ═══════════════════════════════════════════════════════════════════════════
+ * Previous versions (v2.114) overrode LWIP_PLATFORM_ASSERT to prevent abort()
+ * because we had a bug that caused assertions to fire during connection close.
+ *
+ * Root cause was fixed in v2.115:
+ * - We were returning ERR_ABRT WITHOUT calling tcp_abort()
+ * - This violated lwIP protocol and left PCB in inconsistent state
+ * - Now we properly call tcp_close(), fall back to tcp_abort() if needed
+ * - Assertions should NEVER fire with correct lwIP protocol
+ *
+ * Using default LWIP_PLATFORM_ASSERT now (calls abort() on assertion failure).
+ * If assertion fires, it indicates a REAL BUG that needs investigation.
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
+
 #endif /* __LWIPOPTS_H__ */

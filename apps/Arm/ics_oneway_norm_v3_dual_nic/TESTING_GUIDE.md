@@ -15,7 +15,7 @@
 
 ### Build Location
 ```bash
-cd /home/iamfo470/phd/camkes-vm-examples/build
+cd ~/phd/camkes-vm-examples/build
 ```
 
 ---
@@ -51,7 +51,7 @@ Internal Network
 
 #### Terminal 1: Start Simulation
 ```bash
-cd /home/iamfo470/phd/camkes-vm-examples/build
+cd ~/phd/camkes-vm-examples/build
 
 # Start QEMU with dual NICs
 ./simulate --extra-qemu-args="\
@@ -452,7 +452,7 @@ nc -l 6000
 
 ### Start Simulation
 ```bash
-cd /home/iamfo470/phd/camkes-vm-examples/build
+cd ~/phd/camkes-vm-examples/build
 ./simulate --extra-qemu-args="-netdev user,id=net0,hostfwd=tcp::6000-:6000 -device virtio-net-device,netdev=net0 -netdev user,id=net1,hostfwd=tcp::7000-:7000 -device virtio-net-device,netdev=net1"
 ```
 

@@ -256,7 +256,7 @@ VirtIO_Net1_Driver: VirtIO @ slot 30 (+0xc00) ✓ Different device
 ### To Test Current Build:
 
 ```bash
-cd /home/iamfo470/phd/camkes-vm-examples/build
+cd ~/phd/camkes-vm-examples/build
 
 # Run simulation
 ./simulate --extra-qemu-args="\
@@ -303,7 +303,7 @@ VirtIO_Net1_Driver: TCP Echo Server listening on port 7000
 
 ## Contact & References
 
-- Working Example: `/home/iamfo470/phd/camkes-vm-examples/projects/vm-examples/apps/Arm/vm_ethernet_echo/`
-- Build Directory: `/home/iamfo470/phd/camkes-vm-examples/build/`
+- Working Example: `~/phd/camkes-vm-examples/projects/vm-examples/apps/Arm/vm_ethernet_echo/`
+- Build Directory: `~/phd/camkes-vm-examples/build/`
 - QEMU Device Tree Analysis: `/tmp/test.dtb`
 - VirtIO Spec: MMIO transport, slots @ 0x200-byte intervals starting 0xa000000

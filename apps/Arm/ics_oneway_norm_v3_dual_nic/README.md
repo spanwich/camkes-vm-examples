@@ -555,7 +555,7 @@ Large TCP payload → VirtIO_Net0_Driver
 ### Build Instructions
 
 ```bash
-cd /home/iamfo470/phd/camkes-vm-examples
+cd ~/phd/camkes-vm-examples
 
 # Initialize build environment
 mkdir -p build && cd build
@@ -898,7 +898,7 @@ Version: 3.0 (Smart Driver + Metadata Passing Architecture)
 
 ```bash
 # Build
-cd /home/iamfo470/phd/camkes-vm-examples/build
+cd ~/phd/camkes-vm-examples/build
 cmake -DCAMKES_APP=ics_oneway_norm_v3_dual_nic -G Ninja ..
 ninja
 

@@ -67,7 +67,7 @@ If you need detailed debugging output again:
 
 3. Rebuild:
    ```bash
-   cd /home/iamfo470/phd/camkes-vm-examples/build && ninja
+   cd ~/phd/camkes-vm-examples/build && ninja
    ```
 
 ## Files Modified

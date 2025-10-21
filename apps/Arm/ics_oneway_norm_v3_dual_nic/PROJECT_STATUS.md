@@ -10,7 +10,7 @@
 
 ### Build
 ```bash
-cd /home/iamfo470/phd/camkes-vm-examples/build
+cd ~/phd/camkes-vm-examples/build
 ninja
 ```
 
@@ -329,9 +329,9 @@ Platform: qemu-arm-virt (AArch64)
 
 ## Support & References
 
-**Project Location**: `/home/iamfo470/phd/camkes-vm-examples/projects/vm-examples/apps/Arm/ics_oneway_norm_v3_dual_nic`
+**Project Location**: `~/phd/camkes-vm-examples/projects/vm-examples/apps/Arm/ics_oneway_norm_v3_dual_nic`
 
-**Build Location**: `/home/iamfo470/phd/camkes-vm-examples/build`
+**Build Location**: `~/phd/camkes-vm-examples/build`
 
 **Key References**:
 - seL4 Documentation: https://docs.sel4.systems/

@@ -46,6 +46,9 @@
 /* ICS common definitions */
 #include "common.h"
 
+/* v2.117: Connection state sharing */
+#include "connection_state.h"
+
 #define COMPONENT_NAME "VirtIO_Net1_Driver"
 #define TCP_SERVER_PORT 502  /* INBOUND: Modbus port - pretends to be PLC */
 
@@ -112,6 +115,43 @@ struct connection_metadata {
 
 static struct connection_metadata connection_table[MAX_CONNECTIONS];
 static int connection_count = 0;
+
+/* v2.117: Connection state sharing via dataports */
+static volatile struct connection_state_table *own_state = NULL;   /* Our state (exposed to Net0) */
+static volatile struct connection_state_table *peer_state = NULL;  /* Net0's state (read-only) */
+
+/* v2.117: Self-cleaned connection tracking
+ * ═══════════════════════════════════════════════════════════════════════════
+ * Problem: Close notifications can arrive AFTER we've already cleaned up and
+ * recreated a connection with the same 5-tuple. The notification handler can't
+ * tell if the notification is for:
+ *   - The OLD connection (already cleaned up) → should ignore
+ *   - A NEW connection (actively processing) → should NOT close
+ *
+ * Solution: Track connections that WE cleaned up ourselves. When a close
+ * notification arrives, check if we recently cleaned this 5-tuple. If yes,
+ * it's a stale notification for the OLD connection → ignore it.
+ *
+ * This is robust because:
+ * - Based on actual cleanup events, not timing guesses
+ * - Entries consumed after use (prevent false positives)
+ * - Old entries expire automatically (5 second TTL)
+ * - Circular buffer (no unbounded memory growth)
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
+#define MAX_SELF_CLEANED_TRACKING 32  /* Circular buffer size */
+#define SELF_CLEANED_TTL_MS 5000      /* Expire after 5 seconds */
+
+struct self_cleaned_entry {
+    uint32_t src_ip;      /* SCADA IP */
+    uint16_t src_port;    /* SCADA port */
+    uint16_t dst_port;    /* PLC port (502) */
+    uint32_t timestamp;   /* When we cleaned it */
+    bool valid;           /* Entry is valid */
+};
+
+static struct self_cleaned_entry self_cleaned_connections[MAX_SELF_CLEANED_TRACKING];
+static int self_cleaned_index = 0;  /* Circular buffer index */
 
 /*
  * VLAN-BASED DEPLOYMENT CONFIGURATION
@@ -962,6 +1002,40 @@ static uint16_t tcp_checksum(struct iphdr *ip, struct tcphdr *tcp, uint16_t tcp_
  * - Restore original IPs before transmission
  */
 
+/* v2.117: Update shared connection state dataport */
+static void update_shared_connection_state(void)
+{
+    if (!own_state) return;
+
+    /* Update connection count and timestamp */
+    ((struct connection_state_table *)own_state)->count = connection_count;
+    ((struct connection_state_table *)own_state)->last_update = sys_now();
+
+    /* Copy active connections to shared state */
+    int shared_idx = 0;
+    for (int i = 0; i < MAX_CONNECTIONS && shared_idx < MAX_SHARED_CONNECTIONS; i++) {
+        if (connection_table[i].active) {
+            struct connection_view *view = (struct connection_view *)&own_state->connections[shared_idx];
+            view->src_ip = connection_table[i].original_src_ip;
+            view->dst_ip = connection_table[i].original_dest_ip;
+            view->src_port = connection_table[i].src_port;
+            view->dst_port = connection_table[i].dest_port;
+            view->timestamp = connection_table[i].timestamp;
+            view->active = true;
+            shared_idx++;
+        }
+    }
+
+    /* Clear remaining slots */
+    for (int i = shared_idx; i < MAX_SHARED_CONNECTIONS; i++) {
+        struct connection_view *view = (struct connection_view *)&own_state->connections[i];
+        view->active = false;
+    }
+
+    /* Memory barrier to ensure updates are visible to Net0 */
+    __sync_synchronize();
+}
+
 /* Store metadata for a new connection */
 static struct connection_metadata* connection_add(uint32_t orig_src, uint32_t orig_dest,
                                                    uint16_t sport, uint16_t dport,
@@ -988,6 +1062,9 @@ static struct connection_metadata* connection_add(uint32_t orig_src, uint32_t or
                    (orig_dest >> 24) & 0xFF, (orig_dest >> 16) & 0xFF,
                    (orig_dest >> 8) & 0xFF, orig_dest & 0xFF, dport);
             #endif
+
+            /* v2.117: Update shared connection state */
+            update_shared_connection_state();
 
             return &connection_table[i];
         }
@@ -1042,6 +1119,68 @@ static struct connection_metadata* connection_lookup_by_tuple(uint32_t src_ip, u
     return NULL;
 }
 
+/* v2.117: Self-cleaned connection tracking functions
+ * ═══════════════════════════════════════════════════════════════════════════
+ * These functions manage the tracking of connections that WE cleaned up ourselves,
+ * so we can ignore stale close notifications for those connections.
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
+
+/* Mark a connection as self-cleaned (we cleaned it up, not via close notification) */
+static void mark_connection_self_cleaned(uint32_t src_ip, uint16_t src_port, uint16_t dst_port)
+{
+    self_cleaned_connections[self_cleaned_index].src_ip = src_ip;
+    self_cleaned_connections[self_cleaned_index].src_port = src_port;
+    self_cleaned_connections[self_cleaned_index].dst_port = dst_port;
+    self_cleaned_connections[self_cleaned_index].timestamp = sys_now();
+    self_cleaned_connections[self_cleaned_index].valid = true;
+
+    printf("%s: [TRACK] Marked connection as self-cleaned: SCADA %u.%u.%u.%u:%u → PLC:%u (index=%d)\n",
+           COMPONENT_NAME,
+           (src_ip >> 24) & 0xFF, (src_ip >> 16) & 0xFF,
+           (src_ip >> 8) & 0xFF, src_ip & 0xFF,
+           src_port, dst_port, self_cleaned_index);
+
+    self_cleaned_index = (self_cleaned_index + 1) % MAX_SELF_CLEANED_TRACKING;
+}
+
+/* Check if a connection was recently self-cleaned (returns true if stale notification) */
+static bool was_recently_self_cleaned(uint32_t src_ip, uint16_t src_port, uint16_t dst_port)
+{
+    uint32_t now = sys_now();
+
+    for (int i = 0; i < MAX_SELF_CLEANED_TRACKING; i++) {
+        if (!self_cleaned_connections[i].valid) {
+            continue;
+        }
+
+        /* Expire old entries (> 5 seconds) */
+        if (now - self_cleaned_connections[i].timestamp > SELF_CLEANED_TTL_MS) {
+            self_cleaned_connections[i].valid = false;
+            continue;
+        }
+
+        /* Check if this 5-tuple matches */
+        if (self_cleaned_connections[i].src_ip == src_ip &&
+            self_cleaned_connections[i].src_port == src_port &&
+            self_cleaned_connections[i].dst_port == dst_port) {
+
+            uint32_t age_ms = now - self_cleaned_connections[i].timestamp;
+            printf("%s: [TRACK] Found self-cleaned connection: SCADA %u.%u.%u.%u:%u → PLC:%u (age=%ums, index=%d)\n",
+                   COMPONENT_NAME,
+                   (src_ip >> 24) & 0xFF, (src_ip >> 16) & 0xFF,
+                   (src_ip >> 8) & 0xFF, src_ip & 0xFF,
+                   src_port, dst_port, age_ms, i);
+
+            /* Mark as consumed to prevent duplicate matches */
+            self_cleaned_connections[i].valid = false;
+            return true;
+        }
+    }
+
+    return false;
+}
+
 /* Forward declaration for pool state management (defined later) */
 static void inbound_free_state(struct tcp_inbound_client_state *state);
 
@@ -1065,6 +1204,10 @@ static void connection_remove(struct tcp_pcb *pcb)
             connection_table[i].active = false;
             connection_table[i].pcb = NULL;
             connection_count--;
+
+            /* v2.117: Update shared connection state */
+            update_shared_connection_state();
+
             return;
         }
     }
@@ -1185,6 +1328,9 @@ static void connection_cleanup_stale(void)
                COMPONENT_NAME, cleaned);
         connection_print_stats();
         #endif
+
+        /* v2.117: Update shared connection state after cleanup */
+        update_shared_connection_state();
     }
 }
 
@@ -2324,44 +2470,72 @@ static err_t inbound_tcp_recv_callback(void *arg, struct tcp_pcb *pcb, struct pb
          * - Cleanup happens later in inbound_ready_handle() or timeout
          */
 
-        /* Mark PCB as NULL in connection_table (but keep metadata for debugging) */
+        /* v2.117: CRITICAL FIX - Prevent double-close bug
+         * ═══════════════════════════════════════════════════════════════════════
+         * Problem: Close notification handler might have already called tcp_close()
+         * on this connection. If we call tcp_close() AGAIN, lwIP will crash with
+         * assertion "tcp_output: pcb->next != pcb" because the PCB is already in
+         * closing state.
+         *
+         * Sequence that causes double-close:
+         * 1. Net0 sends close notification (SCADA closed)
+         * 2. Close notification handler calls tcp_close() on PCB
+         * 3. PLC closes its end → recv(p=NULL) fires
+         * 4. We call tcp_close() AGAIN → CRASH!
+         *
+         * Solution: Check metadata first. If metadata->pcb is already NULL,
+         * it means the close notification handler already handled this close.
+         * Only call tcp_close() if we're the first to handle the close.
+         * ═══════════════════════════════════════════════════════════════════════
+         */
+
+        /* Find metadata to check if connection was already closed */
+        struct connection_metadata *meta = NULL;
         for (int i = 0; i < MAX_CONNECTIONS; i++) {
             if (connection_table[i].active && connection_table[i].pcb == pcb) {
-                printf("%s: [WARN]  PLC closed connection - marking PCB as NULL (keeping metadata)\n", COMPONENT_NAME);
-                connection_table[i].pcb = NULL;  /* Mark as closed but keep metadata */
-
-                /* v2.107: Free pool state and NULL the pointer to prevent double-free */
-                BREADCRUMB(2105);  /* PLC close path - freeing pool state */
-                if (connection_table[i].pool_state != NULL) {
-                    printf("%s: [POOL] PLC closed connection - freeing pool slot\n", COMPONENT_NAME);
-                    inbound_free_state(connection_table[i].pool_state);
-                    connection_table[i].pool_state = NULL;  /* Prevent double-free later */
-                }
-                BREADCRUMB(2106);  /* PLC close path - pool state freed */
-
-                /* v2.97: CRITICAL FIX - Memory barrier to prevent crash in Net0!
-                 * ═══════════════════════════════════════════════════════════════════
-                 * Bug: Net1 sets pcb=NULL but Net0 doesn't see the update due to CPU cache
-                 * Result: Net0 accesses stale PCB pointer → crash at address 0x10
-                 *
-                 * Evidence from crash log (2025-10-20):
-                 * - Net1: "PLC closed connection - marking PCB as NULL"
-                 * - Net0: Crashes at 0x10 (accessing freed PCB)
-                 * - No memory barrier between NULL write and Net0's access
-                 *
-                 * Fix: Force cache flush so Net0 sees the NULL immediately
-                 * This prevents Net0 from accessing a freed PCB that lwIP already freed.
-                 *
-                 * Publication pattern: Write → Barrier → Read (Net0)
-                 */
-                __sync_synchronize();
-
+                meta = &connection_table[i];
                 break;
             }
         }
 
-        /* v2.57: Return ERR_ABRT - lwIP handles tcp_abort() internally */
-        return ERR_ABRT;
+        if (meta == NULL) {
+            /* No metadata found - connection was already cleaned up */
+            printf("%s: [WARN]  PLC closed connection but no metadata found\n",
+                   COMPONENT_NAME);
+            printf("%s:          Connection was likely already closed via notification\n",
+                   COMPONENT_NAME);
+            return ERR_OK;
+        }
+
+        /* Mark PCB as NULL in metadata */
+        printf("%s: [WARN]  PLC closed connection - marking PCB as NULL (keeping metadata)\n",
+               COMPONENT_NAME);
+        meta->pcb = NULL;
+
+        /* Memory barrier to ensure metadata update is visible */
+        __sync_synchronize();
+
+        /* Check if PCB is still valid (not NULL) */
+        if (pcb == NULL) {
+            printf("%s: [WARN]  recv(p=NULL) called with NULL pcb - already freed by lwIP\n",
+                   COMPONENT_NAME);
+            return ERR_OK;
+        }
+
+        /* Try to close connection gracefully */
+        err_t close_err = tcp_close(pcb);
+        if (close_err != ERR_OK) {
+            /* tcp_close() failed (e.g. ERR_MEM) - abort immediately */
+            printf("%s: [WARN]  tcp_close() failed (%d) - aborting connection\n",
+                   COMPONENT_NAME, close_err);
+            tcp_abort(pcb);
+            return ERR_ABRT;
+        }
+
+        /* tcp_close() succeeded - lwIP will handle the rest */
+        printf("%s: [INFO]  PLC connection closed gracefully with tcp_close()\n",
+               COMPONENT_NAME);
+        return ERR_OK;
     }
 
     if (err != ERR_OK) {
@@ -2522,12 +2696,38 @@ static void inbound_tcp_err_callback(void *arg, err_t err)
            err == ERR_TIMEOUT ? "ERR_TIMEOUT (Timeout)" : "Unknown");
 
     /* CRITICAL: PCB is already freed by lwIP when err callback is called - don't access it!
-     * Clean up our state only */
+     * v2.116: CRITICAL FIX - Clear metadata's PCB pointer to prevent stale pointer usage
+     * ═══════════════════════════════════════════════════════════════════════════
+     * Bug: When lwIP freed PCB and called this error callback, we only freed the
+     * pool state but never cleared the metadata's PCB pointer. Later, when close
+     * notification arrived, it found metadata with stale PCB and tried to call
+     * tcp_close() on freed memory → NULL pointer crash in tcp_output().
+     *
+     * Fix: Find the metadata that references this state and clear its PCB pointer.
+     */
     if (state != NULL) {
+        /* Find and clear the metadata that references this state */
+        for (int i = 0; i < MAX_CONNECTIONS; i++) {
+            if (connection_table[i].active && connection_table[i].pool_state == state) {
+                printf("%s:   → Clearing metadata PCB pointer (PCB was freed by lwIP)\n",
+                       COMPONENT_NAME);
+                connection_table[i].pcb = NULL;  /* PCB already freed by lwIP */
+                connection_table[i].active = false;
+                if (connection_count > 0) {
+                    connection_count--;
+                }
+
+                /* v2.117: Update shared connection state */
+                update_shared_connection_state();
+
+                break;
+            }
+        }
+
         inbound_free_state(state);  /* v2.106: Free connection pool slot */
     }
 
-    printf("%s: [CLEAN] INBOUND connection error triggered - state cleaned up\n", COMPONENT_NAME);
+    printf("%s: [CLEAN] INBOUND connection error triggered - state and metadata cleaned up\n", COMPONENT_NAME);
 }
 
 static err_t inbound_tcp_connected_callback(void *arg, struct tcp_pcb *pcb, err_t err)
@@ -2866,6 +3066,32 @@ void inbound_ready_handle(void)
                ics_msg->metadata.src_ip & 0xFF,
                ics_msg->metadata.src_port);
 
+        /* v2.117: CRITICAL FIX - Check if this is a stale notification for a self-cleaned connection
+         * ═══════════════════════════════════════════════════════════════════════════
+         * Problem: Close notifications can arrive AFTER we've cleaned up the OLD connection
+         * and created a NEW connection with the same 5-tuple. If we process the stale
+         * notification, we'll close the ACTIVE NEW connection → CRASH!
+         *
+         * Solution: Check if we recently cleaned this 5-tuple ourselves. If yes, the
+         * notification is stale (for the OLD connection we already cleaned up).
+         * Ignore it to avoid closing the NEW connection.
+         *
+         * This is robust because:
+         * - Based on actual cleanup events (not timing guesses)
+         * - Entries are consumed after use (no false positives)
+         * - Old entries auto-expire (5 second TTL)
+         * ═══════════════════════════════════════════════════════════════════════════
+         */
+        if (was_recently_self_cleaned(ics_msg->metadata.src_ip,
+                                       ics_msg->metadata.src_port,
+                                       ics_msg->metadata.dst_port)) {
+            printf("%s:   → IGNORING stale notification - we cleaned this connection ourselves\n",
+                   COMPONENT_NAME);
+            printf("%s:      A NEW connection may exist with same 5-tuple - must NOT close it!\n",
+                   COMPONENT_NAME);
+            return;  /* Ignore stale notification */
+        }
+
         /* Look up PLC connection for this SCADA session */
         struct connection_metadata *meta = connection_lookup_by_tuple(
             ics_msg->metadata.src_ip,
@@ -2880,34 +3106,36 @@ void inbound_ready_handle(void)
             printf("%s:   → Found PLC connection (PCB=%p) - closing gracefully\n",
                    COMPONENT_NAME, (void*)pcb);
 
-            /* v2.98: CRITICAL FIX - Always call tcp_close() regardless of state
+            /* v2.117: CRITICAL FIX - Mark PCB as NULL BEFORE calling tcp_close()
              * ═══════════════════════════════════════════════════════════════════
-             * Previous bug (v2.97): Checked pcb->state and only called tcp_close()
-             * if state == ESTABLISHED. When PCB was already in CLOSE_WAIT (state=2),
-             * code only cleaned metadata but never called any lwIP function.
-             * Result: PCB never freed → zombie connections → memory leak.
+             * Problem: tcp_close() can trigger recv(p=NULL) callback DURING execution.
+             * If meta->pcb is still set when recv callback fires, it will try to call
+             * tcp_close() AGAIN → double-close bug → lwIP assertion crash!
              *
-             * Solution per CRITICAL_LESSON_PCB_ACCESS.md:
-             * - NEVER access pcb->state or any PCB fields directly
-             * - ALWAYS call tcp_close() regardless of state
-             * - Trust lwIP's error return to know what happened:
-             *   - ERR_OK: lwIP accepted the close, will call callbacks when done
-             *   - Error: Can't close (e.g. ERR_MEM), clean up metadata manually
+             * Sequence of double-close bug:
+             * 1. Close notification handler calls tcp_close(pcb)
+             * 2. tcp_close() sends FIN and processes incoming packets
+             * 3. PLC FIN arrives → lwIP calls recv(p=NULL) BEFORE tcp_close() returns
+             * 4. recv callback checks metadata, finds pcb still set
+             * 5. recv callback calls tcp_close() AGAIN → CRASH!
              *
-             * Why this works:
-             * - If PCB in ESTABLISHED → lwIP sends FIN, waits for ACK
-             * - If PCB in CLOSE_WAIT → lwIP completes close (sends FIN-ACK), frees PCB
-             * - If PCB in FIN_WAIT/CLOSING → lwIP handles state transition
-             * - lwIP will call our tcp_recv(NULL) or tcp_err callback when done
+             * Solution: Mark meta->pcb = NULL BEFORE calling tcp_close().
+             * This way, if recv(p=NULL) fires during tcp_close(), it will see
+             * pcb=NULL and skip the second close.
+             * ═══════════════════════════════════════════════════════════════════
              */
 
-            /* DON'T check state! Always call tcp_close() and trust lwIP */
+            /* Mark PCB as NULL to prevent double-close */
+            meta->pcb = NULL;
+            __sync_synchronize();  /* Memory barrier */
+
+            /* v2.98: Always call tcp_close() regardless of state
+             * Trust lwIP's error return to know what happened */
             err_t close_err = tcp_close(pcb);
             if (close_err != ERR_OK) {
                 printf("%s:   [WARN]  tcp_close() failed (%d) - cleaning up metadata manually\n",
                        COMPONENT_NAME, close_err);
-                /* Only if tcp_close() FAILS, clean up manually */
-                meta->pcb = NULL;
+                /* tcp_close() failed - clean up metadata manually */
                 meta->active = false;
                 if (connection_count > 0) {
                     connection_count--;
@@ -3017,6 +3245,20 @@ cleanup_and_create_new:
          * Connection validation failed - clean up and create new
          * ───────────────────────────────────────────────────────────────────── */
         printf("%s:   [CLEAN] Cleaning up old connection (PCB=%p)\n", COMPONENT_NAME, (void*)existing_pcb);
+
+        /* v2.117: Mark this connection as self-cleaned so we ignore close notifications for it
+         * ═══════════════════════════════════════════════════════════════════════════
+         * We're about to clean up this connection ourselves (not via close notification).
+         * If a close notification arrives later for this same 5-tuple, it's a STALE
+         * notification for this OLD connection. We must ignore it to prevent closing
+         * a NEW connection that may have been created with the same 5-tuple.
+         * ═══════════════════════════════════════════════════════════════════════════
+         */
+        mark_connection_self_cleaned(
+            ics_msg->metadata.src_ip,
+            ics_msg->metadata.src_port,
+            ics_msg->metadata.dst_port
+        );
 
         /* v2.107: connection_remove() now handles pool state freeing automatically */
         BREADCRUMB(2107);  /* Cleanup path - clearing callbacks */
@@ -3993,6 +4235,18 @@ void post_init(void)
     memset(connection_table, 0, sizeof(connection_table));
     connection_count = 0;
     printf("%s: [OK] Connection tracking table initialized (%d slots)\n", COMPONENT_NAME, MAX_CONNECTIONS);
+
+    /* v2.117: Initialize connection state sharing dataports */
+    own_state = (volatile struct connection_state_table *)net1_conn_state;
+    peer_state = (volatile struct connection_state_table *)net0_conn_state;
+    if (own_state) {
+        memset((void *)own_state, 0, sizeof(struct connection_state_table));
+        printf("%s: [OK] Own connection state dataport mapped (size=%zu bytes)\n",
+               COMPONENT_NAME, sizeof(struct connection_state_table));
+    }
+    if (peer_state) {
+        printf("%s: [OK] Peer connection state dataport mapped (read-only access to Net0)\n", COMPONENT_NAME);
+    }
 
     /* v2.93: Note about cleaning up stale PLC connections from previous versions
      *

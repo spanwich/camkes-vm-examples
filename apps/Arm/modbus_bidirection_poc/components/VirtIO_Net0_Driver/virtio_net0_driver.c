@@ -46,6 +46,9 @@
 /* ICS common definitions */
 #include "common.h"
 
+/* v2.117: Connection state sharing */
+#include "connection_state.h"
+
 #define COMPONENT_NAME "VirtIO_Net0_Driver"
 #define TCP_SERVER_PORT 502  /* INBOUND: Modbus port - pretends to be PLC */
 
@@ -125,6 +128,10 @@ struct connection_metadata {
 
 static struct connection_metadata connection_table[MAX_CONNECTIONS];
 static int connection_count = 0;
+
+/* v2.117: Connection state sharing via dataports */
+static volatile struct connection_state_table *own_state = NULL;   /* Our state (exposed to Net1) */
+static volatile struct connection_state_table *peer_state = NULL;  /* Net1's state (read-only) */
 
 /*
  * VLAN-BASED DEPLOYMENT CONFIGURATION
@@ -942,6 +949,40 @@ static uint16_t tcp_checksum(struct iphdr *ip, struct tcphdr *tcp, uint16_t tcp_
  * - Restore original IPs before transmission
  */
 
+/* v2.117: Update shared connection state dataport */
+static void update_shared_connection_state(void)
+{
+    if (!own_state) return;
+
+    /* Update connection count and timestamp */
+    ((struct connection_state_table *)own_state)->count = connection_count;
+    ((struct connection_state_table *)own_state)->last_update = sys_now();
+
+    /* Copy active connections to shared state */
+    int shared_idx = 0;
+    for (int i = 0; i < MAX_CONNECTIONS && shared_idx < MAX_SHARED_CONNECTIONS; i++) {
+        if (connection_table[i].active) {
+            struct connection_view *view = (struct connection_view *)&own_state->connections[shared_idx];
+            view->src_ip = connection_table[i].original_src_ip;
+            view->dst_ip = connection_table[i].original_dest_ip;
+            view->src_port = connection_table[i].src_port;
+            view->dst_port = connection_table[i].dest_port;
+            view->timestamp = connection_table[i].timestamp;
+            view->active = true;
+            shared_idx++;
+        }
+    }
+
+    /* Clear remaining slots */
+    for (int i = shared_idx; i < MAX_SHARED_CONNECTIONS; i++) {
+        struct connection_view *view = (struct connection_view *)&own_state->connections[i];
+        view->active = false;
+    }
+
+    /* Memory barrier to ensure updates are visible to Net1 */
+    __sync_synchronize();
+}
+
 /* Store metadata for a new connection */
 static struct connection_metadata* connection_add(uint32_t orig_src, uint32_t orig_dest,
                                                    uint16_t sport, uint16_t dport)
@@ -970,6 +1011,9 @@ static struct connection_metadata* connection_add(uint32_t orig_src, uint32_t or
                    (orig_dest >> 24) & 0xFF, (orig_dest >> 16) & 0xFF,
                    (orig_dest >> 8) & 0xFF, orig_dest & 0xFF, dport);
             #endif
+
+            /* v2.117: Update shared connection state */
+            update_shared_connection_state();
 
             return &connection_table[i];
         }
@@ -1050,6 +1094,10 @@ static void connection_remove(struct tcp_pcb *pcb)
             connection_table[i].has_pending_outbound = false;
             connection_table[i].pending_outbound_len = 0;
             connection_count--;
+
+            /* v2.117: Update shared connection state */
+            update_shared_connection_state();
+
             return;
         }
     }
@@ -3381,6 +3429,18 @@ void post_init(void)
     memset(connection_table, 0, sizeof(connection_table));
     connection_count = 0;
     printf("%s: [OK] Connection tracking table initialized (%d slots)\n", COMPONENT_NAME, MAX_CONNECTIONS);
+
+    /* v2.117: Initialize connection state sharing dataports */
+    own_state = (volatile struct connection_state_table *)net0_conn_state;
+    peer_state = (volatile struct connection_state_table *)net1_conn_state;
+    if (own_state) {
+        memset((void *)own_state, 0, sizeof(struct connection_state_table));
+        printf("%s: [OK] Own connection state dataport mapped (size=%zu bytes)\n",
+               COMPONENT_NAME, sizeof(struct connection_state_table));
+    }
+    if (peer_state) {
+        printf("%s: [OK] Peer connection state dataport mapped (read-only access to Net1)\n", COMPONENT_NAME);
+    }
 
     /* Initialize VirtIO device */
     if (virtio_net_init() != 0) {

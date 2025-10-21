@@ -76,6 +76,11 @@ import <global-connectors.camkes>;
 /* ICS Message buffer size */
 #define ICS_BUFFER_SIZE 65536
 
+/* v2.117: Connection state sharing buffer size
+ * sizeof(struct connection_state_table) = 256 × 20 bytes + 8 bytes = 5128 bytes
+ * Round up to page size (4KB aligned) = 8KB for safety */
+#define CONNECTION_STATE_SIZE 8192
+
 /* ═══════════════════════════════════════════════════════════════════════ */
 /* HARDWARE COMPONENTS - Dual VirtIO-Net Devices                            */
 /* ═══════════════════════════════════════════════════════════════════════ */
@@ -111,6 +116,10 @@ component VirtIO_Net0_Driver {
     /* OUTBOUND path: ICS_Outbound → External */
     dataport Buf(ICS_BUFFER_SIZE) outbound_dp;
     consumes Notification outbound_ready;
+
+    /* v2.117: Connection state sharing - read-only access to Net1's state */
+    dataport Buf(CONNECTION_STATE_SIZE) net0_conn_state;  /* Expose own state */
+    dataport Buf(CONNECTION_STATE_SIZE) net1_conn_state;  /* Read Net1's state */
 }
 
 /* VirtIO_Net1_Driver - Internal network (port 7000, bidirectional) */
@@ -128,6 +137,10 @@ component VirtIO_Net1_Driver {
     /* OUTBOUND path: Internal → ICS_Outbound */
     dataport Buf(ICS_BUFFER_SIZE) outbound_dp;
     emits Notification outbound_ready;
+
+    /* v2.117: Connection state sharing - read-only access to Net0's state */
+    dataport Buf(CONNECTION_STATE_SIZE) net1_conn_state;  /* Expose own state */
+    dataport Buf(CONNECTION_STATE_SIZE) net0_conn_state;  /* Read Net0's state */
 }
 
 /* ═══════════════════════════════════════════════════════════════════════ */
@@ -236,6 +249,19 @@ assembly {
         connection seL4Notification outbound_to_net0_ntfy(
             from ics_outbound.out_ntfy,
             to net0_drv.outbound_ready
+        );
+
+        /* ═══ v2.117: Connection State Sharing - Net0 ↔ Net1 ═══ */
+        /* Net0 reads Net1's connection state (read-only) */
+        connection seL4SharedData net0_reads_net1_state(
+            from net0_drv.net1_conn_state,
+            to net1_drv.net1_conn_state
+        );
+
+        /* Net1 reads Net0's connection state (read-only) */
+        connection seL4SharedData net1_reads_net0_state(
+            from net1_drv.net0_conn_state,
+            to net0_drv.net0_conn_state
         );
     }
 

@@ -1923,19 +1923,39 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
          * ═══════════════════════════════════════════════════════════════════════
          */
 
-        /* v2.115: STEP 1 - Save PCB data FIRST (before any close/abort operations)
-         * CRITICAL: PCB becomes invalid after tcp_close()/tcp_abort()!
-         * Must save all needed data to local variables BEFORE closing.
+        /* v2.115: STEP 1 - Find metadata FIRST (contains all connection info)
+         * CRITICAL: NEVER access PCB fields directly! (See CRITICAL_LESSON_PCB_ACCESS.md)
+         * - Accessing PCB fields can crash if lwIP frees PCB during access
+         * - Metadata already has all connection info (stored during accept)
+         * - Use metadata instead of PCB fields for safety
          */
-        uint32_t remote_ip = ntohl(ip4_addr_get_u32(&pcb->remote_ip));
-        uint16_t remote_port = pcb->remote_port;
-        uint16_t local_port = pcb->local_port;
+        struct connection_metadata *meta = NULL;
+        for (int i = 0; i < MAX_CONNECTIONS; i++) {
+            if (connection_table[i].active && connection_table[i].pcb == pcb) {
+                meta = &connection_table[i];
+                break;
+            }
+        }
+
+        /* If no metadata found, can't send close notification (should not happen) */
+        if (meta == NULL) {
+            printf("%s: [WARN]  Connection closed but no metadata found (PCB=%p)\n",
+                   COMPONENT_NAME, (void*)pcb);
+            /* Still need to close the PCB properly */
+            err_t close_err = tcp_close(pcb);
+            if (close_err != ERR_OK) {
+                tcp_abort(pcb);
+                return ERR_ABRT;
+            }
+            return ERR_OK;
+        }
 
         #if DEBUG_TRAFFIC
         printf("%s: [INIT] TCP connection closed by SCADA\n", COMPONENT_NAME);
         printf("%s:    Remote: %u.%u.%u.%u:%u\n", COMPONENT_NAME,
-               (remote_ip >> 24) & 0xFF, (remote_ip >> 16) & 0xFF,
-               (remote_ip >> 8) & 0xFF, remote_ip & 0xFF, remote_port);
+               (meta->original_src_ip >> 24) & 0xFF, (meta->original_src_ip >> 16) & 0xFF,
+               (meta->original_src_ip >> 8) & 0xFF, meta->original_src_ip & 0xFF,
+               meta->src_port);
         #endif
 
         /* v2.75: Only decrement if counter is positive (prevent underflow)
@@ -1973,16 +1993,9 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
          * This allows us to detect closed connections without losing metadata.
          */
 
-        /* v2.115: STEP 2 - Find and mark PCB as NULL (but keep metadata!) */
-        struct connection_metadata *meta = NULL;
-        for (int i = 0; i < MAX_CONNECTIONS; i++) {
-            if (connection_table[i].active && connection_table[i].pcb == pcb) {
-                printf("%s: [WARN]  SCADA closed connection - marking PCB as NULL (keeping metadata for pending response)\n", COMPONENT_NAME);
-                connection_table[i].pcb = NULL;  /* Mark as closed but keep metadata */
-                meta = &connection_table[i];
-                break;
-            }
-        }
+        /* v2.115: STEP 2 - Mark PCB as NULL (but keep metadata!) */
+        printf("%s: [WARN]  SCADA closed connection - marking PCB as NULL (keeping metadata for pending response)\n", COMPONENT_NAME);
+        meta->pcb = NULL;  /* Mark as closed but keep metadata */
 
         /* v2.93: Send close notification to Net1 so it can close PLC connection
          *
@@ -1996,8 +2009,8 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
          * This prevents PLC connection accumulation while avoiding double-free bugs.
          */
 
-        /* v2.115: STEP 3 - Send notification using SAVED PCB data (not pcb->xxx!) */
-        if (meta != NULL && inbound_dp != NULL) {
+        /* v2.115: STEP 3 - Send notification using METADATA (not PCB fields!) */
+        if (inbound_dp != NULL) {
             ICS_Message *ics_msg = (ICS_Message *)inbound_dp;
 
             /* Prepare close notification message */
@@ -2007,11 +2020,11 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
             ics_msg->metadata.is_ip = 1;
             ics_msg->metadata.is_tcp = 1;
 
-            /* Copy connection 5-tuple using SAVED data (pcb may become invalid!) */
-            ics_msg->metadata.src_ip = remote_ip;              /* From saved variable */
-            ics_msg->metadata.dst_ip = meta->original_dest_ip; /* Original PLC IP */
-            ics_msg->metadata.src_port = remote_port;          /* From saved variable */
-            ics_msg->metadata.dst_port = local_port;           /* From saved variable */
+            /* Copy connection 5-tuple FROM METADATA (never access PCB fields!) */
+            ics_msg->metadata.src_ip = meta->original_src_ip;   /* SCADA IP */
+            ics_msg->metadata.dst_ip = meta->original_dest_ip;  /* PLC IP */
+            ics_msg->metadata.src_port = meta->src_port;        /* SCADA port */
+            ics_msg->metadata.dst_port = meta->dest_port;       /* PLC port (502) */
 
             /* ZERO-length payload = close signal */
             ics_msg->payload_length = 0;
@@ -2019,11 +2032,11 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
 
             printf("%s: [TX] Sending close notification to Net1 (SCADA %u.%u.%u.%u:%u closed)\n",
                    COMPONENT_NAME,
-                   (remote_ip >> 24) & 0xFF,
-                   (remote_ip >> 16) & 0xFF,
-                   (remote_ip >> 8) & 0xFF,
-                   remote_ip & 0xFF,
-                   remote_port);
+                   (meta->original_src_ip >> 24) & 0xFF,
+                   (meta->original_src_ip >> 16) & 0xFF,
+                   (meta->original_src_ip >> 8) & 0xFF,
+                   meta->original_src_ip & 0xFF,
+                   meta->src_port);
 
             /* Force cache flush before notification */
             __sync_synchronize();

@@ -1211,6 +1211,8 @@ static err_t custom_input_promiscuous(struct pbuf *p, struct netif *inp)
 
     /* Check Ethernet header */
     if (p->len < sizeof(struct eth_hdr)) {
+        printf("%s: [WARN] Packet too small for ethernet header: p->len=%u, pbuf=%p, p->ref=%d\n",
+               COMPONENT_NAME, p->len, (void*)p, p->ref);
         return ERR_ARG;
     }
 
@@ -1318,6 +1320,9 @@ static err_t custom_input_promiscuous(struct pbuf *p, struct netif *inp)
     }
 
     /* Unknown protocol - drop */
+    printf("%s: [WARN] Unknown ethernet protocol: ethertype=0x%04x, pbuf=%p, p->ref=%d, p->len=%u\n",
+           COMPONENT_NAME, type, (void*)p, p->ref, p->len);
+    BREADCRUMB(9004);  /* pbuf_free at line 1321 (unknown protocol) */
     pbuf_free(p);
     return ERR_OK;
 }
@@ -1788,6 +1793,7 @@ static void process_rx_packets(void)
             }
 
             if (lwip_result != ERR_OK) {
+                BREADCRUMB(9005);  /* pbuf_free at line 1791 (process_rx_packets lwip error) */
                 pbuf_free(p);
             }
         } else {
@@ -2124,6 +2130,7 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
     }
 
     if (err != ERR_OK) {
+        BREADCRUMB(9001);  /* pbuf_free at line 2127 (error path) */
         pbuf_free(p);
         return err;
     }
@@ -2157,6 +2164,7 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
     if (inbound_dp == NULL) {
         printf("%s: [ERR] FATAL: inbound_dp is NULL! CAmkES dataport not mapped\n", COMPONENT_NAME);
         printf("%s:    This indicates seL4 capability/memory allocation failure\n", COMPONENT_NAME);
+        BREADCRUMB(9002);  /* pbuf_free at line 2160 (dataport NULL) */
         pbuf_free(p);
         return ERR_MEM;
     }
@@ -2303,6 +2311,7 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
         }
     }
 
+    BREADCRUMB(9003);  /* pbuf_free at line 2306 (normal path end of tcp_echo_recv) */
     pbuf_free(p);
     return ERR_OK;
 }
@@ -2922,12 +2931,25 @@ void outbound_ready_handle(void)
                (ics_msg->metadata.dst_ip >> 8) & 0xFF, ics_msg->metadata.dst_ip & 0xFF,
                ics_msg->metadata.dst_port);
         printf("%s:    Response from PLC arrived too late (connection closed by SCADA)\n", COMPONENT_NAME);
-        /* Clean up stale metadata */
+
+        /* v2.120: CRITICAL FIX - DO NOT mark active=false here!
+         * ═══════════════════════════════════════════════════════════════════════════
+         * Bug: Marking active=false makes metadata invisible to subsequent lookups
+         * Result: "No metadata for port 502->XXXX" errors for future responses
+         *
+         * Fix: Clear awaiting_response to allow cleanup, but keep metadata visible
+         * Cleanup will happen in next connection_cleanup_stale() cycle
+         * ═══════════════════════════════════════════════════════════════════════════
+         */
         meta->awaiting_response = false;
-        meta->active = false;
-        if (connection_count > 0) {
-            connection_count--;
-        }
+
+        /* REMOVED (v2.120):
+         * meta->active = false;
+         * if (connection_count > 0) {
+         *     connection_count--;
+         * }
+         */
+
         return;
     }
 
@@ -2948,15 +2970,20 @@ void outbound_ready_handle(void)
     /* VALIDATION LAYER 1: NULL PCB Check (MUST BE FIRST!)
      * Net1 may have freed the PCB - check pointer validity before ANY dereference */
     if (meta->pcb == NULL) {
-        /* PCB already freed by Net1 - remove stale metadata */
+        /* PCB already freed by Net1 - drop response but keep metadata visible */
         printf("%s: [WARN]  OUTBOUND: PCB is NULL - dropping response for %u.%u.%u.%u:%u\n",
                COMPONENT_NAME,
                (ics_msg->metadata.dst_ip >> 24) & 0xFF, (ics_msg->metadata.dst_ip >> 16) & 0xFF,
                (ics_msg->metadata.dst_ip >> 8) & 0xFF, ics_msg->metadata.dst_ip & 0xFF,
                ics_msg->metadata.dst_port);
-        BREADCRUMB(3014);  /* Stale PCB detected - removing metadata */
-        meta->active = false;
-        return;  /* Silent drop after cleanup */
+        BREADCRUMB(3014);  /* Stale PCB detected */
+
+        /* v2.120: DO NOT mark active=false here! (same fix as line 2936)
+         * Let connection_cleanup_stale() handle metadata removal */
+
+        /* REMOVED (v2.120): meta->active = false; */
+
+        return;  /* Silent drop, metadata stays visible */
     }
 
     /* v2.85: REMOVED VALIDATION LAYER 2 - accessing pcb->state causes crashes!
@@ -3503,7 +3530,7 @@ static int virtio_net_init(void)
 void post_init(void)
 {
     printf("%s: Component started\n", COMPONENT_NAME);
-    printf("%s: NET0 v2.114-lwip-assert-non-fatal (2025-10-21) - lwIP assertions don't abort\n", COMPONENT_NAME);
+    printf("%s: NET0 v2.119-complete-fix (2025-10-22) - lwIP tcp_abandon + tcp_output fixes\n", COMPONENT_NAME);
     printf("%s: [FIX] MODE: PRODUCTION with fast cleanup (every 100 iterations)\n", COMPONENT_NAME);
     printf("%s: [OK] FIX 1: awaiting_response flag prevents premature metadata cleanup!\n", COMPONENT_NAME);
     printf("%s: [OK] FIX 2: Send close notification to Net1 when SCADA closes\n", COMPONENT_NAME);
@@ -3693,12 +3720,18 @@ int run(void)
         if (outbound_ready_poll()) {
             /* CRITICAL: Ensure we see latest dataport writes from ICS_Outbound */
             __sync_synchronize();
+            BREADCRUMB(8000);  /* Before outbound_ready_handle */
             outbound_ready_handle();
+            BREADCRUMB(8001);  /* After outbound_ready_handle */
         }
 
         /* Process lwIP timers and RX packets */
+        BREADCRUMB(8002);  /* Before sys_check_timeouts */
         sys_check_timeouts();
+        BREADCRUMB(8003);  /* After sys_check_timeouts */
+        BREADCRUMB(8004);  /* Before process_rx_packets */
         process_rx_packets();
+        BREADCRUMB(8005);  /* After process_rx_packets */
 
         /* Refill RX buffers OUTSIDE IRQ context to avoid IRQ storm
          * This happens in main loop after processing completes */

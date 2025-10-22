@@ -1844,19 +1844,29 @@ static void tcp_echo_err(void *arg, err_t err)
         default:           err_name = "UNKNOWN"; break;
     }
 
-    /* v2.75: Only decrement if counter is positive (prevent underflow)
-     * lwIP may call both err callback and recv(p=NULL) for the same connection */
-    if (active_connections > 0) {
-        active_connections--;
-        total_connections_closed++;
-    } else {
-        printf("%s: [WARN]  BUG: active_connections already 0, not decrementing (double-free prevented)\n",
-               COMPONENT_NAME);
-    }
+    /* v2.121: CRITICAL FIX - Do NOT decrement counter in error callback!
+     * ═══════════════════════════════════════════════════════════════════
+     * Problem: Error callback decrements counter, then periodic cleanup
+     * decrements it AGAIN → double-decrement → counter underflow!
+     *
+     * Root Cause:
+     * - Error callback has NO metadata access (arg=NULL at line 2395)
+     * - Can't mark metadata->pcb = NULL or metadata->active = false
+     * - Only decrements global counter (incomplete cleanup)
+     * - Then periodic cleanup runs and decrements counter AGAIN!
+     *
+     * Fix: Remove counter decrement from error callback
+     * Let periodic cleanup handle BOTH metadata AND counter in one place
+     *
+     * Result:
+     * - Error callback only logs the error
+     * - Periodic cleanup does complete cleanup atomically
+     * - No double-decrement, accurate connection counting
+     * ═══════════════════════════════════════════════════════════════════
+     */
 
     printf("%s: [WARN]  TCP connection error - err=%d (%s)\n", COMPONENT_NAME, err, err_name);
-    printf("%s:    → Active connections: %u | Total created: %u | Total closed: %u\n",
-           COMPONENT_NAME, active_connections, total_connections_created, total_connections_closed);
+    printf("%s:    → Connection will be cleaned up by periodic cleanup\n", COMPONENT_NAME);
 
     /* v2.83: CRITICAL FIX - Do NOT call connection_cleanup_stale() from error callback!
      *

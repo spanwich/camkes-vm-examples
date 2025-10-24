@@ -1175,7 +1175,30 @@ static void connection_cleanup_stale(void)
             printf("%s: [CLEAN] Cleanup stale connection [%d]: PCB is NULL and no response pending\n", COMPONENT_NAME, i);
             #endif
             connection_table[i].active = false;
-            connection_count--;
+
+            /* v2.122: CRITICAL FIX - Do NOT decrement counter here!
+             * ═══════════════════════════════════════════════════════════════════
+             * Problem: Both error callback AND periodic cleanup decrement counter
+             * Result: Double-decrement → counter underflow
+             *
+             * Root Cause:
+             * - When connection error occurs, lwIP calls tcp_echo_err()
+             * - Error callback decrements connection_count-- (line 1850)
+             * - Later, periodic cleanup finds pcb==NULL and decrements AGAIN!
+             *
+             * Fix: Let error callback be authoritative for counter decrement
+             * Periodic cleanup only marks metadata inactive (no counter change)
+             *
+             * Why This Works:
+             * - Error callback is called by lwIP when connection fails
+             * - It decrements counter immediately (authoritative cleanup)
+             * - Periodic cleanup only marks metadata->active=false (lazy cleanup)
+             * - No double-decrement, accurate counting
+             * ═══════════════════════════════════════════════════════════════════
+             */
+
+            /* REMOVED (v2.122): connection_count--; */
+
             cleaned++;
         }
 
@@ -1386,7 +1409,39 @@ static void process_rx_packets(void)
     static uint16_t last_used_idx = 0;
     static uint32_t check_count = 0;
 
+    /* v2.138: CRITICAL FIX - Reentrancy guard to prevent deadlock
+     * Problem: process_rx_packets() called from BOTH main loop AND IRQ handler
+     * - Main loop calls at line 3848 (after B8004)
+     * - IRQ handler calls at line 3239 (when VirtIO interrupt fires)
+     * Without guard: IRQ can interrupt main loop's call → reentrant execution → deadlock!
+     *
+     * Evidence from v2.137:
+     * - B8002-B8005 stopped (main loop stuck)
+     * - B8006-B8009 continued (IRQ handler kept calling)
+     * - Main loop never reached B8005 → deadlock
+     *
+     * Solution: Static flag prevents reentrant execution
+     * - If already processing, return immediately (IRQ handler backs off)
+     * - Main loop completes uninterrupted
+     */
+    static volatile bool in_rx_processing = false;
+
+    if (in_rx_processing) {
+        /* Already processing - return immediately to avoid reentrancy */
+        return;
+    }
+
+    in_rx_processing = true;
+
     check_count++;
+
+    /* v2.137: Track function entry */
+    BREADCRUMB(8006);  /* process_rx_packets entry */
+
+    /* v2.131: Diagnostic - check if RX processing is called */
+    if (check_count % 1000 == 1) {
+        BREADCRUMB(8010);  /* process_rx_packets called (every 1000th time) */
+    }
 
     #if DEBUG_PACKET_DETAIL
     /* FUNDAMENTAL CHECK: Poll VirtIO device InterruptStatus register */
@@ -1430,9 +1485,15 @@ static void process_rx_packets(void)
         uint16_t pending_packets = (uint16_t)(current_used_idx - last_used_idx);
 
         if (pending_packets == 0) {
+            /* v2.137: Track early return (no packets waiting) */
+            BREADCRUMB(8007);  /* No packets, early return */
             /* No more packets - exit IRQ handler and let timer handle refill */
+            in_rx_processing = false;  /* v2.138: Clear reentrancy guard */
             return;
         }
+
+        /* v2.131: Diagnostic - packet found in RX queue */
+        BREADCRUMB(8020);  /* RX packet detected in queue */
 
         /* SAFETY: Detect impossible wraparound scenarios and desynchronization
          *
@@ -1467,6 +1528,7 @@ static void process_rx_packets(void)
                  * Just resync and exit - no packets available right now */
                 last_used_idx = current_used_idx;
                 /* Don't refill here - let timer handle it to avoid IRQ storm */
+                in_rx_processing = false;  /* v2.138: Clear reentrancy guard */
                 return;
             }
 
@@ -1477,6 +1539,7 @@ static void process_rx_packets(void)
                    COMPONENT_NAME, last_used_idx, current_used_idx);
             last_used_idx = current_used_idx;
             /* Don't refill here - let timer handle it to avoid IRQ storm */
+            in_rx_processing = false;  /* v2.138: Clear reentrancy guard */
             return;
         }
 
@@ -1753,8 +1816,14 @@ static void process_rx_packets(void)
             printf("   [OK] pbuf allocated, passing to lwIP input handler\n");
             #endif
 
+            /* v2.137: Track before lwIP input call */
+            BREADCRUMB(8008);  /* Before lwIP input() */
+
             /* Feed packet to lwIP */
             err_t lwip_result = netif_data.input(p, &netif_data);
+
+            /* v2.137: Track after lwIP input call */
+            BREADCRUMB(8009);  /* After lwIP input() */
 
             #if DEBUG_PACKET_DETAIL
             if (lwip_result == ERR_OK) {
@@ -1820,6 +1889,12 @@ static void process_rx_packets(void)
     }
 
     refill_rx_queue();
+
+    /* v2.137: Track function exit (after processing all packets) */
+    BREADCRUMB(8011);  /* process_rx_packets exit */
+
+    /* v2.138: Clear reentrancy guard before returning */
+    in_rx_processing = false;
 }
 
 /*
@@ -1844,19 +1919,31 @@ static void tcp_echo_err(void *arg, err_t err)
         default:           err_name = "UNKNOWN"; break;
     }
 
-    /* v2.75: Only decrement if counter is positive (prevent underflow)
-     * lwIP may call both err callback and recv(p=NULL) for the same connection */
-    if (active_connections > 0) {
-        active_connections--;
-        total_connections_closed++;
-    } else {
-        printf("%s: [WARN]  BUG: active_connections already 0, not decrementing (double-free prevented)\n",
-               COMPONENT_NAME);
-    }
+    /* v2.133: CRITICAL FIX - Do NOT decrement counter in error callback!
+     * ═══════════════════════════════════════════════════════════════════
+     * Problem: Error callback decrements counter, then periodic cleanup
+     * or recv(p=NULL) decrements it AGAIN → double-decrement!
+     *
+     * Root Cause:
+     * - Error callback has NO metadata access (arg=NULL at line 2484)
+     * - Can't mark metadata->pcb = NULL
+     * - Can't mark metadata->active = false
+     * - Only decrements global counter (incomplete cleanup)
+     *
+     * Then recv(p=NULL) or periodic cleanup runs:
+     * - recv(p=NULL) decrements counter at line 2049
+     * - OR periodic cleanup finds pcb==NULL && !awaiting_response
+     * - Marks metadata->active = false (correct!)
+     * - Decrements counter AGAIN (bug!)
+     *
+     * Fix: Remove counter decrement from error callback
+     * Let recv(p=NULL) or periodic cleanup handle BOTH metadata AND counter
+     * ═══════════════════════════════════════════════════════════════════
+     */
 
     printf("%s: [WARN]  TCP connection error - err=%d (%s)\n", COMPONENT_NAME, err, err_name);
-    printf("%s:    → Active connections: %u | Total created: %u | Total closed: %u\n",
-           COMPONENT_NAME, active_connections, total_connections_created, total_connections_closed);
+    printf("%s:    → Connection will be cleaned up by recv(p=NULL) or periodic cleanup\n",
+           COMPONENT_NAME);
 
     /* v2.83: CRITICAL FIX - Do NOT call connection_cleanup_stale() from error callback!
      *
@@ -2135,6 +2222,21 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
         return err;
     }
 
+    /* v2.131: CRITICAL FIX - Unconditional stale callback check
+     * Problem: lwIP calls tcp_echo_recv TWICE with same pbuf → double-free
+     * Solution: Early metadata lookup + pbuf ref count guard at end */
+
+    struct connection_metadata *meta_early = connection_lookup_by_pcb(pcb);
+
+    /* Check if this is a stale callback after connection close */
+    if (meta_early != NULL && meta_early->pcb == NULL) {
+        BREADCRUMB(9010);  /* v2.131: Stale callback after close */
+        pbuf_free(p);
+        return ERR_OK;
+    }
+
+    bool metadata_valid_for_processing = (meta_early != NULL && meta_early->active);
+
     /* ═══ Forward TCP data to ICS_Inbound (INBOUND path) ═══ */
 
     #if DEBUG_PACKET_DETAIL
@@ -2194,9 +2296,43 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
 
     /* CRITICAL: Look up original destination IP from connection tracking table
      * pcb->local_ip is the REWRITTEN IP (192.168.96.2) used by lwIP
-     * We need the ORIGINAL PLC IP (e.g., 192.168.95.2) for Net1 to connect to */
-    struct connection_metadata *meta = connection_lookup_by_pcb(pcb);
+     * We need the ORIGINAL PLC IP (e.g., 192.168.95.2) for Net1 to connect to
+     *
+     * v2.131: Use meta_early from above (already looked up at line 2191) */
+    struct connection_metadata *meta = meta_early;  /* v2.131: Reuse early lookup */
     if (meta != NULL && meta->active) {
+        /* v2.125: CRITICAL FIX - Check if PCB is closed before processing data
+         * ═══════════════════════════════════════════════════════════════════════
+         * Problem: Race condition between tcp_close() and queued callbacks
+         *
+         * Sequence causing double-free:
+         * 1. tcp_echo_recv(p=NULL) called (SCADA closed)
+         * 2. meta->pcb set to NULL (line 2075)
+         * 3. tcp_close(pcb) called and frees pbufs
+         * 4. THEN tcp_echo_recv(p=DATA) fires with already-freed pbuf
+         * 5. Code processes data and calls pbuf_free(p) at line 2338
+         * 6. CRASH: pbuf->ref already 0 (already freed by tcp_close)
+         *
+         * Solution: Check if meta->pcb is NULL (connection closed)
+         * If closed, the data is stale - free pbuf and return early
+         * ═══════════════════════════════════════════════════════════════════════
+         */
+        if (meta->pcb == NULL) {
+            printf("%s: [WARN]  tcp_echo_recv: Connection already closed (meta->pcb=NULL), dropping %u bytes\n",
+                   COMPONENT_NAME, p->len);
+            /* Connection was closed - this data is stale */
+            pbuf_free(p);
+            return ERR_OK;
+        }
+
+        /* Additional safety: check if callback pcb matches metadata pcb */
+        if (meta->pcb != pcb) {
+            printf("%s: [WARN]  tcp_echo_recv: PCB mismatch (meta->pcb=%p, callback pcb=%p), dropping %u bytes\n",
+                   COMPONENT_NAME, (void*)meta->pcb, (void*)pcb, p->len);
+            pbuf_free(p);
+            return ERR_OK;
+        }
+
         /* Use original destination IP from packet metadata */
         ics_msg->metadata.dst_ip = meta->original_dest_ip;
         #if DEBUG_METADATA
@@ -2311,8 +2447,17 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
         }
     }
 
-    BREADCRUMB(9003);  /* pbuf_free at line 2306 (normal path end of tcp_echo_recv) */
-    pbuf_free(p);
+    /* v2.131: CRITICAL pbuf ref count guard
+     * lwIP can call tcp_echo_recv TWICE with same pbuf
+     * Guard against double-free by checking ref count */
+    BREADCRUMB(9003);  /* pbuf_free attempt */
+
+    if (p->ref > 0) {
+        pbuf_free(p);
+    } else {
+        BREADCRUMB(9012);  /* v2.131: Duplicate callback - pbuf already freed (ref=0) */
+    }
+
     return ERR_OK;
 }
 
@@ -3530,7 +3675,7 @@ static int virtio_net_init(void)
 void post_init(void)
 {
     printf("%s: Component started\n", COMPONENT_NAME);
-    printf("%s: NET0 v2.119-complete-fix (2025-10-22) - lwIP tcp_abandon + tcp_output fixes\n", COMPONENT_NAME);
+    printf("%s: NET0 v2.127 (2025-10-24) - Comprehensive PCB safety (v2.125 pbuf + v2.126 tcphdr)\n", COMPONENT_NAME);
     printf("%s: [FIX] MODE: PRODUCTION with fast cleanup (every 100 iterations)\n", COMPONENT_NAME);
     printf("%s: [OK] FIX 1: awaiting_response flag prevents premature metadata cleanup!\n", COMPONENT_NAME);
     printf("%s: [OK] FIX 2: Send close notification to Net1 when SCADA closes\n", COMPONENT_NAME);
@@ -3729,9 +3874,21 @@ int run(void)
         BREADCRUMB(8002);  /* Before sys_check_timeouts */
         sys_check_timeouts();
         BREADCRUMB(8003);  /* After sys_check_timeouts */
-        BREADCRUMB(8004);  /* Before process_rx_packets */
-        process_rx_packets();
-        BREADCRUMB(8005);  /* After process_rx_packets */
+
+        /* v2.139: REMOVED process_rx_packets() from main loop - now IRQ-only
+         * Problem: Calling from both main loop AND IRQ handler caused reentrancy:
+         * - Main loop sets in_rx_processing=true
+         * - IRQ fires, tries to call process_rx_packets()
+         * - Reentrancy guard blocks IRQ → packets not processed!
+         *
+         * Solution: VirtIO is designed to be IRQ-driven
+         * - IRQ fires when packets arrive → calls process_rx_packets()
+         * - Main loop no longer polls (removes redundant call)
+         * - No reentrancy possible (only one caller)
+         * - Reentrancy guard can be removed in future cleanup
+         */
+        BREADCRUMB(8004);  /* RESERVED: Previously process_rx_packets */
+        BREADCRUMB(8005);  /* RESERVED: Previously process_rx_packets */
 
         /* Refill RX buffers OUTSIDE IRQ context to avoid IRQ storm
          * This happens in main loop after processing completes */

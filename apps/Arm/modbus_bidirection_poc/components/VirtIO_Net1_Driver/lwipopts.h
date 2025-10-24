@@ -82,20 +82,42 @@
 /* Lightweight protection */
 #define SYS_LIGHTWEIGHT_PROT            0
 
-/* v2.115: LWIP_PLATFORM_ASSERT override removed
+/* v2.134: LWIP_PLATFORM_ASSERT override for seL4 microkernel
  * ═══════════════════════════════════════════════════════════════════════════
- * Previous versions (v2.114) overrode LWIP_PLATFORM_ASSERT to prevent abort()
- * because Net0 had a bug that caused assertions to fire during connection close.
+ * Problem: abort() doesn't work in seL4 microkernel!
+ * - abort() calls raise(SIGABRT) which requires POSIX signals
+ * - seL4 doesn't support POSIX signals in userspace
+ * - abort() returns instead of halting → execution continues with corrupt state
+ * - System continues until hitting cascading failures (heap corruption, etc)
  *
- * Root cause was fixed in Net0 v2.115:
- * - Net0 was returning ERR_ABRT WITHOUT calling tcp_abort()
- * - This violated lwIP protocol and left PCB in inconsistent state
- * - Now Net0 properly calls tcp_close(), falls back to tcp_abort() if needed
- * - Assertions should NEVER fire with correct lwIP protocol
+ * Solution: Use seL4_DebugHalt() instead of abort()
+ * - seL4_DebugHalt() is the microkernel-specific halt syscall
+ * - Immediately stops the kernel from responding to syscalls
+ * - Switches to idle thread with interrupts disabled
+ * - Actually halts the system (unlike abort())
  *
- * Using default LWIP_PLATFORM_ASSERT now (calls abort() on assertion failure).
- * If assertion fires, it indicates a REAL BUG that needs investigation.
+ * Evidence from v2.133:
+ * - Assertion "tcp_input: pcb->next != pcb" at tcp_in.c:269 printed
+ * - But abort() didn't stop execution
+ * - Net0 continued processing with corrupted PCB linked list
+ * - Eventually crashed with heap double-free (cascading failure)
+ *
+ * With seL4_DebugHalt:
+ * - Assertion prints message
+ * - System halts immediately
+ * - GDB will catch the halt
+ * - Can debug the FIRST bug instead of cascading failures
  * ═══════════════════════════════════════════════════════════════════════════
  */
+
+/* Forward declaration of seL4_DebugHalt (defined in libsel4) */
+extern void seL4_DebugHalt(void);
+
+#define LWIP_PLATFORM_ASSERT(x) do { \
+    printf("FATAL: Assertion \"%s\" failed at line %d in %s\n", \
+           x, __LINE__, __FILE__); \
+    fflush(NULL); \
+    seL4_DebugHalt(); \
+} while(0)
 
 #endif /* __LWIPOPTS_H__ */

@@ -762,6 +762,320 @@ See [CRASH-CAPTURE-USAGE.md](CRASH-CAPTURE-USAGE.md) for details.
 
 ---
 
+## lwIP PCB Pointer Management Best Practices
+
+### ⚠️ CRITICAL: Rules for Safe PCB Handling
+
+**These rules MUST be followed to prevent use-after-free crashes and double-free bugs.**
+
+lwIP's Protocol Control Block (PCB) pointer management is a common source of crashes in embedded TCP/IP applications. The following best practices are essential for reliable operation.
+
+---
+
+### Rule 1: lwIP May Free PCBs Automatically
+
+lwIP can free PCBs internally in several situations:
+- When a connection is aborted or reset
+- When `tcp_close()` succeeds
+- In error conditions
+- When timeouts occur
+
+**Never assume a PCB is still valid after any lwIP operation.**
+
+---
+
+### Rule 2: The Error Callback Problem
+
+**CRITICAL**: When the error callback is called, lwIP has **ALREADY FREED** the PCB.
+
+```c
+void error_callback(void *arg, err_t err) {
+    struct my_state *state = (struct my_state *)arg;
+
+    // ❌ WRONG: PCB is already freed by lwIP
+    // tcp_close(pcb);     // CRASH!
+    // tcp_abort(pcb);     // CRASH!
+    // tcp_arg(pcb, NULL); // CRASH!
+
+    // ✅ CORRECT: Only clean up application state
+    state->pcb = NULL;  // Mark as invalid
+    // Free your state if needed
+}
+```
+
+**Do NOT call `tcp_close()`, `tcp_abort()`, or any PCB operation in the error callback.**
+
+---
+
+### Rule 3: Proper Cleanup Pattern
+
+Always NULL callbacks before closing to prevent spurious callback firing:
+
+```c
+void cleanup_connection(struct tcp_pcb *pcb, struct my_state *state) {
+    if (pcb != NULL) {
+        // Clear all callbacks to prevent them firing during/after close
+        tcp_arg(pcb, NULL);
+        tcp_recv(pcb, NULL);
+        tcp_sent(pcb, NULL);
+        tcp_err(pcb, NULL);   // Prevent error callback during close
+        tcp_poll(pcb, NULL, 0);
+
+        // Now safe to close
+        tcp_close(pcb);  // or tcp_abort(pcb) for immediate close
+    }
+
+    if (state != NULL) {
+        state->pcb = NULL;
+        // Free state...
+    }
+}
+```
+
+---
+
+### Rule 4: tcp_close() vs tcp_abort()
+
+**`tcp_close()`**: Graceful close
+- May **fail** and return `ERR_MEM` (out of memory)
+- PCB is **NOT freed** if it fails
+- Must check return value!
+
+**`tcp_abort()`**: Immediate close
+- **Always succeeds**
+- PCB is **freed immediately**
+- No callbacks fire after this
+
+```c
+err_t err = tcp_close(pcb);
+if (err != ERR_OK) {
+    // Close failed, PCB still exists
+    tcp_abort(pcb);  // Force close, frees PCB
+    pcb = NULL;
+}
+```
+
+---
+
+### Rule 5: Never Call tcp_abort() From Callbacks
+
+**CRITICAL VIOLATION**: Calling `tcp_abort()` from recv/sent/poll callbacks causes use-after-free crashes.
+
+```c
+// ❌ WRONG: Calling tcp_abort() from callback
+static err_t recv_callback(void *arg, struct tcp_pcb *pcb,
+                           struct pbuf *p, err_t err) {
+    if (p == NULL) {
+        tcp_abort(pcb);     // ❌ CRASH! lwIP may still need PCB
+        return ERR_ABRT;
+    }
+    // ...
+}
+
+// ✅ CORRECT: Return ERR_ABRT and let lwIP handle it
+static err_t recv_callback(void *arg, struct tcp_pcb *pcb,
+                           struct pbuf *p, err_t err) {
+    if (p == NULL) {
+        // Clean up application state
+        if (state != NULL) {
+            state->pcb = NULL;
+            state->active = false;
+        }
+        return ERR_ABRT;  // ✅ lwIP calls tcp_abort() internally
+    }
+    // ...
+}
+```
+
+**Why this matters**: lwIP needs to clean up internal state after callback returns. Calling `tcp_abort()` from inside the callback frees the PCB while lwIP is still using it.
+
+---
+
+### Rule 6: Never Call tcp_abort() From Main Thread
+
+**CRITICAL VIOLATION**: Calling `tcp_abort()` from outside lwIP context (main loop, event handlers) can cause race conditions.
+
+```c
+// ❌ WRONG: Calling tcp_abort() from CAmkES event handler
+void event_handler(void) {
+    struct tcp_pcb *pcb = /* lookup */;
+
+    tcp_abort(pcb);  // ❌ CRASH! lwIP callback may be using PCB
+}
+```
+
+**Problem**: The PCB may be in use by an lwIP callback running in parallel (or lwIP's internal state machine). Freeing it causes use-after-free.
+
+**Solution Option A: Use a "close pending" flag**
+
+```c
+void event_handler(void) {
+    meta->close_pending = true;
+    // lwIP poll callback will see this and close safely
+}
+
+static err_t poll_callback(void *arg, struct tcp_pcb *pcb) {
+    if (meta->close_pending) {
+        meta->pcb = NULL;
+        meta->active = false;
+        return ERR_ABRT;  // lwIP handles tcp_abort()
+    }
+    return ERR_OK;
+}
+```
+
+**Solution Option B: NULL callbacks + tcp_close()**
+
+```c
+void event_handler(void) {
+    struct tcp_pcb *pcb = meta->pcb;
+
+    // NULL all callbacks first
+    tcp_arg(pcb, NULL);
+    tcp_recv(pcb, NULL);
+    tcp_sent(pcb, NULL);
+    tcp_err(pcb, NULL);
+    tcp_poll(pcb, NULL, 0);
+
+    // Mark as NULL before close
+    meta->pcb = NULL;
+
+    // Attempt graceful close
+    err_t err = tcp_close(pcb);
+    if (err != ERR_OK) {
+        tcp_abort(pcb);  // Force close if graceful fails
+    }
+}
+```
+
+---
+
+### Rule 7: pbuf Ownership
+
+**CRITICAL**: Application code must **NEVER** call `pbuf_free()` on pbufs passed to recv callbacks.
+
+```c
+// ❌ WRONG: Manually freeing pbuf
+static err_t recv_callback(void *arg, struct tcp_pcb *pcb,
+                           struct pbuf *p, err_t err) {
+    // Process data...
+    pbuf_free(p);  // ❌ Double-free! lwIP will also free this
+    return ERR_OK;
+}
+
+// ✅ CORRECT: Let lwIP free the pbuf
+static err_t recv_callback(void *arg, struct tcp_pcb *pcb,
+                           struct pbuf *p, err_t err) {
+    // Process data...
+    tcp_recved(pcb, p->len);  // Tell lwIP we consumed data
+    return ERR_OK;  // ✅ lwIP frees pbuf after callback returns
+}
+```
+
+**lwIP guarantees**:
+- Incoming pbufs freed in `tcp_input()` after callback returns
+- Queued pbufs freed in `tcp_pcb_purge()` when PCB is removed
+- Application code should **only read** pbufs, never free them
+
+---
+
+### Common Double-Free Scenarios
+
+#### Scenario A: Calling cleanup from error callback
+```c
+// ❌ WRONG
+void error_callback(void *arg, err_t err) {
+    cleanup_connection(pcb, state);  // PCB already freed!
+}
+```
+
+#### Scenario B: Not checking tcp_close() return value
+```c
+// ❌ WRONG
+tcp_close(pcb);
+// ... later in error handler ...
+tcp_abort(pcb);  // Double free!
+
+// ✅ CORRECT
+err_t err = tcp_close(pcb);
+if (err != ERR_OK) {
+    tcp_abort(pcb);  // Only abort if close failed
+}
+pcb = NULL;
+```
+
+#### Scenario C: Manual pbuf_free() in recv callback
+```c
+// ❌ WRONG
+static err_t recv_callback(...) {
+    pbuf_free(p);  // Application frees
+    return ERR_OK;
+}
+// lwIP also frees in tcp_input() → DOUBLE FREE!
+
+// ✅ CORRECT
+static err_t recv_callback(...) {
+    // Just process data
+    return ERR_OK;  // lwIP handles pbuf cleanup
+}
+```
+
+---
+
+### Best Practices Summary
+
+1. **Always NULL callbacks before closing PCB**
+   ```c
+   tcp_err(pcb, NULL);  // Prevent error callback during close
+   tcp_close(pcb);
+   ```
+
+2. **In error callback, never touch the PCB**
+   ```c
+   void error_callback(void *arg, err_t err) {
+       state->pcb = NULL;  // Just nullify, don't close
+   }
+   ```
+
+3. **Check return values**
+   ```c
+   if (tcp_close(pcb) != ERR_OK) {
+       tcp_abort(pcb);
+   }
+   pcb = NULL;
+   ```
+
+4. **Use a state structure with the PCB pointer**
+   ```c
+   struct connection_state {
+       struct tcp_pcb *pcb;
+       bool active;
+       bool close_pending;  // For safe closes from main thread
+   };
+   ```
+
+5. **Never call tcp_abort() from callbacks or main thread**
+   - From callbacks: Return `ERR_ABRT` instead
+   - From main thread: Use `close_pending` flag + poll callback
+
+6. **Never call pbuf_free() on recv callback pbufs**
+   - lwIP owns pbuf lifecycle
+   - Application only reads pbufs
+
+---
+
+### Our Implementation Audit
+
+**Files audited**: See `/home/qemu/phd/research-docs/v2.155-lwip-best-practices-audit.md`
+
+**Violations found**:
+1. ❌ `tcp_abort()` called from recv callback (virtio_net1_driver.c:2563)
+2. ❌ `tcp_abort()` called from CAmkES event handler (virtio_net1_driver.c:3156)
+
+**Status**: Fixed in v2.156 (see version history)
+
+---
+
 ## Troubleshooting
 
 ### Issue: Traffic Bypassing QEMU Gateway (Local Routing Problem)

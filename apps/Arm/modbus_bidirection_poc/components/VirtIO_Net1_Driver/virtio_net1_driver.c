@@ -2169,6 +2169,27 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
     printf("   Action: Signaling ICS_Outbound component via outbound_ready_emit()\n");
     #endif
 
+    /* v2.159 FIX: REMOVED memory barrier from here!
+     * ═══════════════════════════════════════════════════════════════════════
+     * CRITICAL: Cannot add memory barrier inside lwIP callback!
+     *
+     * This is tcp_echo_recv() - an lwIP recv callback. Adding __sync_synchronize()
+     * here blocks the CPU inside lwIP's packet processing loop.
+     *
+     * Problem: CPU stall gives lwIP timers chance to fire → race with pbuf
+     * Result: CRASH at pbuf.c:732 (pbuf_free NULL pointer)
+     *
+     * Why barrier not needed:
+     * - CAmkES outbound_ready_emit() has internal synchronization
+     * - Event mechanism provides sufficient memory ordering
+     * - Net0 has barrier AFTER receiving signal (line 4390)
+     *
+     * Cache coherency still guaranteed by:
+     * 1. CAmkES event synchronization
+     * 2. Net0's read barrier after signal
+     * ═══════════════════════════════════════════════════════════════════════
+     */
+
     /* Step 4: Signal ICS_Outbound that PLC response is ready */
     outbound_ready_emit();
 
@@ -2646,6 +2667,22 @@ static err_t inbound_tcp_recv_callback(void *arg, struct tcp_pcb *pcb, struct pb
     BREADCRUMB(1008);  /* Copying payload */
     ics_msg->payload_length = ics_msg->metadata.payload_length;
     memcpy(ics_msg->payload, p->payload, ics_msg->payload_length);
+
+    /* v2.159 FIX: REMOVED memory barrier from here!
+     * ═══════════════════════════════════════════════════════════════════════
+     * CRITICAL: Cannot add memory barrier inside lwIP callback!
+     *
+     * Problem: __sync_synchronize() blocks CPU, gives lwIP timers chance to fire
+     * Result: Race condition with pbuf management → CRASH
+     *
+     * Why barrier not needed here:
+     * - CAmkES outbound_ready_emit() has internal synchronization
+     * - Event mechanism provides memory ordering guarantees
+     * - Net0 has memory barrier AFTER receiving signal (line 4390)
+     *
+     * Evidence: v2.159 crashed at pbuf.c:732 when barrier was here
+     * ═══════════════════════════════════════════════════════════════════════
+     */
 
     /* v2.104: Lightweight breadcrumb debugging for event emission
      * BREADCRUMB 1009: About to emit outbound_ready notification
@@ -3159,6 +3196,35 @@ void inbound_ready_handle(void)
 
     uint32_t close_queue_head = dp->close_queue.head;
 
+    /* v2.159: CRITICAL FIX - Memory barrier for cache coherency
+     * ═══════════════════════════════════════════════════════════════════════
+     * Problem (v2.158): Net0 sent 103 close notifications, Net1 processed 0
+     *
+     * Root Cause: Cache coherency issue with dataport reads
+     * - Net0 writes close_queue.head with memory barrier
+     * - Net1 reads close_queue.head WITHOUT memory barrier
+     * - Net1 CPU cache may have stale value (always reads 0)
+     * - Loop condition (0 < 0) never true → never processes notifications
+     * - Result: Net1 PCB pool exhausts (100/100), communication breaks
+     *
+     * Solution: Add memory barrier AFTER reading from shared dataport
+     * - Forces CPU to invalidate cache line
+     * - Ensures we read the actual value written by Net0
+     * - Loop condition now correct → processes all notifications
+     *
+     * Evidence from v2.158 test (console-20251025-013249.log):
+     * - Net0: 103 close notifications sent ✅
+     * - Net1: 0 notifications processed ❌ (this bug)
+     * - Net0: 88 connections (healthy) ✅
+     * - Net1: 100/100 connections (pool exhausted) ❌
+     *
+     * This is symmetric to Net0's write barrier in tcp_echo_poll():
+     *   Net0: notif->session_id = X; __sync_synchronize(); head++;
+     *   Net1: head = dp->head; __sync_synchronize(); process(notif);
+     * ═══════════════════════════════════════════════════════════════════════
+     */
+    __sync_synchronize();  /* Force cache invalidation - read fresh value from Net0 */
+
     /* Check for queue overflow */
     if (close_queue_head - close_queue_tail > CONTROL_QUEUE_SIZE) {
         printf("%s: [WARN] Close queue overflow! Missed %u notifications\n",
@@ -3227,6 +3293,25 @@ void inbound_ready_handle(void)
                     printf("%s:   → tcp_close() failed (err=%d), forcing tcp_abort()\n",
                            COMPONENT_NAME, err);
                     tcp_abort(pcb);  /* Safe now - callbacks NULL, metadata inactive */
+                }
+
+                /* v2.162: CRITICAL FIX - Free inbound connection pool slot!
+                 * ═══════════════════════════════════════════════════════════════
+                 * BUG (v2.161): Pool exhaustion after 100 connections
+                 * - Close notification processing freed metadata but NOT pool slot
+                 * - inbound_connection_pool[i].active stayed true forever
+                 * - After 100 connections: pool exhausted, can't accept new connections
+                 *
+                 * ROOT CAUSE: Forgot to call inbound_free_state(meta->pool_state)
+                 * - Error callback correctly frees pool (line 2879)
+                 * - Close notification handler forgot to free pool (this bug!)
+                 *
+                 * FIX: Free pool slot same as error callback does
+                 * ═══════════════════════════════════════════════════════════════
+                 */
+                if (meta->pool_state != NULL) {
+                    inbound_free_state(meta->pool_state);
+                    meta->pool_state = NULL;
                 }
 
                 /* Update shared state */
@@ -4555,7 +4640,7 @@ static int virtio_net_init(void)
 void post_init(void)
 {
     printf("%s: Component started\n", COMPONENT_NAME);
-    printf("%s: NET1 v2.156 (2025-10-25) - Fixed lwIP PCB management violations (tcp_abort best practices)\n", COMPONENT_NAME);
+    printf("%s: NET1 v2.162 (2025-10-25) - Fixed pool leak in close notification handler (inbound_free_state)\n", COMPONENT_NAME);
     printf("%s: [FIX] MODE: PRODUCTION-READY with Multi-Layer Validation\n", COMPONENT_NAME);
     printf("%s: [OK] FIX 1: payload_data buffer (prevents dataport corruption)\n", COMPONENT_NAME);
     printf("%s: [OK] FIX 2: tcp_abort() removed from callbacks (crash at 0x38a9c fixed!)\n", COMPONENT_NAME);

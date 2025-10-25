@@ -109,6 +109,21 @@ struct connection_metadata {
     /* v2.92: Response lifecycle tracking */
     bool awaiting_response;        /* True if we're waiting for PLC response (don't cleanup yet!) */
 
+    /* v2.158: Deferred connection close (lwIP best practice)
+     * ══════════════════════════════════════════════════════════════════════════
+     * Problem: Can't call tcp_close() from recv callback (Rule 5 violation)
+     *
+     * Solution: Deferred close via close_pending flag + poll callback
+     *   1. After sending response: recv callback sets close_pending = true
+     *   2. Poll callback (tcp_echo_poll) detects flag
+     *   3. Poll callback sends close notification to Net1
+     *   4. Poll callback returns ERR_ABRT → lwIP handles tcp_abort() internally
+     *
+     * This follows lwIP Rule 6 Solution A: close_pending flag pattern
+     * ══════════════════════════════════════════════════════════════════════════
+     */
+    bool close_pending;            /* True if connection should close (poll handles) */
+
     /* v2.111: Pending outbound data (fix for pbuf ref count bug)
      * ══════════════════════════════════════════════════════════════════════════
      * FIX: Don't call tcp_write() from main loop (outbound_ready_handle)
@@ -1057,6 +1072,10 @@ static struct connection_metadata* connection_add(uint32_t orig_src, uint32_t or
             connection_table[i].pending_outbound_data = NULL;
             connection_table[i].pending_outbound_len = 0;
             connection_table[i].has_pending_outbound = false;
+
+            /* v2.158: Initialize connection lifecycle flags */
+            connection_table[i].awaiting_response = false;
+            connection_table[i].close_pending = false;
 
             /* v2.149: Reset guard flag for new connection
              * Note: This allows stale callbacks to pass guard check if slot is reused quickly
@@ -2567,10 +2586,12 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
         return ERR_OK;
     }
 
+    /* v2.157: lwIP BEST PRACTICE - Never call pbuf_free() from recv callback!
+     * lwIP's tcp_input() always frees the pbuf after callback returns (tcp_in.c:600)
+     * Previous bug: We freed it here, then lwIP tried to free it again → double-free crash! */
     if (err != ERR_OK) {
-        BREADCRUMB(9001);  /* pbuf_free at line 2127 (error path) */
-        pbuf_free(p);
-        return err;
+        BREADCRUMB(9001);  /* Error path - lwIP will free pbuf */
+        return err;  /* ✅ lwIP frees pbuf automatically */
     }
 
     /* v2.131: CRITICAL FIX - Unconditional stale callback check
@@ -2582,8 +2603,7 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
     /* Check if this is a stale callback after connection close */
     if (meta_early != NULL && meta_early->pcb == NULL) {
         BREADCRUMB(9010);  /* v2.131: Stale callback after close */
-        pbuf_free(p);
-        return ERR_OK;
+        return ERR_OK;  /* ✅ v2.157: lwIP frees pbuf automatically */
     }
 
     bool metadata_valid_for_processing = (meta_early != NULL && meta_early->active);
@@ -2617,9 +2637,8 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
     if (inbound_dp == NULL) {
         printf("%s: [ERR] FATAL: inbound_dp is NULL! CAmkES dataport not mapped\n", COMPONENT_NAME);
         printf("%s:    This indicates seL4 capability/memory allocation failure\n", COMPONENT_NAME);
-        BREADCRUMB(9002);  /* pbuf_free at line 2160 (dataport NULL) */
-        pbuf_free(p);
-        return ERR_MEM;
+        BREADCRUMB(9002);  /* Dataport NULL - lwIP will free pbuf */
+        return ERR_MEM;  /* ✅ v2.157: lwIP frees pbuf automatically */
     }
 
     #if DEBUG_PACKET_DETAIL
@@ -2672,16 +2691,14 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
             printf("%s: [WARN]  tcp_echo_recv: Connection already closed (meta->pcb=NULL), dropping %u bytes\n",
                    COMPONENT_NAME, p->len);
             /* Connection was closed - this data is stale */
-            pbuf_free(p);
-            return ERR_OK;
+            return ERR_OK;  /* ✅ v2.157: lwIP frees pbuf automatically */
         }
 
         /* Additional safety: check if callback pcb matches metadata pcb */
         if (meta->pcb != pcb) {
             printf("%s: [WARN]  tcp_echo_recv: PCB mismatch (meta->pcb=%p, callback pcb=%p), dropping %u bytes\n",
                    COMPONENT_NAME, (void*)meta->pcb, (void*)pcb, p->len);
-            pbuf_free(p);
-            return ERR_OK;
+            return ERR_OK;  /* ✅ v2.157: lwIP frees pbuf automatically */
         }
 
         /* Use original destination IP and session ID from packet metadata */
@@ -2795,23 +2812,143 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
                 printf("%s: [WARN]  tcp_echo_recv: PCB stale (meta->pcb=%p, callback pcb=%p) - skip tcp_output\n",
                        COMPONENT_NAME, meta->pcb, pcb);
             }
+
+            /* v2.158: Set close_pending flag (lwIP best practice - deferred close)
+             * ══════════════════════════════════════════════════════════════════════════
+             * Response has been sent to SCADA. Now we need to close the connection.
+             *
+             * CRITICAL: Cannot call tcp_close() from recv callback (Rule 5 violation!)
+             *
+             * Solution: Set close_pending flag, let poll callback handle it
+             *   1. Set flag here (safe - just setting boolean)
+             *   2. Return ERR_OK from this callback (normal flow)
+             *   3. Poll callback fires later (~2 seconds with interval=4)
+             *   4. Poll callback detects flag → sends close notification → returns ERR_ABRT
+             *   5. lwIP calls tcp_abort() internally → connection closed safely
+             *
+             * This follows lwIP Rule 6 Solution A: close_pending flag pattern
+             * ══════════════════════════════════════════════════════════════════════════
+             */
+            meta->close_pending = true;
+
+            printf("%s: [v2.158] Response sent - close_pending=true (poll callback will close)\n",
+                   COMPONENT_NAME);
         } else {
             printf("%s: [WARN]  tcp_echo_recv: tcp_write failed (%d), will retry later\n",
                    COMPONENT_NAME, write_err);
         }
     }
 
-    /* v2.131: CRITICAL pbuf ref count guard
-     * lwIP can call tcp_echo_recv TWICE with same pbuf
-     * Guard against double-free by checking ref count */
-    BREADCRUMB(9003);  /* pbuf_free attempt */
+    /* v2.157: lwIP BEST PRACTICE - NEVER call pbuf_free() from recv callback!
+     *
+     * CRITICAL FIX: This was the root cause of pbuf double-free crashes!
+     *
+     * What was wrong (v2.131-v2.156):
+     * --------------------------------
+     * 1. We called pbuf_free(p) here (manually freeing pbuf)
+     * 2. Callback returned ERR_OK to lwIP
+     * 3. lwIP's tcp_input() ALSO called pbuf_free(inseg.p) at line 600
+     * 4. Result: DOUBLE-FREE → Assertion "p != NULL" failed at line 732 in pbuf.c
+     *
+     * Why ref count check didn't help:
+     * --------------------------------
+     * - Checking p->ref > 0 before pbuf_free() does NOT prevent double-free
+     * - lwIP ALWAYS frees the pbuf in tcp_input() regardless of ref count
+     * - Application code should NEVER call pbuf_free() on callback pbufs
+     *
+     * lwIP ownership model (from tcp_in.c:596-600):
+     * ----------------------------------------------
+     * if (inseg.p != NULL) {
+     *     pbuf_free(inseg.p);  ← lwIP owns this, NOT application!
+     *     inseg.p = NULL;
+     * }
+     *
+     * Correct protocol:
+     * -----------------
+     * - Application processes pbuf data
+     * - Application returns status code (ERR_OK, ERR_ABRT, etc.)
+     * - lwIP handles ALL memory management (allocation AND deallocation)
+     *
+     * Fix (v2.157):
+     * -------------
+     * Remove ALL pbuf_free() calls from recv callback. Let lwIP handle it.
+     */
+    BREADCRUMB(9003);  /* Recv callback complete - lwIP will free pbuf */
 
-    if (p->ref > 0) {
-        pbuf_free(p);
-    } else {
-        BREADCRUMB(9012);  /* v2.131: Duplicate callback - pbuf already freed (ref=0) */
+    return ERR_OK;  /* ✅ lwIP frees pbuf automatically in tcp_input() */
+}
+
+/* v2.158: TCP poll callback for deferred connection cleanup
+ * ═══════════════════════════════════════════════════════════════════════════
+ * Purpose: Handle close_pending flag set by recv callback after sending response
+ *
+ * Why we need this:
+ * - Cannot call tcp_close() from recv callback (lwIP Rule 5 violation)
+ * - Poll callback runs in safe lwIP context
+ * - Fires periodically (~2 seconds with interval=4 in tcp_echo_accept)
+ *
+ * Pattern (lwIP Rule 6, Solution A):
+ * 1. Recv callback sends response → sets close_pending = true
+ * 2. This poll callback detects flag
+ * 3. Sends close notification to Net1 (so Net1 closes PLC connection)
+ * 4. Returns ERR_ABRT → lwIP handles tcp_abort() internally
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
+static err_t tcp_echo_poll(void *arg, struct tcp_pcb *pcb)
+{
+    struct connection_metadata *meta = (struct connection_metadata *)arg;
+
+    if (meta == NULL) {
+        /* No metadata - shouldn't happen but safe to continue */
+        return ERR_OK;
     }
 
+    /* Check if close was requested */
+    if (meta->close_pending) {
+        printf("%s: [v2.158] Poll callback detected close_pending (session %u)\n",
+               COMPONENT_NAME, meta->session_id);
+
+        /* Send close notification to Net1 BEFORE closing
+         * This tells Net1 to close its PLC connection too */
+        InboundDataport *in_dp = (InboundDataport *)inbound_dp;
+        if (in_dp != NULL) {
+            uint32_t head = in_dp->close_queue.head;
+            uint32_t slot = head & CONTROL_QUEUE_MASK;
+            volatile struct control_notification *notif = &in_dp->close_queue.notifications[slot];
+
+            /* Fill notification */
+            notif->session_id = meta->session_id;
+            notif->err_code = 0;  /* Normal close (not error) */
+            notif->seq_num = head;
+            __sync_synchronize();  /* Memory barrier - ensure write visible to Net1 */
+
+            /* Commit to queue */
+            in_dp->close_queue.head = head + 1;
+            inbound_ready_emit();  /* Signal Net1 to process queue */
+
+            printf("%s:   [OK] Close notification queued for Net1 (session %u)\n",
+                   COMPONENT_NAME, meta->session_id);
+        } else {
+            printf("%s:   [WARN] inbound_dp NULL - cannot notify Net1\n", COMPONENT_NAME);
+        }
+
+        /* Clean up application state before returning ERR_ABRT */
+        meta->pcb = NULL;
+        meta->active = false;
+        meta->close_pending = false;
+
+        /* Cleanup metadata (frees connection slot) */
+        connection_cleanup_atomic(meta);
+
+        printf("%s:   [OK] Connection closed - slot freed (session %u)\n",
+               COMPONENT_NAME, meta->session_id);
+
+        /* Return ERR_ABRT → lwIP calls tcp_abort() internally
+         * This is the correct way to close from a callback (Rule 5 compliant) */
+        return ERR_ABRT;
+    }
+
+    /* Normal poll - no action needed */
     return ERR_OK;
 }
 
@@ -2905,6 +3042,20 @@ static err_t tcp_echo_accept(void *arg, struct tcp_pcb *newpcb, err_t err)
     tcp_recv(newpcb, tcp_echo_recv);
     tcp_err(newpcb, tcp_echo_err);  /* Register error callback for connection cleanup */
     tcp_sent(newpcb, tcp_echo_sent);  /* v2.111: Register sent callback for pending outbound data */
+
+    /* v2.158: Register poll callback for deferred connection cleanup
+     * ══════════════════════════════════════════════════════════════════════════
+     * Purpose: Handle close_pending flag set by recv callback after sending response
+     *
+     * Interval = 4 means poll fires every 4 × 500ms = 2 seconds
+     * - Frequent enough to close connections promptly after response sent
+     * - Infrequent enough to minimize overhead
+     *
+     * This callback detects meta->close_pending flag and safely closes connection
+     * following lwIP Rule 6 Solution A (deferred close pattern)
+     * ══════════════════════════════════════════════════════════════════════════
+     */
+    tcp_poll(newpcb, tcp_echo_poll, 4);
 
     return ERR_OK;
 }
@@ -3203,6 +3354,35 @@ void outbound_ready_handle(void)
     static uint32_t error_queue_tail = 0;  /* Consumer state (local, never shared) */
 
     uint32_t error_queue_head = dp->error_queue.head;
+
+    /* v2.159: CRITICAL FIX - Memory barrier for cache coherency
+     * ═══════════════════════════════════════════════════════════════════════
+     * Problem: Same as close_queue bug in v2.158 (Net1 side)
+     *
+     * Root Cause: Cache coherency issue with dataport reads
+     * - Net1 writes error_queue.head with memory barrier (in control_queue_enqueue)
+     * - Net0 reads error_queue.head WITHOUT memory barrier
+     * - Net0 CPU cache may have stale value (reads old head value)
+     * - Loop condition may be false when it should be true → missed notifications
+     * - Result: Error notifications not processed, connections not closed on PLC errors
+     *
+     * Solution: Add memory barrier AFTER reading from shared dataport
+     * - Forces CPU to invalidate cache line
+     * - Ensures we read the actual value written by Net1
+     * - Loop condition now correct → processes all error notifications
+     *
+     * Why external barrier at line 4390 is insufficient:
+     * - Barrier is before function call (in main loop)
+     * - Read happens inside function (compiler may reorder)
+     * - Barrier must be immediately after the read for correct ordering
+     * - Function boundary creates race window
+     *
+     * This is symmetric to Net1's write barrier in control_queue_enqueue():
+     *   Net1: write notification → __sync_synchronize() → update head → emit signal
+     *   Net0: wait signal → read head → __sync_synchronize() → process notification
+     * ═══════════════════════════════════════════════════════════════════════
+     */
+    __sync_synchronize();  /* Force cache invalidation - read fresh value from Net1 */
 
     /* Check for consumer falling too far behind (queue wraparound) */
     if (error_queue_head - error_queue_tail > CONTROL_QUEUE_SIZE) {
@@ -4047,7 +4227,7 @@ static int virtio_net_init(void)
 void post_init(void)
 {
     printf("%s: Component started\n", COMPONENT_NAME);
-    printf("%s: NET0 v2.153 (2025-10-24) - Lock-free control message queues (RST flood protection)\n", COMPONENT_NAME);
+    printf("%s: NET0 v2.162 (2025-10-25) - Fixed ICS dataport forwarding (no changes needed in Net0)\n", COMPONENT_NAME);
     printf("%s: [FIX] MODE: PRODUCTION with fast cleanup (every 100 iterations)\n", COMPONENT_NAME);
     printf("%s: [OK] FIX 1: Immediate cleanup on tcp_echo_err (v2.145 behavior)\n", COMPONENT_NAME);
     printf("%s: [OK] FIX 2: Send close notification to Net1 when SCADA closes\n", COMPONENT_NAME);

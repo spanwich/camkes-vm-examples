@@ -118,7 +118,9 @@ static bool validate_message(const ICS_Message *msg) {
  * Process one message from input dataport
  */
 static bool process_message(void) {
-    ICS_Message *in_msg = (ICS_Message *)in_dp;
+    /* v2.161: Cast to OutboundDataport* to access both response_msg AND error_queue */
+    OutboundDataport *in_dataport = (OutboundDataport *)in_dp;
+    ICS_Message *in_msg = &in_dataport->response_msg;
 
     /* Basic bounds check */
     if (!basic_bounds_check(in_msg, sizeof(Buf))) {
@@ -139,10 +141,28 @@ static bool process_message(void) {
     }
 
     /* Forward to output dataport */
-    ICS_Message *out_msg = (ICS_Message *)out_dp;
+    OutboundDataport *out_dataport = (OutboundDataport *)out_dp;
+    ICS_Message *out_msg = &out_dataport->response_msg;
     memcpy(out_msg, in_msg, sizeof(FrameMetadata) + sizeof(uint16_t) + in_msg->payload_length);
 
-    /* CRITICAL: Force cache flush before notification to ensure Net0 sees latest data */
+    /* v2.161: CRITICAL FIX - Forward error_queue from Net1 to Net0
+     * ═══════════════════════════════════════════════════════════════════════
+     * Bug: Net1 writes error notifications to ics_outbound.in_dp->error_queue
+     *      Net0 reads error notifications from ics_outbound.out_dp->error_queue
+     *      ICS_Outbound wasn't forwarding error_queue → Net0 never saw notifications!
+     *
+     * Fix: Copy entire error_queue structure from in_dp to out_dp
+     *      This forwards all pending error notifications to Net0
+     *
+     * Memory barrier: Ensures Net0 sees updated error_queue.head
+     * ═══════════════════════════════════════════════════════════════════════
+     */
+    memcpy((void*)&out_dataport->error_queue,
+           (void*)&in_dataport->error_queue,
+           sizeof(struct control_queue));
+
+    /* CRITICAL: Force cache flush before notification to ensure Net0 sees latest data
+     * v2.161: This barrier now covers BOTH response_msg AND error_queue */
     __sync_synchronize();
 
     /* Signal VirtIO_Net0_Driver */
@@ -182,9 +202,10 @@ void pre_init(void) {
     memset(&stats, 0, sizeof(stats));
     tcp_messages = udp_messages = arp_messages = other_messages = 0;
     DEBUG_PRINTF("ICS_Outbound: Initializing internal→external validation...\n");
-    DEBUG_PRINTF("ICS_Outbound: 🔖 SOFTWARE VERSION: v1.0-passthrough (2025-10-12)\n");
-    DEBUG_PRINTF("ICS_Outbound: 🔧 Features: Metadata logging + EverParse validation hooks\n");
-    DEBUG_PRINTF("ICS_Outbound: 📊 Protocols: TCP, UDP, ARP detection\n\n");
+    DEBUG_PRINTF("ICS_Outbound: 🔖 SOFTWARE VERSION: v2.161 (2025-10-25)\n");
+    DEBUG_PRINTF("ICS_Outbound: 🔧 Features: Metadata logging + EverParse validation hooks + error_queue forwarding\n");
+    DEBUG_PRINTF("ICS_Outbound: 📊 Protocols: TCP, UDP, ARP detection\n");
+    DEBUG_PRINTF("ICS_Outbound: ✅ CRITICAL FIX: Forwards error_queue from Net1 to Net0 (fixes error notification delivery)\n\n");
 }
 
 int run(void) {

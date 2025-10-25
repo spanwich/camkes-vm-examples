@@ -118,7 +118,9 @@ static bool validate_message(const ICS_Message *msg) {
  * Process one message from input dataport
  */
 static bool process_message(void) {
-    ICS_Message *in_msg = (ICS_Message *)in_dp;
+    /* v2.161: Cast to InboundDataport* to access both request_msg AND close_queue */
+    InboundDataport *in_dataport = (InboundDataport *)in_dp;
+    ICS_Message *in_msg = &in_dataport->request_msg;
 
     /* Basic bounds check */
     if (!basic_bounds_check(in_msg, sizeof(Buf))) {
@@ -139,8 +141,28 @@ static bool process_message(void) {
     }
 
     /* Forward to output dataport */
-    ICS_Message *out_msg = (ICS_Message *)out_dp;
+    InboundDataport *out_dataport = (InboundDataport *)out_dp;
+    ICS_Message *out_msg = &out_dataport->request_msg;
     memcpy(out_msg, in_msg, sizeof(FrameMetadata) + sizeof(uint16_t) + in_msg->payload_length);
+
+    /* v2.161: CRITICAL FIX - Forward close_queue from Net0 to Net1
+     * ═══════════════════════════════════════════════════════════════════════
+     * Bug: Net0 writes close notifications to ics_inbound.in_dp->close_queue
+     *      Net1 reads close notifications from ics_inbound.out_dp->close_queue
+     *      ICS_Inbound wasn't forwarding close_queue → Net1 never saw notifications!
+     *
+     * Fix: Copy entire close_queue structure from in_dp to out_dp
+     *      This forwards all pending close notifications to Net1
+     *
+     * Memory barrier: Ensures Net1 sees updated close_queue.head
+     * ═══════════════════════════════════════════════════════════════════════
+     */
+    memcpy((void*)&out_dataport->close_queue,
+           (void*)&in_dataport->close_queue,
+           sizeof(struct control_queue));
+
+    /* Memory barrier: Force cache flush so Net1 sees updated close_queue */
+    __sync_synchronize();
 
     /* Signal VirtIO_Net1_Driver */
     out_ntfy_emit();
@@ -179,9 +201,10 @@ void pre_init(void) {
     memset(&stats, 0, sizeof(stats));
     tcp_messages = udp_messages = arp_messages = other_messages = 0;
     DEBUG_PRINTF("ICS_Inbound: Initializing external→internal validation...\n");
-    DEBUG_PRINTF("ICS_Inbound: 🔖 SOFTWARE VERSION: v1.0-passthrough (2025-10-12)\n");
-    DEBUG_PRINTF("ICS_Inbound: 🔧 Features: Metadata logging + EverParse validation hooks\n");
-    DEBUG_PRINTF("ICS_Inbound: 📊 Protocols: TCP, UDP, ARP detection\n\n");
+    DEBUG_PRINTF("ICS_Inbound: 🔖 SOFTWARE VERSION: v2.161 (2025-10-25)\n");
+    DEBUG_PRINTF("ICS_Inbound: 🔧 Features: Metadata logging + EverParse validation hooks + close_queue forwarding\n");
+    DEBUG_PRINTF("ICS_Inbound: 📊 Protocols: TCP, UDP, ARP detection\n");
+    DEBUG_PRINTF("ICS_Inbound: ✅ CRITICAL FIX: Forwards close_queue from Net0 to Net1 (fixes PCB pool exhaustion)\n\n");
 }
 
 int run(void) {

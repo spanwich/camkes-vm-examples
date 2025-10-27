@@ -15,6 +15,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <string.h>
+#include "control_queue.h"
 
 /* Buffer and message size limits */
 #define MAX_PAYLOAD_SIZE    60000   /* Maximum payload size in bytes */
@@ -37,8 +38,13 @@
  *
  * Contains all protocol/frame information extracted by VirtIO drivers.
  * ICS validation components use this for protocol-aware validation.
+ *
+ * v2.150: Added session_id for reliable SCADA ↔ PLC connection mapping
  */
 typedef struct {
+    // v2.150: Session ID for connection tracking across components
+    uint32_t session_id;            /* Unique session ID (0 = unassigned) */
+
     // Ethernet frame info
     uint8_t  dst_mac[6];        /* Destination MAC address */
     uint8_t  src_mac[6];        /* Source MAC address */
@@ -79,6 +85,55 @@ typedef struct {
     uint16_t      payload_length;           /* Length of payload */
     uint8_t       payload[MAX_PAYLOAD_SIZE]; /* Actual payload data */
 } __attribute__((packed)) ICS_Message;
+
+/*
+ * Dataport Layout Structures (v2.188-sentinel)
+ *
+ * v2.188-sentinel APPROACH: Use payload_length=0 sentinel for control-only messages
+ * ═══════════════════════════════════════════════════════════════════════════════
+ *
+ * PREVIOUS (v2.153-v2.187): Control queues embedded in ICS dataports
+ * - InboundDataport: request_msg + close_queue
+ * - OutboundDataport: response_msg + error_queue
+ * - Problem: ICS forwards stale request_msg when only close_queue updated
+ *
+ * NEW (v2.188-sentinel): Sentinel value to distinguish control-only vs data+control
+ * - When Net0 sends close-only: Set request_msg.payload_length = 0 (sentinel)
+ * - When Net1 sends error-only: Set response_msg.payload_length = 0 (sentinel)
+ * - Receiver checks: if (payload_length == 0) → skip data processing, handle control only
+ *
+ * Benefits:
+ * 1. Minimal code changes (~20 lines vs ~130 for architectural split)
+ * 2. No CAmkES configuration changes (no new dataports/connections)
+ * 3. Keeps original design intent (control through ICS makes semantic sense)
+ * 4. ICS validation allows payload_length=0 (line 218: "if (payload_length > 0)")
+ * 5. Solves stale data forwarding (explicit sentinel vs leftover garbage)
+ * ═══════════════════════════════════════════════════════════════════════════════
+ */
+
+/*
+ * Inbound Dataport Layout (Net0 → ICS_Inbound → Net1)
+ * - Net0 writes: SCADA requests OR close-only notifications
+ * - ICS_Inbound validates and forwards both
+ * - Net1 reads: checks payload_length=0 for close-only
+ * v2.188-sentinel: payload_length=0 indicates close-only notification
+ */
+typedef struct {
+    ICS_Message request_msg;           /* Main request buffer (~60KB) */
+    struct control_queue close_queue;  /* Close notification queue (~1.5KB) */
+} __attribute__((packed)) InboundDataport;
+
+/*
+ * Outbound Dataport Layout (Net1 → ICS_Outbound → Net0)
+ * - Net1 writes: PLC responses OR error-only notifications
+ * - ICS_Outbound validates and forwards both
+ * - Net0 reads: checks payload_length=0 for error-only
+ * v2.188-sentinel: payload_length=0 indicates error-only notification
+ */
+typedef struct {
+    ICS_Message response_msg;          /* Main response buffer (~60KB) */
+    struct control_queue error_queue;  /* Error notification queue (~1.5KB) */
+} __attribute__((packed)) OutboundDataport;
 
 /*
  * Audit log entry for tracking dropped/rejected messages

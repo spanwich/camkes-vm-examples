@@ -21,14 +21,18 @@
 /*
  * Minimal connection view for sharing between components
  *
+ * v2.150: Added session_id for reliable SCADA ↔ PLC connection mapping
+ *
  * This structure contains only the essential information needed for:
  * - Identifying connections (5-tuple)
  * - Detecting stale notifications (timestamp)
  * - Checking if connection is active (active flag)
+ * - Linking SCADA and PLC connections (session_id)
  *
- * Size: 20 bytes per entry × 256 = 5 KB total per component
+ * Size: 24 bytes per entry × 256 = 6 KB total per component
  */
 struct connection_view {
+    uint32_t session_id;  /* v2.150: Unique ID for SCADA connection (0 = unassigned) */
     uint32_t src_ip;      /* Source IP (SCADA) */
     uint32_t dst_ip;      /* Destination IP (PLC) */
     uint16_t src_port;    /* Source port (SCADA ephemeral) */

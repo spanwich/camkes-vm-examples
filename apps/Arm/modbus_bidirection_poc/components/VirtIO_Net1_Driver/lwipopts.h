@@ -15,7 +15,7 @@
 
 /* Memory configuration */
 #define MEM_ALIGNMENT                   4
-#define MEM_SIZE                        (128 * 1024)  /* v2.87: 128KB heap to support 256 PCBs */
+#define MEM_SIZE                        (128 * 1024)  /* v2.182: Reverted to 128KB for leak testing */
 
 /* v2.78: Use static memory pools instead of malloc to prevent cross-component contamination */
 #define MEM_LIBC_MALLOC                 0       /* DO NOT use system malloc */
@@ -38,14 +38,40 @@
 
 /* TCP configuration */
 #define LWIP_TCP                        1
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * ICS/SCADA Optimizations for Rapid Connection Cycling (v2.169)
+ * ═══════════════════════════════════════════════════════════════════════
+ *
+ * Standard TCP_MSL=60s causes PCB pool exhaustion in ICS environments where
+ * SCADA systems open/close connections every 1-2 seconds for Modbus polling.
+ *
+ * Problem: TIME_WAIT = 2×MSL = 120s
+ *   - At 1 connection/2s rate: 60 PCBs stuck in TIME_WAIT
+ *   - Pool exhausts after ~100 connections (MEMP_NUM_TCP_PCB=100)
+ *   - Communication stops: "Failed to create TCP PCB - pool exhausted"
+ *
+ * Solution: Reduce MSL to 30s (TIME_WAIT = 60s)
+ *   - Conservative approach (was 1s in v2.168, too aggressive)
+ *   - At 1 connection/2s rate: ~30 PCBs in TIME_WAIT (vs 60 at MSL=60s)
+ *   - With symmetric error notification (RST), TIME_WAIT should be minimal
+ *   - ICS networks are controlled environments - 60s adequate
+ *
+ * Note: v2.169 adds RST notification to client when pool exhausts,
+ *       which should prevent most TIME_WAIT accumulation anyway.
+ *
+ * See: research-docs/tcp-connection-exhaustion-industry-practices-research.md
+ */
+#define TCP_MSL                         30000UL  /* 30 seconds (default: 60s) → TIME_WAIT = 60s */
+
 #define TCP_MSS                         1460
 #define TCP_SND_BUF                     (16 * TCP_MSS)
 #define TCP_SND_QUEUELEN                ((4 * TCP_SND_BUF) / TCP_MSS)
 #define TCP_WND                         (16 * TCP_MSS)
 #define LWIP_WND_SCALE                  1
 #define TCP_RCV_SCALE                   2
-#define MEMP_NUM_TCP_SEG                TCP_SND_QUEUELEN
-#define MEMP_NUM_TCP_PCB                100     /* v2.100: Match PLC connection limit to prevent orphaned connections */
+#define MEMP_NUM_TCP_PCB                100     /* v2.182: Reverted to 100 for leak testing */
+#define MEMP_NUM_TCP_SEG                800     /* v2.182: 8 segments per connection (8 * 100 = 800) */
 #define MEMP_NUM_TCP_PCB_LISTEN         16      /* Max listening sockets (increased from 4) */
 
 /* UDP configuration */
@@ -53,7 +79,7 @@
 #define MEMP_NUM_UDP_PCB                4
 
 /* pbuf configuration */
-#define PBUF_POOL_SIZE                  512     /* v2.100: Support 100 connections (100×3×1.25=375 → 512) */
+#define PBUF_POOL_SIZE                  375     /* v2.182: Support 100 connections (100×3×1.25=375) */
 #define PBUF_POOL_BUFSIZE               2048    /* Match PACKET_BUFFER_SIZE */
 
 /* Checksum configuration - let hardware handle it if possible */
@@ -82,42 +108,15 @@
 /* Lightweight protection */
 #define SYS_LIGHTWEIGHT_PROT            0
 
-/* v2.134: LWIP_PLATFORM_ASSERT override for seL4 microkernel
- * ═══════════════════════════════════════════════════════════════════════════
- * Problem: abort() doesn't work in seL4 microkernel!
- * - abort() calls raise(SIGABRT) which requires POSIX signals
- * - seL4 doesn't support POSIX signals in userspace
- * - abort() returns instead of halting → execution continues with corrupt state
- * - System continues until hitting cascading failures (heap corruption, etc)
+/* v2.163: LWIP_PLATFORM_ASSERT removed from lwipopts.h
  *
- * Solution: Use seL4_DebugHalt() instead of abort()
- * - seL4_DebugHalt() is the microkernel-specific halt syscall
- * - Immediately stops the kernel from responding to syscalls
- * - Switches to idle thread with interrupts disabled
- * - Actually halts the system (unlike abort())
+ * Now using default from util_libs/liblwip/include/lwip/arch/cc.h
+ * which uses while(1) infinite loop instead of abort().
  *
- * Evidence from v2.133:
- * - Assertion "tcp_input: pcb->next != pcb" at tcp_in.c:269 printed
- * - But abort() didn't stop execution
- * - Net0 continued processing with corrupted PCB linked list
- * - Eventually crashed with heap double-free (cascading failure)
+ * This ensures assertions actually HALT the system instead of
+ * returning (abort doesn't work in seL4 - no POSIX signals).
  *
- * With seL4_DebugHalt:
- * - Assertion prints message
- * - System halts immediately
- * - GDB will catch the halt
- * - Can debug the FIRST bug instead of cascading failures
- * ═══════════════════════════════════════════════════════════════════════════
+ * GDB will catch the infinite loop for debugging.
  */
-
-/* Forward declaration of seL4_DebugHalt (defined in libsel4) */
-extern void seL4_DebugHalt(void);
-
-#define LWIP_PLATFORM_ASSERT(x) do { \
-    printf("FATAL: Assertion \"%s\" failed at line %d in %s\n", \
-           x, __LINE__, __FILE__); \
-    fflush(NULL); \
-    seL4_DebugHalt(); \
-} while(0)
 
 #endif /* __LWIPOPTS_H__ */

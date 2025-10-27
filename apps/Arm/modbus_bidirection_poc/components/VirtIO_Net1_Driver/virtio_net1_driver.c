@@ -1125,6 +1125,7 @@ static struct connection_metadata* connection_add(uint32_t session_id,  /* v2.15
 
             /* Reuse this slot - update all fields but keep active=true */
             connection_table[i].pcb = NULL;  /* Will be set when TCP accept happens */
+            connection_table[i].session_id = session_id;  /* v2.190: CRITICAL FIX - Update session_id in reuse path! */
             connection_table[i].original_src_ip = orig_src;
             connection_table[i].original_dest_ip = orig_dest;
             connection_table[i].src_port = sport;
@@ -2970,6 +2971,15 @@ static void inbound_tcp_err_callback(void *arg, err_t err)
 
                 if (success) {
                     meta->error_notified = true;  /* Set dedup flag */
+
+                    /* v2.188-sentinel: Mark as error-only notification
+                     * Set payload_length = 0 to indicate this is NOT a response
+                     * ICS_Outbound will forward this, Net0 will see sentinel and skip response processing
+                     */
+                    dp->response_msg.payload_length = 0;  /* Sentinel: error-only, no payload */
+                    dp->response_msg.metadata.session_id = meta->session_id;
+                    __sync_synchronize();  /* Memory barrier - ensure sentinel visible before signal */
+
                     outbound_ready_emit();        /* Signal Net0 */
 
                     printf("%s: Enqueued error notification to Net0 "
@@ -3123,6 +3133,15 @@ static err_t inbound_tcp_connected_callback(void *arg, struct tcp_pcb *pcb, err_
 
             if (success) {
                 meta->error_notified = true;
+
+                /* v2.188-sentinel: Mark as error-only notification
+                 * Set payload_length = 0 to indicate this is NOT a response
+                 * ICS_Outbound will forward this, Net0 will see sentinel and skip response processing
+                 */
+                dp->response_msg.payload_length = 0;  /* Sentinel: error-only, no payload */
+                dp->response_msg.metadata.session_id = meta->session_id;
+                __sync_synchronize();  /* Memory barrier - ensure sentinel visible before signal */
+
                 outbound_ready_emit();
 
                 printf("%s: Enqueued connection failure notification to Net0 "

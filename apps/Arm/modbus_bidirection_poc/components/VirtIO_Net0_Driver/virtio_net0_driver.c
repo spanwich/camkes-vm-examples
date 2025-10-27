@@ -108,6 +108,18 @@ struct connection_metadata {
     uint32_t timestamp;            /* Creation time - for metadata consistency with Net1 */
     /* v2.92: Response lifecycle tracking */
     bool awaiting_response;        /* True if we're waiting for PLC response (don't cleanup yet!) */
+    /* v2.189: Response arrival tracking (fix race condition)
+     * ══════════════════════════════════════════════════════════════════════════
+     * Problem: tcp_echo_recv(p=NULL) sets awaiting_response=true when SCADA closes,
+     *          even if response already arrived and was processed.
+     *
+     * Solution: Track when response arrives separately from awaiting state
+     *   1. outbound_ready_handle(): response_received = true (response arrived)
+     *   2. tcp_echo_recv(p=NULL): check response_received before setting awaiting_response
+     *   3. If response_received=true: proceed with normal close (don't wait)
+     * ══════════════════════════════════════════════════════════════════════════
+     */
+    bool response_received;        /* True if PLC response arrived (even if not sent yet) */
 
     /* v2.158: Deferred connection close (lwIP best practice)
      * ══════════════════════════════════════════════════════════════════════════
@@ -1104,6 +1116,7 @@ static struct connection_metadata* connection_add(uint32_t orig_src, uint32_t or
 
             /* v2.158: Initialize connection lifecycle flags */
             connection_table[i].awaiting_response = false;
+            connection_table[i].response_received = false;  /* v2.189: Response arrival tracking */
             connection_table[i].close_pending = false;
             connection_table[i].closing = false;  /* v2.180: Deferred metadata cleanup */
 
@@ -1305,6 +1318,7 @@ static void connection_cleanup_atomic(struct connection_metadata *meta)
     meta->has_pending_outbound = false;
     meta->pending_outbound_len = 0;
     meta->awaiting_response = false;
+    meta->response_received = false;  /* v2.189: Reset response tracking */
 
     /* v2.147: DO NOT clear guard flag!
      * ═══════════════════════════════════════════════════════════════════════
@@ -2269,6 +2283,15 @@ static void tcp_echo_err(void *arg, err_t err)
 
         if (success) {
             meta->close_notified = true;  /* Set dedup flag */
+
+            /* v2.188-sentinel: Mark as close-only notification
+             * Error callback means connection terminated, no request data to send
+             * Set sentinel for defensive programming and consistency
+             */
+            dp->request_msg.payload_length = 0;  /* Sentinel: close-only, no payload */
+            dp->request_msg.metadata.session_id = meta->session_id;
+            __sync_synchronize();  /* Memory barrier - ensure sentinel visible before signal */
+
             inbound_ready_emit();         /* Signal Net1 */
 
             printf("%s: Enqueued close notification to Net1 "
@@ -2495,7 +2518,61 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
          * ═══════════════════════════════════════════════════════════════════════
          */
 
-        /* Set awaiting_response flag - response will send close notification */
+        /* v2.189: Check if response already received (fix race condition)
+         * ═══════════════════════════════════════════════════════════════════════
+         * Race condition: SCADA closes AFTER response arrives but BEFORE processing
+         *
+         * Timeline:
+         *   T+0ms: SCADA sends request
+         *   T+55ms: PLC response arrives → response_received=true
+         *   T+100ms: SCADA sends FIN (closes) → tcp_echo_recv(p=NULL) fires
+         *   T+105ms: Check: response_received? YES! → Skip awaiting mode
+         *
+         * If we blindly set awaiting_response=true, we'd keep connection alive
+         * even though response already arrived. This causes pool exhaustion!
+         * ═══════════════════════════════════════════════════════════════════════
+         */
+        if (meta->response_received) {
+            /* Response already arrived and processed - proceed with normal close */
+            printf("%s: SCADA closed AFTER response received - proceeding with normal close (session %u)\n",
+                   COMPONENT_NAME, meta->session_id);
+            printf("%s:    → Response was already sent to SCADA\n", COMPONENT_NAME);
+            printf("%s:    → No need to wait - closing both sides now\n", COMPONENT_NAME);
+
+            /* Send close notification to Net1 */
+            update_shared_connection_state();  /* Ensure connection visible in peer_state */
+
+            InboundDataport *dp = (InboundDataport *)inbound_dp;
+            if (dp != NULL && !meta->close_notified) {
+                uint32_t head = dp->close_queue.head;
+                uint32_t slot = head & CONTROL_QUEUE_MASK;
+                volatile struct control_notification *notif = &dp->close_queue.notifications[slot];
+
+                notif->session_id = meta->session_id;
+                notif->err_code = 0;  /* Normal close */
+                notif->seq_num = head;
+                __sync_synchronize();
+
+                dp->close_queue.head = head + 1;
+
+                /* v2.188-sentinel: Mark as close-only notification */
+                dp->request_msg.payload_length = 0;
+                dp->request_msg.metadata.session_id = meta->session_id;
+                __sync_synchronize();
+
+                inbound_ready_emit();
+                meta->close_notified = true;
+
+                printf("%s:   [OK] Close notification queued for Net1 (session %u)\n",
+                       COMPONENT_NAME, meta->session_id);
+            }
+
+            /* Cleanup metadata */
+            connection_cleanup_atomic(meta);
+            return ERR_OK;
+        }
+
+        /* Response NOT received yet - enter awaiting_response mode */
         meta->awaiting_response = true;
         /* DON'T set cleanup_in_progress - error callbacks must still work */
 
@@ -2906,6 +2983,15 @@ static err_t tcp_echo_poll(void *arg, struct tcp_pcb *pcb)
 
             /* Commit to queue */
             in_dp->close_queue.head = head + 1;
+
+            /* v2.188-sentinel: Mark as close-only notification
+             * Set payload_length = 0 to indicate this is NOT a request
+             * ICS_Inbound will forward this, Net1 will see sentinel and skip request processing
+             */
+            in_dp->request_msg.payload_length = 0;  /* Sentinel: close-only, no payload */
+            in_dp->request_msg.metadata.session_id = meta->session_id;
+            __sync_synchronize();  /* Memory barrier - ensure sentinel visible before signal */
+
             inbound_ready_emit();  /* Signal Net1 to process queue */
 
             printf("%s:   [OK] Close notification queued for Net1 (session %u)\n",
@@ -3634,6 +3720,15 @@ void outbound_ready_handle(void)
 
                 if (success) {
                     scada_meta->close_notified = true;  /* Set dedup flag */
+
+                    /* v2.188-sentinel: Mark as close-only notification
+                     * Pool exhaustion means rejecting NEW connection, no request data exists yet
+                     * Set sentinel for defensive programming and consistency
+                     */
+                    dp->request_msg.payload_length = 0;  /* Sentinel: close-only, no payload */
+                    dp->request_msg.metadata.session_id = scada_meta->session_id;
+                    __sync_synchronize();  /* Memory barrier - ensure sentinel visible before signal */
+
                     inbound_ready_emit();               /* Signal Net1 */
 
                     printf("%s:    → Sent close notification to Net1 (session %u, err=ERR_ABRT) - Net1 will tcp_abort() PLC PCB\n",
@@ -4020,6 +4115,26 @@ void outbound_ready_handle(void)
     }
 
     BREADCRUMB(3011);  /* tcp_write succeeded */
+
+    /* v2.189: CRITICAL FIX - Mark response received BEFORE checking awaiting_response
+     * ═══════════════════════════════════════════════════════════════════════════
+     * Problem: Race condition between response arrival and SCADA close
+     *
+     * Scenario:
+     *   1. SCADA sends request
+     *   2. PLC response arrives, queued for processing
+     *   3. SCADA sends FIN (closes connection)
+     *   4. tcp_echo_recv(p=NULL) sets awaiting_response=true
+     *   5. outbound_ready_handle() runs NOW
+     *   6. tcp_write() succeeds (connection still open)
+     *   7. BUG: awaiting_response still true, connection kept alive!
+     *
+     * Fix: Set response_received=true immediately after tcp_write succeeds
+     *   - tcp_echo_recv checks response_received before setting awaiting_response
+     *   - If response_received=true: skip awaiting mode, proceed with normal close
+     * ═══════════════════════════════════════════════════════════════════════════
+     */
+    meta->response_received = true;  /* Response arrived and successfully written to TCP */
 
     /* v2.166: CRITICAL FIX - Defer tcp_output() to poll callback (fix reentrancy)
      * ═══════════════════════════════════════════════════════════════════════════

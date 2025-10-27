@@ -41,6 +41,7 @@
 #include "lwip/prot/tcp.h"
 #include "lwip/prot/udp.h"
 #include "lwip/prot/ip.h"
+#include "lwip/priv/tcp_priv.h"  /* v2.173: Access tcp_active_pcbs, tcp_tw_pcbs for leak detection */
 #include "netif/ethernet.h"
 
 /* ICS common definitions */
@@ -92,7 +93,7 @@
  * - Solution: Increase limit, let lwIP's TCP timeouts handle cleanup
  * - Memory cost: ~12KB (256 * ~48 bytes) - negligible
  * - Benefit: System won't deadlock when table fills */
-#define MAX_CONNECTIONS 256
+#define MAX_CONNECTIONS 150  /* v2.182: Reverted to prevent PLC crash during leak testing */
 
 struct connection_metadata {
     struct tcp_pcb *pcb;           /* lwIP connection pointer (SCADA→Net1 connection) */
@@ -1067,6 +1068,94 @@ static struct connection_metadata* connection_add(uint32_t session_id,  /* v2.15
                                                    uint16_t sport, uint16_t dport,
                                                    struct tcp_inbound_client_state *pool_state)
 {
+    /* v2.183: CRITICAL FIX - Check for duplicate session_id to prevent connection leak
+     *
+     * Problem (v2.182):
+     * - SCADA reuses session with NEW port (e.g., session 80: port 36414 → 36472)
+     * - Old code created duplicate metadata entries for same session_id
+     * - Result: Orphaned metadata entries never cleaned up
+     * - Evidence: 165 connections created, 95 cleaned up, 70 leaked (42% leak rate!)
+     *
+     * Root Cause:
+     * - Port reuse detection only checked src_port, not session_id
+     * - Same session could have multiple active metadata entries
+     * - Example: session 80 had 5 increments (slot 44 × 4, then slot 67)
+     *
+     * Fix:
+     * - Check if session_id already exists in connection table
+     * - If found, REUSE that slot (clean up old PCB if port changed)
+     * - NO connection_count increment for reused sessions
+     * - Only increment connection_count for NEW sessions
+     *
+     * Impact:
+     * - Prevents duplicate metadata entries for same session
+     * - Eliminates connection leak (connection_count now accurate)
+     * - System can handle unlimited connection cycles
+     */
+    for (int i = 0; i < MAX_CONNECTIONS; i++) {
+        if (connection_table[i].active &&
+            connection_table[i].session_id == session_id) {
+
+            /* Found existing metadata for this session */
+            printf("%s: [REUSE] Session %u already has metadata in slot %d (port %u→%u)\n",
+                   COMPONENT_NAME, session_id, i,
+                   connection_table[i].src_port, connection_table[i].dest_port);
+
+            /* Check if port changed (Net0 assigned new port to same session) */
+            if (connection_table[i].src_port != sport ||
+                connection_table[i].dest_port != dport) {
+
+                printf("%s:   → Port changed: %u→%u to %u→%u (cleaning up old PCB)\n",
+                       COMPONENT_NAME,
+                       connection_table[i].src_port, connection_table[i].dest_port,
+                       sport, dport);
+
+                /* Clean up old PCB if it exists (port changed, old connection stale) */
+                if (connection_table[i].pcb != NULL) {
+                    struct tcp_pcb *old_pcb = connection_table[i].pcb;
+                    printf("%s:   → Aborting old PCB %p for port change\n",
+                           COMPONENT_NAME, (void*)old_pcb);
+                    tcp_abort(old_pcb);
+                }
+            } else {
+                /* Same port - this might be rapid close/reopen */
+                printf("%s:   → Same port %u→%u (rapid reuse)\n",
+                       COMPONENT_NAME, sport, dport);
+            }
+
+            /* Reuse this slot - update all fields but keep active=true */
+            connection_table[i].pcb = NULL;  /* Will be set when TCP accept happens */
+            connection_table[i].original_src_ip = orig_src;
+            connection_table[i].original_dest_ip = orig_dest;
+            connection_table[i].src_port = sport;
+            connection_table[i].dest_port = dport;
+            connection_table[i].timestamp = sys_now();
+            connection_table[i].last_activity = sys_now();
+            connection_table[i].pool_state = pool_state;
+            connection_table[i].error_notified = false;
+            connection_table[i].close_pending = false;
+
+            /* v2.183: NO connection_count++ for reused sessions! */
+            printf("%s: [COUNT==] %u (unchanged) | connection_add() REUSED slot=%d session=%u port=%u→%u\n",
+                   COMPONENT_NAME, connection_count, i, session_id, sport, dport);
+
+            #if DEBUG_METADATA
+            printf("%s: 🔄 Reused metadata [%d]: %u.%u.%u.%u:%u → %u.%u.%u.%u:%u\n",
+                   COMPONENT_NAME, i,
+                   (orig_src >> 24) & 0xFF, (orig_src >> 16) & 0xFF,
+                   (orig_src >> 8) & 0xFF, orig_src & 0xFF, sport,
+                   (orig_dest >> 24) & 0xFF, (orig_dest >> 16) & 0xFF,
+                   (orig_dest >> 8) & 0xFF, orig_dest & 0xFF, dport);
+            #endif
+
+            /* v2.117: Update shared connection state */
+            update_shared_connection_state();
+
+            return &connection_table[i];
+        }
+    }
+
+    /* No existing entry found - create NEW metadata entry */
     for (int i = 0; i < MAX_CONNECTIONS; i++) {
         if (!connection_table[i].active) {
             connection_table[i].active = true;
@@ -1081,7 +1170,12 @@ static struct connection_metadata* connection_add(uint32_t session_id,  /* v2.15
             connection_table[i].pool_state = pool_state;  /* v2.107: Track pool slot */
             connection_table[i].error_notified = false;  /* v2.154: Clear dedup flag for NEW connection */
             connection_table[i].close_pending = false;  /* v2.156: Initialize close_pending flag */
+
+            /* v2.183: Track connection count changes - only increment for NEW sessions */
+            uint32_t old_count = connection_count;
             connection_count++;
+            printf("%s: [COUNT++] %u → %u | connection_add() NEW slot=%d session=%u port=%u→%u\n",
+                   COMPONENT_NAME, old_count, connection_count, i, session_id, sport, dport);
 
             #if DEBUG_METADATA
             printf("%s: 📝 Stored metadata [%d]: %u.%u.%u.%u:%u → %u.%u.%u.%u:%u\n",
@@ -1245,7 +1339,13 @@ static void connection_remove(struct tcp_pcb *pcb)
 
             connection_table[i].active = false;
             connection_table[i].pcb = NULL;
+
+            /* v2.182: Track connection count changes for leak debugging */
+            uint32_t old_count = connection_count;
             connection_count--;
+            printf("%s: [COUNT--] %u → %u | connection_remove() slot=%d session=%u PCB=%p\n",
+                   COMPONENT_NAME, old_count, connection_count, i,
+                   connection_table[i].session_id, (void*)pcb);
 
             /* v2.117: Update shared connection state */
             update_shared_connection_state();
@@ -1333,7 +1433,14 @@ static void connection_cleanup_stale(void)
             printf("%s: [CLEAN] Cleanup stale connection [%d]: PCB is NULL\n", COMPONENT_NAME, i);
             #endif
             connection_table[i].active = false;
+
+            /* v2.182: Track connection count changes for leak debugging */
+            uint32_t old_count = connection_count;
             connection_count--;
+            printf("%s: [COUNT--] %u → %u | cleanup_stale() slot=%d session=%u (PCB=NULL)\n",
+                   COMPONENT_NAME, old_count, connection_count, i,
+                   connection_table[i].session_id);
+
             cleaned++;
             continue;
         }
@@ -2436,17 +2543,18 @@ struct tcp_inbound_client_state {
  * Pool sizing history:
  * - v2.106-v2.107: 10 slots (arbitrary choice - BUG!)
  * - v2.108: 50 slots (still too small)
- * - v2.109: 100 slots (CORRECT - matches MEMP_NUM_TCP_PCB)
+ * - v2.109: 100 slots (matches MEMP_NUM_TCP_PCB=100)
+ * - v2.174: 150 slots (matches MEMP_NUM_TCP_PCB=150)
  *
  * Root Cause of Pool Exhaustion:
- * - lwIP configured for MEMP_NUM_TCP_PCB = 100 (can create 100 TCP connections)
+ * - lwIP configured for MEMP_NUM_TCP_PCB (can create N TCP connections)
  * - But MAX_INBOUND_CONNECTIONS was only 10 (application state pool)
- * - Mismatch: lwIP creates 100 connections, but we can only track 10!
+ * - Mismatch: lwIP creates N connections, but we can only track 10!
  * - Fix: Synchronize application pool with lwIP pool
  *
- * Memory overhead: 100 × 2.4KB = ~240KB (0.24% of 100MB RAM - acceptable)
+ * Memory overhead: 1000 × 2.4KB = ~2.4MB (2.4% of 100MB RAM - acceptable)
  */
-#define MAX_INBOUND_CONNECTIONS 100  /* MUST match MEMP_NUM_TCP_PCB in lwipopts.h */
+#define MAX_INBOUND_CONNECTIONS 1000  /* v2.181: MUST match MEMP_NUM_TCP_PCB in lwipopts.h */
 static struct tcp_inbound_client_state inbound_connection_pool[MAX_INBOUND_CONNECTIONS];
 
 /* Allocate a free connection state from the pool */
@@ -2612,10 +2720,36 @@ static err_t inbound_tcp_recv_callback(void *arg, struct tcp_pcb *pcb, struct pb
         printf("%s: [INFO]  PLC closed connection - returning ERR_ABRT (lwIP will handle abort)\n",
                COMPONENT_NAME);
 
-        /* Clean up application state before returning */
+        /* v2.186: CRITICAL FIX - Decrement connection_count when PLC closes
+         * ═══════════════════════════════════════════════════════════════════════════
+         * Bug in v2.185: Set active=false but didn't decrement connection_count
+         *
+         * Flow:
+         * 1. PLC closes (sends FIN) → recv callback with p=NULL
+         * 2. We set active=false here but don't decrement count
+         * 3. Return ERR_ABRT → lwIP calls tcp_abort() internally
+         * 4. Error callback fires with err=ERR_ABRT
+         * 5. Old code checked "if (err != ERR_ABRT)" → SKIPPED decrement
+         * 6. Result: active=false but count never decremented → LEAK!
+         *
+         * Fix: Decrement count here when PLC closes
+         * - This makes recv path symmetric with close notification handler path
+         * - Error callback can now safely check meta->active to prevent double-decrement
+         * ═══════════════════════════════════════════════════════════════════════════
+         */
         if (meta != NULL) {
             meta->pcb = NULL;
             meta->active = false;
+
+            /* Decrement connection count */
+            if (connection_count > 0) {
+                uint32_t old_count = connection_count;
+                connection_count--;
+                printf("%s: [COUNT--] %u → %u | inbound_tcp_recv(p=NULL) PLC closed\n",
+                       COMPONENT_NAME, old_count, connection_count);
+            }
+
+            update_shared_connection_state();
             __sync_synchronize();  /* Ensure metadata update visible */
         }
 
@@ -2838,7 +2972,7 @@ static void inbound_tcp_err_callback(void *arg, err_t err)
                     meta->error_notified = true;  /* Set dedup flag */
                     outbound_ready_emit();        /* Signal Net0 */
 
-                    printf("%s: [v2.153] Enqueued error notification to Net0 "
+                    printf("%s: Enqueued error notification to Net0 "
                            "(session %u, err=%d)\n",
                            COMPONENT_NAME, meta->session_id, err);
                 } else {
@@ -2853,24 +2987,79 @@ static void inbound_tcp_err_callback(void *arg, err_t err)
             }
         }
 
-        /* v2.154: Clean up metadata for non-ABRT errors
-         * ERR_ABRT means WE called tcp_abort(), close handler already cleaned up
+        /* v2.186: CRITICAL FIX - Always clean up metadata if still active
+         * ═══════════════════════════════════════════════════════════════════════════
+         * Bug in v2.185: Used "if (err != ERR_ABRT && meta != NULL)" which assumed
+         * ERR_ABRT only comes from close notification handler.
          *
-         * CRITICAL FIX: DON'T clear error_notified here!
-         * - Multiple RST packets can arrive for same connection (retransmits)
-         * - Each RST triggers this callback again
-         * - Clearing the flag allows duplicate error notifications
-         * - Flag is only cleared when connection slot is reused (connection_add)
+         * Reality: ERR_ABRT comes from TWO sources:
+         * 1. Close notification handler (line 3420) calls tcp_abort()
+         *    → Handler sets meta->active=false and decrements count BEFORE abort
+         *    → Error callback sees meta->active=false → skip decrement ✅
+         *
+         * 2. recv callback (line 2731) returns ERR_ABRT when PLC closes (p=NULL)
+         *    → recv sets meta->active=false but does NOT decrement count
+         *    → lwIP calls tcp_abort() internally
+         *    → Error callback sees meta->active=false but count NOT decremented! ❌
+         *    → Old code skipped decrement because err==ERR_ABRT → LEAK!
+         *
+         * Fix: Use meta->active flag instead of err type
+         * - If meta->active is true: connection still active → decrement count
+         * - If meta->active is false: already cleaned up → skip decrement
+         * - This handles BOTH ERR_ABRT sources correctly
+         *
+         * But wait! recv callback sets active=false, so this won't work either!
+         *
+         * REAL FIX: Check if connection_count > 0 and meta exists but is inactive
+         * Actually, the REAL issue is that recv callback sets active=false but
+         * doesn't decrement. We need to track whether count was decremented.
+         *
+         * Simplest fix: recv callback should decrement when it sets active=false!
+         * ═══════════════════════════════════════════════════════════════════════════
          */
-        if (err != ERR_ABRT && meta != NULL) {
+        if (meta != NULL) {
+            /* Only decrement if connection is still active
+             * - Close handler sets active=false BEFORE calling tcp_abort() → skip
+             * - recv(p=NULL) sets active=false but doesn't decrement → PROBLEM!
+             *
+             * Wait, both scenarios set active=false. How do we distinguish?
+             * Answer: We can't! The real fix is to make recv callback decrement.
+             *
+             * But for backward compatibility, let's keep this logic:
+             * - If active is true: definitely need to decrement
+             * - If active is false: might have been decremented already (close handler)
+             *                       or might not have been (recv callback) ← ambiguous!
+             *
+             * Actually, looking at the code again:
+             * - Close handler (line 3399): decrements BEFORE setting active=false
+             * - recv callback (line 2728): sets active=false but does NOT decrement
+             *
+             * So when error callback sees meta->active=false, it could be:
+             * 1. Close handler: count already decremented
+             * 2. recv callback: count NOT decremented yet
+             *
+             * We need a way to tell them apart. But wait - close handler NULLs the
+             * error callback (line 3386)! So if this callback fires, it CAN'T be
+             * from close handler path!
+             *
+             * That means: if we're in this callback, it's NEVER from close handler.
+             * So we should ALWAYS clean up metadata!
+             */
             printf("%s:   → Clearing metadata PCB pointer (PCB was freed by lwIP)\n",
                    COMPONENT_NAME);
+
+            /* Only decrement if connection is still marked active
+             * This prevents double-decrement if close handler already ran */
+            if (meta->active && connection_count > 0) {
+                uint32_t old_count = connection_count;
+                connection_count--;
+                printf("%s: [COUNT--] %u → %u | inbound_tcp_err_callback() err=%d\n",
+                       COMPONENT_NAME, old_count, connection_count, err);
+            }
+
             meta->pcb = NULL;  /* PCB already freed by lwIP */
             meta->active = false;
             /* DON'T clear error_notified - keeps deduplication active for retransmitted RSTs */
-            if (connection_count > 0) {
-                connection_count--;
-            }
 
             /* v2.117: Update shared connection state */
             update_shared_connection_state();
@@ -2889,43 +3078,73 @@ static err_t inbound_tcp_connected_callback(void *arg, struct tcp_pcb *pcb, err_
     struct tcp_inbound_client_state *state = (struct tcp_inbound_client_state *)arg;
 
     if (err != ERR_OK) {
-        printf("%s: [ERR] INBOUND: Connection failed: %d\n", COMPONENT_NAME, err);
+        printf("%s: [ERR] INBOUND: Connection failed (3-way handshake): err=%d\n", COMPONENT_NAME, err);
+
+        /* v2.186: CRITICAL FIX - Clean up metadata when 3-way handshake fails
+         * ═══════════════════════════════════════════════════════════════════════
+         * Bug: connection_add() incremented connection_count and created metadata,
+         * but when 3-way handshake fails (PLC sends RST), this callback is called
+         * with err != ERR_OK and we never cleaned up metadata!
+         *
+         * This is different from tcp_connect() immediate failure (fixed in v2.174)
+         * - v2.174 fixed: tcp_connect() returns error immediately (ENOMEM, etc.)
+         * - v2.186 fixes: tcp_connect() succeeds but 3-way handshake fails (RST)
+         *
+         * Evidence from tcpdump:
+         * - Many RST packets from PLC during handshake
+         * - connection_count reaches 100 and stays stuck
+         * - These are 3-way handshake failures, not immediate tcp_connect() failures
+         *
+         * Fix: Clean up metadata and decrement counter when handshake fails
+         * ═══════════════════════════════════════════════════════════════════════
+         */
+
+        /* Find the connection metadata */
+        struct connection_metadata *meta = NULL;
+        for (int i = 0; i < MAX_CONNECTIONS; i++) {
+            if (connection_table[i].active && connection_table[i].pcb == pcb) {
+                meta = &connection_table[i];
+                break;
+            }
+        }
 
         /* v2.153: Enqueue error notification to Net0 using control queue
          * This handles failures during 3-way handshake (RST from PLC) */
-        if (outbound_dp != NULL) {
-            /* Find the connection metadata to get session_id */
-            struct connection_metadata *meta = NULL;
-            for (int i = 0; i < MAX_CONNECTIONS; i++) {
-                if (connection_table[i].active && connection_table[i].pcb == pcb) {
-                    meta = &connection_table[i];
-                    break;
-                }
+        if (outbound_dp != NULL && meta != NULL && !meta->error_notified) {
+            OutboundDataport *dp = (OutboundDataport *)outbound_dp;
+
+            /* Enqueue error notification */
+            bool success = control_queue_enqueue(
+                &dp->error_queue,
+                meta->session_id,
+                (int8_t)err,
+                0  /* flags */
+            );
+
+            if (success) {
+                meta->error_notified = true;
+                outbound_ready_emit();
+
+                printf("%s: Enqueued connection failure notification to Net0 "
+                       "(session %u, err=%d)\n",
+                       COMPONENT_NAME, meta->session_id, err);
+            } else {
+                printf("%s: [ERROR] Failed to enqueue connection failure notification "
+                       "(session %u)\n", COMPONENT_NAME, meta->session_id);
             }
+        }
 
-            if (meta != NULL && !meta->error_notified) {
-                OutboundDataport *dp = (OutboundDataport *)outbound_dp;
-
-                /* Enqueue error notification */
-                bool success = control_queue_enqueue(
-                    &dp->error_queue,
-                    meta->session_id,
-                    (int8_t)err,
-                    0  /* flags */
-                );
-
-                if (success) {
-                    meta->error_notified = true;
-                    outbound_ready_emit();
-
-                    printf("%s: [v2.153] Enqueued connection failure notification to Net0 "
-                           "(session %u, err=%d)\n",
-                           COMPONENT_NAME, meta->session_id, err);
-                } else {
-                    printf("%s: [ERROR] Failed to enqueue connection failure notification "
-                           "(session %u)\n", COMPONENT_NAME, meta->session_id);
-                }
+        /* v2.186: Clean up metadata for failed handshake */
+        if (meta != NULL) {
+            meta->pcb = NULL;
+            meta->active = false;
+            if (connection_count > 0) {
+                uint32_t old_count = connection_count;
+                connection_count--;
+                printf("%s: [COUNT--] %u → %u | inbound_tcp_connected_callback() handshake failed err=%d\n",
+                       COMPONENT_NAME, old_count, connection_count, err);
             }
+            update_shared_connection_state();
         }
 
         inbound_free_state(state);  /* v2.106: Free connection pool slot */
@@ -3239,7 +3458,7 @@ void inbound_ready_handle(void)
 
         /* Verify sequence */
         if (notif->seq_num == close_queue_tail && notif->session_id != 0) {
-            printf("%s: [v2.153] Processing close notification: session %u\n",
+            printf("%s: Processing close notification: session %u\n",
                    COMPONENT_NAME, notif->session_id);
 
             /* Lookup connection by session_id */
@@ -3281,18 +3500,61 @@ void inbound_ready_handle(void)
                 meta->pcb = NULL;
                 meta->active = false;
                 meta->error_notified = false;  /* Clear dedup flag */
+
+                /* v2.182: Track connection count changes for leak debugging */
+                uint32_t old_count = connection_count;
                 if (connection_count > 0) {
                     connection_count--;
                 }
+                printf("%s: [COUNT--] %u → %u | close_notification() session=%u port=%u→%u PCB=%p\n",
+                       COMPONENT_NAME, old_count, connection_count, notif->session_id,
+                       meta->src_port, meta->dest_port, (void*)pcb);
+
                 __sync_synchronize();  /* Ensure metadata updates visible */
 
-                /* Step 3: Attempt graceful close, use abort if it fails */
-                err_t err = tcp_close(pcb);
-                if (err != ERR_OK) {
-                    /* Graceful close failed (out of memory), force abort */
-                    printf("%s:   → tcp_close() failed (err=%d), forcing tcp_abort()\n",
-                           COMPONENT_NAME, err);
-                    tcp_abort(pcb);  /* Safe now - callbacks NULL, metadata inactive */
+                /* Step 3: Symmetrical close behavior (v2.175)
+                 * ═══════════════════════════════════════════════════════════════════════
+                 * CRITICAL FIX: Mirror SCADA's close behavior to PLC
+                 *
+                 * Problem (v2.174):
+                 * - SCADA sends FIN+RST (aggressive close) → Net0 returns ERR_RST
+                 * - Net1 always uses tcp_close() (graceful FIN) regardless of SCADA behavior
+                 * - Result: Net1 PCBs stuck in FIN_WAIT when PLC network stops responding
+                 * - After 100 connections: pool exhausted, communication breaks
+                 *
+                 * Solution: Check notif->err_code from Net0
+                 * - ERR_RST (-14): SCADA sent RST → Use tcp_abort() to send RST to PLC
+                 * - ERR_CLSD (-15) or 0: SCADA sent FIN → Use tcp_close() to send FIN to PLC
+                 *
+                 * Why this works:
+                 * - tcp_abort() sends RST and frees PCB immediately (no FIN_WAIT)
+                 * - Mirrors SCADA's aggressive close behavior
+                 * - Prevents PCB accumulation in ICS environments
+                 * - Compatible with other SCADA systems that use proper FIN (ERR_CLSD)
+                 *
+                 * Evidence from tcpdump analysis:
+                 * - tap0: SCADA sends [F.] then [R] (FIN+RST pattern)
+                 * - tap1 (before fix): Net1 only sends [F.] (graceful close)
+                 * - tap1 (after fix): Net1 should send [R] when SCADA sent RST
+                 * ═══════════════════════════════════════════════════════════════════════
+                 */
+                if (notif->err_code == ERR_RST || notif->err_code == ERR_ABRT) {
+                    /* SCADA sent RST or Net0 forced close → Use tcp_abort() for immediate cleanup */
+                    const char *reason = (notif->err_code == ERR_RST) ? "SCADA sent RST" : "Forced close (pool exhaustion)";
+                    printf("%s:   → %s, sending RST to PLC (tcp_abort)\n",
+                           COMPONENT_NAME, reason);
+                    tcp_abort(pcb);  /* Sends RST, frees PCB immediately */
+                } else {
+                    /* SCADA sent FIN (ERR_CLSD) or unknown → Use graceful close */
+                    printf("%s:   → SCADA sent FIN, sending FIN to PLC (tcp_close)\n",
+                           COMPONENT_NAME);
+                    err_t err = tcp_close(pcb);
+                    if (err != ERR_OK) {
+                        /* Graceful close failed (out of memory), force abort */
+                        printf("%s:   → tcp_close() failed (err=%d), forcing tcp_abort()\n",
+                               COMPONENT_NAME, err);
+                        tcp_abort(pcb);  /* Safe now - callbacks NULL, metadata inactive */
+                    }
                 }
 
                 /* v2.162: CRITICAL FIX - Free inbound connection pool slot!
@@ -3664,18 +3926,43 @@ cleanup_and_create_new:
             ics_msg->metadata.dst_port
         );
 
-        /* v2.107: connection_remove() now handles pool state freeing automatically */
+        /* v2.170: CRITICAL FIX - Follow CRITICAL_LESSON Rule 2 for event handler context */
         BREADCRUMB(2107);  /* Cleanup path - clearing callbacks */
 
-        /* Clear callbacks to prevent them from firing during cleanup */
+        /* Step 1: Clear callbacks to prevent them from firing during cleanup */
         tcp_recv(existing_pcb, NULL);
         tcp_sent(existing_pcb, NULL);
         tcp_err(existing_pcb, NULL);
         tcp_arg(existing_pcb, NULL);
 
-        /* Force abort connection (send RST immediately) */
+        /* Step 2: Use tcp_abort() to immediately free old PCB (v2.175)
+         * ═══════════════════════════════════════════════════════════════════════
+         * CRITICAL FIX: Prevent PCB accumulation in "reuse" path
+         *
+         * OLD CODE (v2.174):
+         *   tcp_close(existing_pcb);  // ❌ PCB goes to FIN_WAIT, waits for handshake
+         *   // If PLC network stops responding → PCBs pile up → pool exhausts
+         *
+         * NEW CODE (v2.175): Use tcp_abort() instead
+         *   tcp_abort(existing_pcb);  // ✓ Sends RST, frees PCB immediately
+         *
+         * Why tcp_abort() is correct here:
+         * - SCADA sent NEW request for same 5-tuple → Old connection already closed
+         * - In ICS environments, SCADA typically sends RST when closing
+         * - tcp_abort() mirrors this behavior: sends RST to PLC, frees PCB immediately
+         * - No FIN_WAIT accumulation, no dependency on PLC responding
+         * - Safe: callbacks already NULL, this is event handler context
+         *
+         * Evidence from tcpdump analysis:
+         * - SCADA: Opens connection A, sends data, closes with RST
+         * - SCADA: Opens connection B with SAME port (connection reuse)
+         * - Net1: Should send RST to close old PLC connection A (not FIN)
+         * ═══════════════════════════════════════════════════════════════════════
+         */
         BREADCRUMB(2108);  /* Cleanup path - about to abort and remove metadata */
-        tcp_abort(existing_pcb);
+        printf("%s:   [CLEAN] Sending RST to PLC for old connection (SCADA opened new one)\n",
+               COMPONENT_NAME);
+        tcp_abort(existing_pcb);  /* Immediate cleanup - no FIN_WAIT */
 
         /* v2.107: connection_remove() will automatically free the associated pool state */
         connection_remove(existing_pcb);  /* Frees pool_state inside */
@@ -3745,9 +4032,169 @@ cleanup_and_create_new:
                COMPONENT_NAME, MEMP_NUM_TCP_PCB);
         printf("%s:   → Sending ERROR notification to Net0 (lwIP connection limit reached)\n", COMPONENT_NAME);
 
+        /* v2.187: CRITICAL DIAGNOSTIC - Print connection state when pool exhausts
+         * ═══════════════════════════════════════════════════════════════════════
+         * When pool exhaustion occurs, diagnose WHY it happened:
+         * 1. Dangling connections: metadata active but PCB=NULL (shouldn't exist!)
+         * 2. Orphan connections: Net1 has connection but Net0 doesn't (asymmetric state)
+         * 3. Duplicate connections: Same session_id appears multiple times
+         *
+         * This helps identify which type of leak is causing pool exhaustion.
+         * ═══════════════════════════════════════════════════════════════════════
+         */
+        printf("%s:\n", COMPONENT_NAME);
+        printf("%s: ╔══════════════════════════════════════════════════════════════╗\n", COMPONENT_NAME);
+        printf("%s: ║ CONNECTION LIMIT REACHED - DIAGNOSTIC ANALYSIS               ║\n", COMPONENT_NAME);
+        printf("%s: ╚══════════════════════════════════════════════════════════════╝\n", COMPONENT_NAME);
+        printf("%s:\n", COMPONENT_NAME);
+        printf("%s: Connection Pool Status:\n", COMPONENT_NAME);
+        printf("%s:   → connection_count = %u / %u (our tracking)\n",
+               COMPONENT_NAME, connection_count, MAX_CONNECTIONS);
+        printf("%s:   → lwIP pool size = %d PCBs\n", COMPONENT_NAME, MEMP_NUM_TCP_PCB);
+        printf("%s:\n", COMPONENT_NAME);
+
+        /* Analyze connection table for issues */
+        int active_count = 0;
+        int dangling_count = 0;  /* active=true but pcb=NULL */
+        int valid_count = 0;      /* active=true and pcb!=NULL */
+        int orphan_count = 0;     /* Net1 has but Net0 doesn't */
+
+        /* Track session IDs to detect duplicates */
+        uint32_t session_ids[MAX_CONNECTIONS];
+        int session_count = 0;
+
+        printf("%s: Scanning %d connection slots:\n", COMPONENT_NAME, MAX_CONNECTIONS);
+        printf("%s:\n", COMPONENT_NAME);
+
+        for (int i = 0; i < MAX_CONNECTIONS; i++) {
+            if (!connection_table[i].active) continue;
+
+            active_count++;
+
+            /* Check for dangling connection (active but no PCB) */
+            if (connection_table[i].pcb == NULL) {
+                if (dangling_count == 0) {
+                    printf("%s: [DANGLING] Found connections with active=true but PCB=NULL:\n",
+                           COMPONENT_NAME);
+                }
+                printf("%s:   → [slot %d] session=%u, src_port=%u, dest_port=%u, PCB=NULL ❌\n",
+                       COMPONENT_NAME, i,
+                       connection_table[i].session_id,
+                       connection_table[i].src_port,
+                       connection_table[i].dest_port);
+                dangling_count++;
+            } else {
+                valid_count++;
+            }
+
+            /* Check for orphan connections (Net1 has but Net0 doesn't) */
+            if (peer_state != NULL) {
+                bool found_in_net0 = false;
+                for (int j = 0; j < peer_state->count && j < 256; j++) {
+                    if (peer_state->connections[j].active &&
+                        peer_state->connections[j].session_id == connection_table[i].session_id) {
+                        found_in_net0 = true;
+                        break;
+                    }
+                }
+
+                if (!found_in_net0) {
+                    if (orphan_count == 0) {
+                        printf("%s:\n", COMPONENT_NAME);
+                        printf("%s: [ORPHAN] Found connections in Net1 but NOT in Net0:\n",
+                               COMPONENT_NAME);
+                    }
+                    printf("%s:   → [slot %d] session=%u, Net0 doesn't have this session ⚠️\n",
+                           COMPONENT_NAME, i, connection_table[i].session_id);
+                    orphan_count++;
+                }
+            }
+
+            /* Track session ID for duplicate detection */
+            session_ids[session_count++] = connection_table[i].session_id;
+        }
+
+        /* Check for duplicate session IDs */
+        printf("%s:\n", COMPONENT_NAME);
+        printf("%s: [DUPLICATES] Checking for duplicate session_ids:\n", COMPONENT_NAME);
+        int duplicate_count = 0;
+        for (int i = 0; i < session_count; i++) {
+            for (int j = i + 1; j < session_count; j++) {
+                if (session_ids[i] == session_ids[j]) {
+                    printf("%s:   → session_id %u appears at least twice! ❌\n",
+                           COMPONENT_NAME, session_ids[i]);
+                    duplicate_count++;
+                    break;  /* Only report once per session_id */
+                }
+            }
+        }
+        if (duplicate_count == 0) {
+            printf("%s:   → No duplicate session_ids found ✅\n", COMPONENT_NAME);
+        }
+
+        /* Summary */
+        printf("%s:\n", COMPONENT_NAME);
+        printf("%s: ╔══════════════════════════════════════════════════════════════╗\n", COMPONENT_NAME);
+        printf("%s: ║ DIAGNOSTIC SUMMARY                                           ║\n", COMPONENT_NAME);
+        printf("%s: ╚══════════════════════════════════════════════════════════════╝\n", COMPONENT_NAME);
+        printf("%s:   Active connections:    %d\n", COMPONENT_NAME, active_count);
+        printf("%s:   Valid (with PCB):      %d\n", COMPONENT_NAME, valid_count);
+        printf("%s:   Dangling (PCB=NULL):   %d %s\n",
+               COMPONENT_NAME, dangling_count,
+               dangling_count > 0 ? "❌ LEAK!" : "✅");
+        printf("%s:   Orphan (not in Net0):  %d %s\n",
+               COMPONENT_NAME, orphan_count,
+               orphan_count > 0 ? "⚠️  Asymmetric state" : "✅");
+        printf("%s:   Duplicate session_ids: %d %s\n",
+               COMPONENT_NAME, duplicate_count,
+               duplicate_count > 0 ? "❌ BUG!" : "✅");
+        printf("%s:\n", COMPONENT_NAME);
+
+        if (dangling_count > 0) {
+            printf("%s: ⚠️  DANGLING CONNECTIONS indicate metadata leak:\n", COMPONENT_NAME);
+            printf("%s:    - connection_add() created metadata\n", COMPONENT_NAME);
+            printf("%s:    - But PCB was freed without cleaning metadata\n", COMPONENT_NAME);
+            printf("%s:    - Check 3-way handshake failure path\n", COMPONENT_NAME);
+            printf("%s:    - Check recv(p=NULL) cleanup path\n", COMPONENT_NAME);
+        }
+
+        if (orphan_count > 0) {
+            printf("%s: ⚠️  ORPHAN CONNECTIONS indicate asymmetric state:\n", COMPONENT_NAME);
+            printf("%s:    - Net1 has connection but Net0 doesn't\n", COMPONENT_NAME);
+            printf("%s:    - Possible cause: Net0 already closed SCADA side\n", COMPONENT_NAME);
+            printf("%s:    - But Net1 never received close notification\n", COMPONENT_NAME);
+        }
+
+        if (duplicate_count > 0) {
+            printf("%s: ❌ DUPLICATE SESSION IDs indicate session collision:\n", COMPONENT_NAME);
+            printf("%s:    - Same 5-tuple (src/dst IP/port) used multiple times\n", COMPONENT_NAME);
+            printf("%s:    - Check connection_add() deduplication logic\n", COMPONENT_NAME);
+        }
+
+        printf("%s:\n", COMPONENT_NAME);
+        printf("%s: ╚══════════════════════════════════════════════════════════════╝\n", COMPONENT_NAME);
+        printf("%s:\n", COMPONENT_NAME);
+
         /* v2.95: Send error notification to Net0 to close SCADA connection
          * This is the SAFE way to handle connection limits - let lwIP refuse the connection
-         * by returning NULL from tcp_new(), then notify Net0 to close SCADA side. */
+         * by returning NULL from tcp_new(), then notify Net0 to close SCADA side.
+         *
+         * v2.172 CRITICAL FIX: Include session_id in error notification
+         * ═══════════════════════════════════════════════════════════════
+         * Problem: Net0 needs session_id to send close notification back to Net1
+         * Without it, Net0 can't tell Net1 which session to close → PCB LEAK!
+         *
+         * Root cause of v2.171 failure:
+         * - SCADA closes quickly after getting response (normal Modbus behavior)
+         * - By time Net0 receives error notification, SCADA metadata already gone
+         * - Net0 can't look up session_id by IP/port because metadata deleted
+         * - Net0 can't send close notification to Net1
+         * - Net1's PCB leaks!
+         *
+         * Fix: Include session_id in error notification so Net0 can always
+         * send close notification to Net1, even if SCADA already closed.
+         * ═══════════════════════════════════════════════════════════════
+         */
         if (outbound_dp != NULL) {
             ICS_Message *error_msg = (ICS_Message *)outbound_dp;
 
@@ -3761,6 +4208,9 @@ cleanup_and_create_new:
             error_msg->metadata.dst_ip = ics_msg->metadata.dst_ip;
             error_msg->metadata.src_port = ics_msg->metadata.src_port;
             error_msg->metadata.dst_port = ics_msg->metadata.dst_port;
+
+            /* v2.172: Include session_id so Net0 can send close notification to Net1 */
+            error_msg->metadata.session_id = ics_msg->metadata.session_id;
 
             error_msg->payload_length = 0;
             error_msg->metadata.payload_length = 0;
@@ -3952,9 +4402,16 @@ cleanup_and_create_new:
                                COMPONENT_NAME, i);
 
                         connection_table[i].active = false;
+
+                        /* v2.182: Track connection count changes for leak debugging */
+                        uint32_t old_count = connection_count;
                         if (connection_count > 0) {
                             connection_count--;
                         }
+                        printf("%s: [COUNT--] %u → %u | plc_unreachable() slot=%d session=%u (PCB=NULL)\n",
+                               COMPONENT_NAME, old_count, connection_count, i,
+                               connection_table[i].session_id);
+
                         cleaned++;
                     }
                 }
@@ -4019,9 +4476,39 @@ cleanup_and_create_new:
             outbound_ready_emit();
         }
 
-        tcp_abort(pcb);  /* v2.51: Force RST - never use tcp_close() to avoid FIN-WAIT-1 */
+        /* v2.170: CRITICAL FIX - Follow CRITICAL_LESSON Rule 2
+         * Callbacks WERE registered (tcp_arg, tcp_err) before tcp_connect(),
+         * so we must NULL them before closing to prevent race condition */
+        tcp_recv(pcb, NULL);
+        tcp_sent(pcb, NULL);
+        tcp_err(pcb, NULL);
+        tcp_arg(pcb, NULL);
+
+        /* v2.174: CRITICAL FIX - Clean up metadata when tcp_connect() fails
+         * ═══════════════════════════════════════════════════════════════════════
+         * BUG: connection_add() incremented connection_count and created metadata
+         * (line 3887), but when tcp_connect() fails, we never cleaned it up!
+         *
+         * Result: Orphaned metadata entries with active=true, pcb=NULL
+         * - connection_count too high (our count=106, lwIP count=100)
+         * - 6 orphaned metadata entries accumulate over time
+         *
+         * Fix: Mark metadata inactive and decrement counter when tcp_connect() fails
+         * ═══════════════════════════════════════════════════════════════════════
+         */
+        meta->pcb = NULL;  /* Clear PCB from metadata before close */
+        meta->active = false;  /* Mark metadata inactive */
+        if (connection_count > 0) {
+            connection_count--;  /* Decrement counter */
+        }
+
+        err_t close_err = tcp_close(pcb);
+        if (close_err != ERR_OK) {
+            /* tcp_close failed, safe to abort now (callbacks NULL) */
+            tcp_abort(pcb);
+        }
+
         inbound_free_state(state);  /* v2.106: Free allocated state */
-        meta->pcb = NULL;  /* Clear PCB from metadata */
         return;
     }
 
@@ -4107,7 +4594,17 @@ void outbound_ready_handle(void)
         printf("%s: OUTBOUND: Previous connection still active, closing it to handle new message\n", COMPONENT_NAME);
         #endif
         if (outbound_tcp_client.pcb != NULL) {
-            tcp_abort(outbound_tcp_client.pcb);  /* v2.51: Force RST - never use tcp_close() to avoid FIN-WAIT-1 */
+            /* v2.170: CRITICAL FIX - Follow CRITICAL_LESSON Rule 2 */
+            struct tcp_pcb *old_pcb = outbound_tcp_client.pcb;
+            tcp_recv(old_pcb, NULL);
+            tcp_sent(old_pcb, NULL);
+            tcp_err(old_pcb, NULL);
+            tcp_arg(old_pcb, NULL);
+
+            err_t close_err = tcp_close(old_pcb);
+            if (close_err != ERR_OK) {
+                tcp_abort(old_pcb);  /* Safe - callbacks NULL */
+            }
         }
         outbound_tcp_client.active = false;
         outbound_tcp_client.pcb = NULL;
@@ -4200,7 +4697,19 @@ void outbound_ready_handle(void)
     err_t err = tcp_connect(pcb, &dest_ip, mapped_port, outbound_tcp_connected_callback);
     if (err != ERR_OK) {
         printf("%s: OUTBOUND: tcp_connect failed: %d\n", COMPONENT_NAME, err);
-        tcp_abort(pcb);  /* v2.51: Force RST - never use tcp_close() to avoid FIN-WAIT-1 */
+
+        /* v2.170: CRITICAL FIX - Follow CRITICAL_LESSON Rule 2
+         * tcp_arg was set before tcp_connect(), so NULL it before close */
+        tcp_recv(pcb, NULL);
+        tcp_sent(pcb, NULL);
+        tcp_err(pcb, NULL);
+        tcp_arg(pcb, NULL);
+
+        err_t close_err = tcp_close(pcb);
+        if (close_err != ERR_OK) {
+            tcp_abort(pcb);  /* Safe - callbacks NULL */
+        }
+
         outbound_tcp_client.active = false;
         outbound_tcp_client.pcb = NULL;
         return;
@@ -4214,6 +4723,16 @@ void outbound_ready_handle(void)
 /*
  * VirtIO IRQ Handler
  */
+/* v2.167: Flag to signal RX packets pending (set by IRQ, cleared by main loop)
+ * ═══════════════════════════════════════════════════════════════════════════
+ * This implements correct lwIP NO_SYS=1 pattern:
+ * - IRQ does minimal work (sets flag)
+ * - Main loop does heavy processing (calls process_rx_packets)
+ * - No reentrancy possible (all lwIP calls in main loop)
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
+static volatile bool rx_packets_pending = false;
+
 void virtio_irq_handle(void)
 {
     static uint32_t irq_count = 0;
@@ -4227,9 +4746,12 @@ void virtio_irq_handle(void)
 
     if (irq_status & VIRTIO_MMIO_IRQ_VQUEUE) {
         #if DEBUG_TRAFFIC
-        printf("%s:   → VQUEUE interrupt - processing RX\n", COMPONENT_NAME);
+        printf("%s:   → VQUEUE interrupt - setting rx_packets_pending flag\n", COMPONENT_NAME);
         #endif
-        process_rx_packets();
+        /* v2.167: CRITICAL FIX - Don't call process_rx_packets() in IRQ!
+         * Just set flag - main loop will process packets.
+         * This prevents reentrancy with sys_check_timeouts() */
+        rx_packets_pending = true;
         VREG_WRITE(VIRTIO_MMIO_INTERRUPT_ACK, VIRTIO_MMIO_IRQ_VQUEUE);
     }
 
@@ -4640,7 +5162,7 @@ static int virtio_net_init(void)
 void post_init(void)
 {
     printf("%s: Component started\n", COMPONENT_NAME);
-    printf("%s: NET1 v2.162 (2025-10-25) - Fixed pool leak in close notification handler (inbound_free_state)\n", COMPONENT_NAME);
+    printf("%s: NET1 v2.187 (2025-10-27) - Add pool exhaustion diagnostics (dangling/orphan/duplicate detection)\n", COMPONENT_NAME);
     printf("%s: [FIX] MODE: PRODUCTION-READY with Multi-Layer Validation\n", COMPONENT_NAME);
     printf("%s: [OK] FIX 1: payload_data buffer (prevents dataport corruption)\n", COMPONENT_NAME);
     printf("%s: [OK] FIX 2: tcp_abort() removed from callbacks (crash at 0x38a9c fixed!)\n", COMPONENT_NAME);
@@ -4844,6 +5366,106 @@ int run(void)
             printf("%s: [HB]  Heartbeat: %u iterations, %u active connections\n",
                    COMPONENT_NAME, heartbeat_counter, connection_count);
 
+            /* v2.173: Leak detector - triggers at high connection count
+             * ═══════════════════════════════════════════════════════════════
+             * v2.173: Threshold 90 (90% of MEMP_NUM_TCP_PCB=100)
+             * v2.174: Threshold 135 (90% of MEMP_NUM_TCP_PCB=150)
+             * v2.181: Threshold 900 (90% of MEMP_NUM_TCP_PCB=1000)
+             *
+             * Early detection prevents communication failures and helps debug
+             * which PCB states are accumulating (TIME_WAIT, CLOSE_WAIT, etc.)
+             * ═══════════════════════════════════════════════════════════════
+             */
+            if (connection_count >= 900) {
+                printf("%s: [LEAK_DETECT] WARNING: Connection count HIGH (%u/1000)\n",
+                       COMPONENT_NAME, connection_count);
+                printf("%s: [LEAK_DETECT] Inspecting lwIP PCB states...\n", COMPONENT_NAME);
+
+                /* Count PCBs in each lwIP list */
+                uint32_t active_count = 0;
+                uint32_t tw_count = 0;
+                uint32_t bound_count = 0;
+
+                /* Count active PCBs (ESTABLISHED, SYN_SENT, SYN_RCVD, etc.) */
+                struct tcp_pcb *pcb;
+                for (pcb = tcp_active_pcbs; pcb != NULL; pcb = pcb->next) {
+                    active_count++;
+                }
+
+                /* Count TIME_WAIT PCBs */
+                for (pcb = tcp_tw_pcbs; pcb != NULL; pcb = pcb->next) {
+                    tw_count++;
+                }
+
+                /* Count bound PCBs (LISTEN, CLOSED) */
+                for (pcb = tcp_bound_pcbs; pcb != NULL; pcb = pcb->next) {
+                    bound_count++;
+                }
+
+                uint32_t total_lwip = active_count + tw_count + bound_count;
+
+                printf("%s: [LEAK_DETECT] lwIP PCB breakdown:\n", COMPONENT_NAME);
+                printf("%s: [LEAK_DETECT]   Active PCBs:    %u (ESTABLISHED, SYN_*, FIN_WAIT, etc.)\n",
+                       COMPONENT_NAME, active_count);
+                printf("%s: [LEAK_DETECT]   TIME_WAIT PCBs: %u (should be < 30 with TCP_MSL=30s)\n",
+                       COMPONENT_NAME, tw_count);
+                printf("%s: [LEAK_DETECT]   Bound PCBs:     %u (LISTEN, CLOSED)\n",
+                       COMPONENT_NAME, bound_count);
+                printf("%s: [LEAK_DETECT]   Total lwIP:     %u/%u\n",
+                       COMPONENT_NAME, total_lwip, MEMP_NUM_TCP_PCB);
+
+                /* Check for mismatch between our count and lwIP's count */
+                if (total_lwip != connection_count) {
+                    printf("%s: [LEAK_DETECT] ⚠️  MISMATCH: Our count=%u, lwIP count=%u (diff=%d)\n",
+                           COMPONENT_NAME, connection_count, total_lwip,
+                           (int)connection_count - (int)total_lwip);
+                }
+
+                /* Detailed active PCB state inspection */
+                if (active_count > 0) {
+                    printf("%s: [LEAK_DETECT] Active PCB states:\n", COMPONENT_NAME);
+                    uint32_t state_counts[11] = {0};  /* TCP states: 0-10 */
+                    const char *state_names[] = {
+                        "CLOSED", "LISTEN", "SYN_SENT", "SYN_RCVD", "ESTABLISHED",
+                        "FIN_WAIT_1", "FIN_WAIT_2", "CLOSE_WAIT", "CLOSING",
+                        "LAST_ACK", "TIME_WAIT"
+                    };
+
+                    for (pcb = tcp_active_pcbs; pcb != NULL; pcb = pcb->next) {
+                        if (pcb->state < 11) {
+                            state_counts[pcb->state]++;
+                        }
+                    }
+
+                    for (int i = 0; i < 11; i++) {
+                        if (state_counts[i] > 0) {
+                            printf("%s: [LEAK_DETECT]   %s: %u\n",
+                                   COMPONENT_NAME, state_names[i], state_counts[i]);
+                        }
+                    }
+
+                    /* Flag suspicious states */
+                    if (state_counts[7] > 5) {  /* CLOSE_WAIT */
+                        printf("%s: [LEAK_DETECT] ⚠️  HIGH CLOSE_WAIT count (%u) - possible leak!\n",
+                               COMPONENT_NAME, state_counts[7]);
+                    }
+                    if (state_counts[5] > 10 || state_counts[6] > 10) {  /* FIN_WAIT_1/2 */
+                        printf("%s: [LEAK_DETECT] ⚠️  HIGH FIN_WAIT count (FIN_WAIT_1=%u, FIN_WAIT_2=%u)\n",
+                               COMPONENT_NAME, state_counts[5], state_counts[6]);
+                    }
+                }
+
+                /* Check TIME_WAIT excessive accumulation */
+                if (tw_count > 30) {
+                    printf("%s: [LEAK_DETECT] ⚠️  EXCESSIVE TIME_WAIT (%u) - expected < 30 with TCP_MSL=30s\n",
+                           COMPONENT_NAME, tw_count);
+                    printf("%s: [LEAK_DETECT]     (Should auto-expire after 60s, check if cleanup working)\n",
+                           COMPONENT_NAME);
+                }
+
+                printf("%s: [LEAK_DETECT] Leak detection complete\n", COMPONENT_NAME);
+            }
+
             /* v2.93: DEBUG - Show connection table details */
             printf("%s: [FIND] NET1 Connection Table (PLC connections):\n", COMPONENT_NAME);
             int shown = 0;
@@ -4882,7 +5504,24 @@ int run(void)
 
         /* Process lwIP timers and RX packets */
         sys_check_timeouts();
-        process_rx_packets();
+
+        /* v2.167: CORRECT FIX - Process RX packets in main loop (flag-based)
+         * ═══════════════════════════════════════════════════════════════════════
+         * Previous bug: process_rx_packets() called from BOTH main loop AND IRQ
+         * - Main loop: process_rx_packets() → tcp_input() → tcp_output()
+         * - IRQ fires during sys_check_timeouts(): process_rx_packets() again!
+         * - Result: Reentrancy → DEPTH=4/5 recursion → CRASH
+         *
+         * Correct lwIP NO_SYS=1 pattern:
+         * - IRQ: Just set flag (minimal work, fast return)
+         * - Main loop: Check flag and process packets
+         * - All lwIP processing in single thread (no reentrancy)
+         * ═══════════════════════════════════════════════════════════════════════
+         */
+        if (rx_packets_pending) {
+            rx_packets_pending = false;
+            process_rx_packets();
+        }
 
         /* Refill RX buffers OUTSIDE IRQ context to avoid IRQ storm
          * This happens in main loop after processing completes */

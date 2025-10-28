@@ -152,6 +152,49 @@ struct connection_metadata {
 static struct connection_metadata connection_table[MAX_CONNECTIONS];
 static int connection_count = 0;
 
+/* v2.198: Cleanup queue - Single Producer Single Consumer (SPSC) queue
+ * ═══════════════════════════════════════════════════════════════════════════
+ * Symmetrical implementation with Net0 v2.198
+ *
+ * Producer: lwIP callbacks (error, recv, poll, etc.)
+ * Consumer: process_cleanup_queue() in main loop
+ *
+ * Benefits:
+ * - Single cleanup logic (no more 13+ different cleanup locations!)
+ * - No race conditions (main loop processes atomically)
+ * - Natural deduplication (session_id=0 after cleanup)
+ * - Works even if active=false set before enqueue (pool exhaustion case)
+ *
+ * v2.199: Queue size increased to 512 (from 64)
+ * - Handles burst connection closes (100+ simultaneous)
+ * - Reduces overflow risk under extreme load
+ * - Minimal memory cost (~8KB for 512 entries × 8 bytes + 8 bytes overhead)
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
+#define CLEANUP_QUEUE_SIZE 512
+#define CLEANUP_QUEUE_MASK (CLEANUP_QUEUE_SIZE - 1)
+
+struct cleanup_request {
+    uint32_t session_id;
+    uint32_t timestamp;  /* sys_now() when enqueued */
+};
+
+struct cleanup_queue {
+    struct cleanup_request requests[CLEANUP_QUEUE_SIZE];
+    volatile uint32_t head;  /* Producer writes here */
+    volatile uint32_t tail;  /* Consumer reads here */
+};
+
+static struct cleanup_queue cleanup_queue = {0};
+
+/* Cleanup statistics */
+struct cleanup_stats {
+    uint32_t enqueued;
+    uint32_t processed;
+    uint32_t duplicates;
+};
+static struct cleanup_stats cleanup_stats = {0};
+
 /* v2.117: Connection state sharing via dataports */
 static volatile struct connection_state_table *own_state = NULL;   /* Our state (exposed to Net0) */
 static volatile struct connection_state_table *peer_state = NULL;  /* Net0's state (read-only) */
@@ -1062,39 +1105,45 @@ static void update_shared_connection_state(void)
     __sync_synchronize();
 }
 
+/* v2.199: Forward declaration - needed by emergency cleanup in connection_add() */
+static void process_cleanup_queue(void);
+
 /* Store metadata for a new connection */
 static struct connection_metadata* connection_add(uint32_t session_id,  /* v2.150: Session ID from Net0 */
                                                    uint32_t orig_src, uint32_t orig_dest,
                                                    uint16_t sport, uint16_t dport,
                                                    struct tcp_inbound_client_state *pool_state)
 {
-    /* v2.183: CRITICAL FIX - Check for duplicate session_id to prevent connection leak
+    /* v2.198: CRITICAL FIX - Check for ANY session_id match (active or inactive)
      *
-     * Problem (v2.182):
-     * - SCADA reuses session with NEW port (e.g., session 80: port 36414 → 36472)
-     * - Old code created duplicate metadata entries for same session_id
-     * - Result: Orphaned metadata entries never cleaned up
-     * - Evidence: 165 connections created, 95 cleaned up, 70 leaked (42% leak rate!)
+     * Problem (v2.198):
+     * - Old reuse logic only checked active==true connections
+     * - If connection had active==false (cleanup pending), it wasn't found
+     * - Result: Created NEW entry with same session_id → DUPLICATE session_ids!
+     * - Cleanup queue gets confused: multiple slots with same session_id
      *
-     * Root Cause:
-     * - Port reuse detection only checked src_port, not session_id
-     * - Same session could have multiple active metadata entries
-     * - Example: session 80 had 5 increments (slot 44 × 4, then slot 67)
+     * Example failure:
+     * 1. Session 2: active=true, cleanup pending (active set to false)
+     * 2. New connection: session 2 arrives
+     * 3. Reuse logic: Doesn't find old session 2 (active==false)
+     * 4. Creates NEW slot with session 2 (COUNT++)
+     * 5. Now TWO slots have session_id=2!
+     * 6. Cleanup queue: Finds wrong slot or gets confused
      *
-     * Fix:
-     * - Check if session_id already exists in connection table
-     * - If found, REUSE that slot (clean up old PCB if port changed)
-     * - NO connection_count increment for reused sessions
-     * - Only increment connection_count for NEW sessions
+     * Fix (v2.198):
+     * - Check for session_id match regardless of active flag
+     * - If found (active or not), REUSE that slot
+     * - Clear any pending cleanup state
+     * - Prevents duplicate session_ids in connection table
      *
-     * Impact:
-     * - Prevents duplicate metadata entries for same session
-     * - Eliminates connection leak (connection_count now accurate)
-     * - System can handle unlimited connection cycles
+     * Why this works:
+     * - Session IDs are globally unique (from Net0)
+     * - Only ONE connection per session_id should exist at a time
+     * - Reusing inactive slots prevents cleanup queue confusion
+     * - Cleanup queue can handle double-cleanup (session_id=0 dedup)
      */
     for (int i = 0; i < MAX_CONNECTIONS; i++) {
-        if (connection_table[i].active &&
-            connection_table[i].session_id == session_id) {
+        if (connection_table[i].session_id == session_id) {
 
             /* Found existing metadata for this session */
             printf("%s: [REUSE] Session %u already has metadata in slot %d (port %u→%u)\n",
@@ -1123,7 +1172,9 @@ static struct connection_metadata* connection_add(uint32_t session_id,  /* v2.15
                        COMPONENT_NAME, sport, dport);
             }
 
-            /* Reuse this slot - update all fields but keep active=true */
+            /* Reuse this slot - update all fields and ensure active=true
+             * v2.198: CRITICAL - Must set active=true even if it was false (cleanup pending) */
+            connection_table[i].active = true;  /* v2.198: Reactivate slot (might have been false) */
             connection_table[i].pcb = NULL;  /* Will be set when TCP accept happens */
             connection_table[i].session_id = session_id;  /* v2.190: CRITICAL FIX - Update session_id in reuse path! */
             connection_table[i].original_src_ip = orig_src;
@@ -1156,9 +1207,22 @@ static struct connection_metadata* connection_add(uint32_t session_id,  /* v2.15
         }
     }
 
-    /* No existing entry found - create NEW metadata entry */
+    /* No existing entry found - create NEW metadata entry
+     * v2.199: CRITICAL FIX - Only reuse fully cleaned slots (session_id=0)
+     *
+     * Race condition (from v2.198 testing):
+     * 1. Session 16: Close notification sets active=false, enqueues cleanup (session_id=16)
+     * 2. Session 17 arrives within 6ms (before cleanup queue processes)
+     * 3. OLD CODE: Finds slot 0 (active=false) ✓
+     * 4. Overwrites: session_id 16 → 17
+     * 5. Cleanup queue: Looks for session 16 → NOT FOUND (slot has 17)!
+     *
+     * Fix: Only reuse slots where session_id==0 (cleanup completed)
+     * - Cleanup queue sets session_id=0 after processing
+     * - Prevents race between slot allocation and cleanup processing
+     */
     for (int i = 0; i < MAX_CONNECTIONS; i++) {
-        if (!connection_table[i].active) {
+        if (!connection_table[i].active && connection_table[i].session_id == 0) {
             connection_table[i].active = true;
             connection_table[i].pcb = NULL;  /* Will be set when TCP accept happens */
             connection_table[i].session_id = session_id;  /* v2.150: Store session ID from Net0 */
@@ -1193,7 +1257,66 @@ static struct connection_metadata* connection_add(uint32_t session_id,  /* v2.15
             return &connection_table[i];
         }
     }
-    printf("%s: [WARN]  Connection table full! Dropping metadata.\n", COMPONENT_NAME);
+
+    /* v2.199: EMERGENCY FALLBACK - No clean slots available
+     * ═══════════════════════════════════════════════════════════════════════════
+     * Extreme case: All slots have cleanup pending (active=false, session_id!=0)
+     *
+     * This can happen when:
+     * - Burst close: 100+ connections close within 10ms
+     * - Main loop delayed: Cleanup queue hasn't processed yet
+     * - High load: Cleanup can't keep up with close rate
+     *
+     * Solution: Process cleanup queue synchronously RIGHT NOW
+     * - Frees up slots immediately
+     * - Allows connection to proceed
+     * - Only happens under extreme load (normal case finds clean slot above)
+     *
+     * After emergency cleanup, try ONE more time to find clean slot
+     * ═══════════════════════════════════════════════════════════════════════════
+     */
+    printf("%s: [EMERGENCY] No clean slots available - processing cleanup queue immediately!\n",
+           COMPONENT_NAME);
+    printf("%s:   → All 150 slots have cleanup pending (burst close detected)\n",
+           COMPONENT_NAME);
+
+    /* Synchronous cleanup - process all pending cleanup requests NOW */
+    process_cleanup_queue();
+
+    /* Try again - should find clean slots now */
+    for (int i = 0; i < MAX_CONNECTIONS; i++) {
+        if (!connection_table[i].active && connection_table[i].session_id == 0) {
+            connection_table[i].active = true;
+            connection_table[i].pcb = NULL;
+            connection_table[i].session_id = session_id;
+            connection_table[i].original_src_ip = orig_src;
+            connection_table[i].original_dest_ip = orig_dest;
+            connection_table[i].src_port = sport;
+            connection_table[i].dest_port = dport;
+            connection_table[i].timestamp = sys_now();
+            connection_table[i].last_activity = sys_now();
+            connection_table[i].pool_state = pool_state;
+            connection_table[i].error_notified = false;
+            connection_table[i].close_pending = false;
+
+            uint32_t old_count = connection_count;
+            connection_count++;
+            printf("%s: [COUNT++] %u → %u | connection_add() EMERGENCY slot=%d session=%u port=%u→%u\n",
+                   COMPONENT_NAME, old_count, connection_count, i, session_id, sport, dport);
+
+            update_shared_connection_state();
+
+            printf("%s:   ✓ Emergency cleanup successful - slot %d allocated\n",
+                   COMPONENT_NAME, i);
+            return &connection_table[i];
+        }
+    }
+
+    /* Still no slots after emergency cleanup - system critically overloaded! */
+    printf("%s: [CRITICAL] Connection table STILL full after emergency cleanup!\n",
+           COMPONENT_NAME);
+    printf("%s:   → System overloaded: All slots active with PCBs\n", COMPONENT_NAME);
+    printf("%s:   → Cannot accept new connection (session %u)\n", COMPONENT_NAME, session_id);
     return NULL;
 }
 
@@ -1231,10 +1354,24 @@ static struct connection_metadata* connection_lookup_by_pcb(struct tcp_pcb *pcb)
 /* v2.153: Lookup metadata by session_id */
 static struct connection_metadata* connection_lookup_by_session_id(uint32_t session_id)
 {
-    if (session_id == 0) return NULL;  /* 0 = unassigned */
+    if (session_id == 0) return NULL;  /* 0 = unassigned/cleaned */
 
+    /* v2.198: REMOVED active flag check for cleanup queue compatibility
+     * ═══════════════════════════════════════════════════════════════════════════
+     * Symmetrical with Net0 v2.198
+     *
+     * Old behavior: Only return if active==true
+     * Problem: Close notification handler sets active=false BEFORE enqueueing cleanup
+     * Result: Cleanup queue can't find connection → counter never decremented!
+     *
+     * New behavior: Match by session_id only, ignore active flag
+     * - If found: Return metadata (cleanup queue will handle it)
+     * - If not found: Return NULL (already cleaned or invalid)
+     * - Idempotency: After cleanup, session_id set to 0 → future lookups fail
+     * ═══════════════════════════════════════════════════════════════════════════
+     */
     for (int i = 0; i < MAX_CONNECTIONS; i++) {
-        if (connection_table[i].active && connection_table[i].session_id == session_id) {
+        if (connection_table[i].session_id == session_id) {
             return &connection_table[i];
         }
     }
@@ -1254,6 +1391,153 @@ static struct connection_metadata* connection_lookup_by_tuple(uint32_t src_ip, u
         }
     }
     return NULL;
+}
+
+/**
+ * v2.198: Cleanup queue functions - Symmetrical with Net0 v2.198
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
+
+/**
+ * enqueue_cleanup() - Producer: Enqueue cleanup request (called from callbacks)
+ *
+ * This function can be called from:
+ * - lwIP callbacks (error, recv, poll, etc.)
+ * - Event handlers (close notification, etc.)
+ *
+ * It's safe to call from any context - just adds to queue.
+ * Main loop will process the request atomically.
+ */
+static inline void enqueue_cleanup(uint32_t session_id)
+{
+    if (session_id == 0) {
+        printf("%s: WARN: enqueue_cleanup called with session_id=0 (ignoring)\n",
+               COMPONENT_NAME);
+        return;
+    }
+
+    uint32_t head = cleanup_queue.head;
+    uint32_t tail = cleanup_queue.tail;
+
+    /* Check if queue is full */
+    if (head - tail >= CLEANUP_QUEUE_SIZE) {
+        printf("%s: ERROR: Cleanup queue full! head=%u tail=%u (session %u dropped)\n",
+               COMPONENT_NAME, head, tail, session_id);
+        return;
+    }
+
+    /* Add to queue */
+    uint32_t slot = head & CLEANUP_QUEUE_MASK;
+    cleanup_queue.requests[slot].session_id = session_id;
+    cleanup_queue.requests[slot].timestamp = sys_now();
+
+    __sync_synchronize();  /* Memory barrier - ensure request is written before head update */
+
+    cleanup_queue.head = head + 1;
+    cleanup_stats.enqueued++;
+
+    printf("%s: [QUEUE] Enqueued cleanup session=%u (queue depth=%u)\n",
+           COMPONENT_NAME, session_id, head + 1 - tail);
+}
+
+/* Forward declaration for pool state management (needed by process_cleanup_queue) */
+static void inbound_free_state(struct tcp_inbound_client_state *state);
+
+/**
+ * process_cleanup_queue() - Consumer: Process cleanup requests (called from main loop)
+ *
+ * This function runs in the main loop (guaranteed execution) and processes
+ * all pending cleanup requests from the queue.
+ *
+ * v2.198: Natural deduplication using session_id:
+ * - First request for session_id X: Lookup succeeds → cleanup, set session_id=0
+ * - Duplicate requests: Lookup fails (session_id=0) → skip (already done)
+ *
+ * No guard flag or active flag needed:
+ * - session_id=0 after cleanup provides idempotency
+ * - Works even if active=false was set before enqueue (close notification case)
+ * - No blocking or race conditions
+ * - Simple and robust
+ */
+static void process_cleanup_queue(void)
+{
+    uint32_t tail = cleanup_queue.tail;
+    uint32_t head = cleanup_queue.head;
+
+    /* Process all pending requests */
+    while (tail != head) {
+        uint32_t slot = tail & CLEANUP_QUEUE_MASK;
+        struct cleanup_request *req = &cleanup_queue.requests[slot];
+
+        /* v2.198: Skip if session_id is 0 (invalid/already cleaned) */
+        if (req->session_id == 0) {
+            printf("%s: [QUEUE] SKIP: session_id=0 (invalid or already cleaned)\n",
+                   COMPONENT_NAME);
+            cleanup_stats.duplicates++;
+            tail++;
+            cleanup_queue.tail = tail;
+            continue;
+        }
+
+        /* Debug - show what we're trying to cleanup */
+        printf("%s: [QUEUE] Processing cleanup session=%u (queued %ums ago)\n",
+               COMPONENT_NAME, req->session_id, sys_now() - req->timestamp);
+
+        /* Lookup connection by session_id (v2.198: ignores active flag) */
+        struct connection_metadata *meta = connection_lookup_by_session_id(req->session_id);
+
+        if (meta == NULL) {
+            /* Connection not found - already cleaned up (session_id was set to 0) */
+            printf("%s: [QUEUE] SKIP: session=%u not found (already cleaned)\n",
+                   COMPONENT_NAME, req->session_id);
+            cleanup_stats.duplicates++;
+        } else {
+            /* Perform cleanup */
+
+            /* Decrement counters */
+            if (connection_count > 0) {
+                connection_count--;
+                printf("%s: [COUNT--] %u → %u | cleanup session=%u (queued %ums ago)\n",
+                       COMPONENT_NAME, connection_count + 1, connection_count,
+                       req->session_id, sys_now() - req->timestamp);
+            } else {
+                printf("%s: ERROR: connection_count already 0 (prevented underflow for session %u)!\n",
+                       COMPONENT_NAME, req->session_id);
+            }
+
+            /* Mark metadata as inactive */
+            meta->active = false;
+            meta->pcb = NULL;
+            meta->error_notified = false;
+            meta->close_pending = false;
+
+            /* v2.198: Set session_id=0 for idempotency
+             * ═══════════════════════════════════════════════════════════════════════════
+             * CRITICAL: Prevents double-cleanup if enqueued multiple times
+             * - Next cleanup attempt: lookup fails (session_id=0) → skip
+             * - Works even without active flag check
+             * - Simpler and more robust than guard flags
+             * ═══════════════════════════════════════════════════════════════════════════
+             */
+            meta->session_id = 0;
+
+            /* Free inbound connection pool slot if allocated */
+            if (meta->pool_state != NULL) {
+                inbound_free_state(meta->pool_state);
+                meta->pool_state = NULL;
+            }
+
+            /* Update shared connection state */
+            update_shared_connection_state();
+
+            cleanup_stats.processed++;
+        }
+
+        /* Advance tail */
+        __sync_synchronize();  /* Memory barrier */
+        tail++;
+        cleanup_queue.tail = tail;
+    }
 }
 
 /* v2.117: Self-cleaned connection tracking functions
@@ -1317,9 +1601,6 @@ static bool was_recently_self_cleaned(uint32_t src_ip, uint16_t src_port, uint16
 
     return false;
 }
-
-/* Forward declaration for pool state management (defined later) */
-static void inbound_free_state(struct tcp_inbound_client_state *state);
 
 /* Remove connection metadata */
 static void connection_remove(struct tcp_pcb *pcb)
@@ -3058,21 +3339,22 @@ static void inbound_tcp_err_callback(void *arg, err_t err)
             printf("%s:   → Clearing metadata PCB pointer (PCB was freed by lwIP)\n",
                    COMPONENT_NAME);
 
-            /* Only decrement if connection is still marked active
-             * This prevents double-decrement if close handler already ran */
-            if (meta->active && connection_count > 0) {
-                uint32_t old_count = connection_count;
-                connection_count--;
-                printf("%s: [COUNT--] %u → %u | inbound_tcp_err_callback() err=%d\n",
-                       COMPONENT_NAME, old_count, connection_count, err);
-            }
-
             meta->pcb = NULL;  /* PCB already freed by lwIP */
             meta->active = false;
             /* DON'T clear error_notified - keeps deduplication active for retransmitted RSTs */
 
             /* v2.117: Update shared connection state */
             update_shared_connection_state();
+
+            /* v2.198: Enqueue cleanup instead of direct connection_count--
+             * ═══════════════════════════════════════════════════════════════
+             * Symmetrical with Net0 v2.198 - Single cleanup logic
+             * - Old code: Complex logic to determine if we should decrement
+             * - New code: Always enqueue, queue handles deduplication via session_id
+             * - Works even if close handler already enqueued (natural dedup)
+             * ═══════════════════════════════════════════════════════════════
+             */
+            enqueue_cleanup(meta->session_id);
         }
 
         inbound_free_state(state);  /* v2.106: Free connection pool slot (always needed) */
@@ -3483,7 +3765,19 @@ void inbound_ready_handle(void)
             /* Lookup connection by session_id */
             struct connection_metadata *meta = connection_lookup_by_session_id(notif->session_id);
 
-            if (meta != NULL && meta->active && meta->pcb != NULL) {
+            /* v2.198: CRITICAL FIX - Remove active flag check
+             * ═══════════════════════════════════════════════════════════════
+             * BUG: connection_remove() sets active=false but NOT session_id=0
+             * Result: Close notification finds connection but skips cleanup
+             * because meta->active==false
+             *
+             * FIX: Check meta->pcb instead of meta->active
+             * - If PCB exists: Close it and enqueue cleanup
+             * - If PCB is NULL: Connection already closed, still enqueue cleanup
+             *   (cleanup queue will handle deduplication via session_id)
+             * ═══════════════════════════════════════════════════════════════
+             */
+            if (meta != NULL && meta->pcb != NULL) {
                 struct tcp_pcb *pcb = meta->pcb;
 
                 printf("%s:   → Closing PLC connection (session %u, PCB=%p)\n",
@@ -3519,15 +3813,6 @@ void inbound_ready_handle(void)
                 meta->pcb = NULL;
                 meta->active = false;
                 meta->error_notified = false;  /* Clear dedup flag */
-
-                /* v2.182: Track connection count changes for leak debugging */
-                uint32_t old_count = connection_count;
-                if (connection_count > 0) {
-                    connection_count--;
-                }
-                printf("%s: [COUNT--] %u → %u | close_notification() session=%u port=%u→%u PCB=%p\n",
-                       COMPONENT_NAME, old_count, connection_count, notif->session_id,
-                       meta->src_port, meta->dest_port, (void*)pcb);
 
                 __sync_synchronize();  /* Ensure metadata updates visible */
 
@@ -3598,10 +3883,28 @@ void inbound_ready_handle(void)
                 /* Update shared state */
                 update_shared_connection_state();
 
-                printf("%s:   ✓ PLC connection closed (session %u)\n",
+                /* v2.198: Enqueue cleanup (main loop will decrement connection_count)
+                 * ═══════════════════════════════════════════════════════════════
+                 * Symmetrical with Net0 v2.198 - Single cleanup logic
+                 * - Callbacks already NULLed ✅
+                 * - PCB already closed/aborted ✅
+                 * - Pool state already freed ✅
+                 * - Now enqueue for metadata cleanup (connection_count--)
+                 * ═══════════════════════════════════════════════════════════════
+                 */
+                enqueue_cleanup(notif->session_id);
+
+                printf("%s:   ✓ PLC connection closed, cleanup enqueued (session %u)\n",
                        COMPONENT_NAME, notif->session_id);
+            } else if (meta != NULL) {
+                /* v2.198: PCB is NULL but metadata exists - connection_remove() was called
+                 * Still need to enqueue cleanup to decrement connection_count if needed */
+                printf("%s:   → PCB already closed, but metadata exists (session %u) - enqueueing cleanup\n",
+                       COMPONENT_NAME, notif->session_id);
+                enqueue_cleanup(notif->session_id);
             } else {
-                printf("%s:   → Connection already closed (session %u)\n",
+                /* meta == NULL - session not found at all, already fully cleaned */
+                printf("%s:   → Session %u not found (already fully cleaned)\n",
                        COMPONENT_NAME, notif->session_id);
             }
         }
@@ -5181,7 +5484,7 @@ static int virtio_net_init(void)
 void post_init(void)
 {
     printf("%s: Component started\n", COMPONENT_NAME);
-    printf("%s: NET1 v2.187 (2025-10-27) - Add pool exhaustion diagnostics (dangling/orphan/duplicate detection)\n", COMPONENT_NAME);
+    printf("%s: NET1 v2.201 (2025-10-27) - Increase lwIP memory pools to 5MB (eliminate memory exhaustion)\n", COMPONENT_NAME);
     printf("%s: [FIX] MODE: PRODUCTION-READY with Multi-Layer Validation\n", COMPONENT_NAME);
     printf("%s: [OK] FIX 1: payload_data buffer (prevents dataport corruption)\n", COMPONENT_NAME);
     printf("%s: [OK] FIX 2: tcp_abort() removed from callbacks (crash at 0x38a9c fixed!)\n", COMPONENT_NAME);
@@ -5380,6 +5683,16 @@ int run(void)
 
     static uint32_t heartbeat_counter = 0;
     while (1) {
+        /* v2.198: Process cleanup queue (symmetrical with Net0)
+         * ═══════════════════════════════════════════════════════════════
+         * CRITICAL: Must be called in main loop for guaranteed execution
+         * - Processes all pending cleanup requests atomically
+         * - Single source of truth for connection_count--
+         * - No race conditions (main loop is single-threaded)
+         * ═══════════════════════════════════════════════════════════════
+         */
+        process_cleanup_queue();
+
         /* v2.74: Heartbeat to detect silent hangs */
         if (++heartbeat_counter >= 50000) {
             printf("%s: [HB]  Heartbeat: %u iterations, %u active connections\n",

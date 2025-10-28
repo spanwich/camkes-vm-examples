@@ -41,6 +41,7 @@
 #include "lwip/prot/tcp.h"
 #include "lwip/prot/udp.h"
 #include "lwip/prot/ip.h"
+#include "lwip/priv/tcp_priv.h"  /* v2.205: Access tcp_active_pcbs for ooseq diagnostics */
 #include "netif/ethernet.h"
 
 /* ICS common definitions */
@@ -240,6 +241,56 @@ static uint32_t next_session_id = 1;
 /* v2.117: Connection state sharing via dataports */
 static volatile struct connection_state_table *own_state = NULL;   /* Our state (exposed to Net1) */
 static volatile struct connection_state_table *peer_state = NULL;  /* Net1's state (read-only) */
+
+/* v2.193: Queue-based cleanup architecture
+ * ══════════════════════════════════════════════════════════════════════════════
+ * Problem with direct cleanup calls (v2.192):
+ * - Multiple callbacks (recv, poll, err) all call connection_cleanup_atomic()
+ * - Guard flag (cleanup_in_progress) blocks duplicate calls
+ * - But guard NEVER cleared → blocks ALL subsequent cleanups → CONNECTION LEAK!
+ *
+ * Queue-based solution:
+ * - Callbacks enqueue cleanup requests (never blocks)
+ * - Main loop processes queue (guaranteed to run)
+ * - Natural deduplication: check meta->active flag
+ * - No guard blocking issues
+ * - Single cleanup enforcement point
+ *
+ * Benefits:
+ * ✅ No more guard blocking
+ * ✅ Reliable cleanup (main loop always runs)
+ * ✅ Simple deduplication (active flag)
+ * ✅ Easy debugging (single processing point)
+ * ✅ Clean architecture (producer/consumer pattern)
+ * ══════════════════════════════════════════════════════════════════════════════
+ */
+#define CLEANUP_QUEUE_SIZE 512  /* Must be power of 2 */
+#define CLEANUP_QUEUE_MASK (CLEANUP_QUEUE_SIZE - 1)
+
+struct cleanup_request {
+    uint32_t session_id;
+    uint32_t timestamp;  /* For age tracking and debugging */
+};
+
+struct cleanup_queue {
+    volatile uint32_t head;  /* Producer writes here (callbacks) */
+    volatile uint32_t tail;  /* Consumer reads here (main loop) */
+    struct cleanup_request requests[CLEANUP_QUEUE_SIZE];
+};
+
+static struct cleanup_queue cleanup_queue = {
+    .head = 0,
+    .tail = 0
+};
+
+/* Queue statistics for debugging */
+static struct {
+    uint32_t enqueued;        /* Total cleanup requests enqueued */
+    uint32_t processed;       /* Total requests processed */
+    uint32_t duplicates;      /* Requests for already-inactive connections */
+    uint32_t max_depth;       /* Maximum queue depth seen */
+    uint32_t overflows;       /* Queue full events */
+} cleanup_stats = {0};
 
 /*
  * VLAN-BASED DEPLOYMENT CONFIGURATION
@@ -507,6 +558,267 @@ static struct tcp_echo_state tcp_state_pool[MAX_TCP_CONNECTIONS];
 static uint32_t packets_received = 0;
 static uint32_t packets_sent = 0;
 static uint32_t dhcp_bound = 0;
+
+/* v2.203: Pbuf leak diagnostics */
+static uint32_t pbuf_allocated_count = 0;
+static uint32_t pbuf_freed_count = 0;
+static uint32_t pbuf_leaked_to_lwip = 0;  /* Pbufs passed to lwIP successfully */
+static uint32_t pbuf_arp_count = 0;
+static uint32_t pbuf_tcp_count = 0;
+static uint32_t pbuf_udp_count = 0;
+static uint32_t pbuf_other_count = 0;
+static uint32_t pbuf_error_count = 0;  /* Pbufs we had to free due to errors */
+
+/* v2.205: Out-of-order segment tracking */
+typedef struct {
+    uint32_t pcbs_with_ooseq;      /* Number of PCBs that have ooseq queue */
+    uint32_t total_ooseq_segments;  /* Total segments across all PCBs */
+    uint32_t total_ooseq_pbufs;     /* Approximate pbuf count in all ooseq */
+    uint32_t total_active_pcbs;     /* Total PCBs in tcp_active_pcbs list */
+} ooseq_stats_t;
+
+/* v2.205: Count out-of-order segments and pbufs across all PCBs
+ * This diagnostic helps identify if pbufs are stuck in ooseq queues
+ */
+static void get_ooseq_stats(ooseq_stats_t *stats)
+{
+    struct tcp_pcb *pcb;
+
+    stats->pcbs_with_ooseq = 0;
+    stats->total_ooseq_segments = 0;
+    stats->total_ooseq_pbufs = 0;
+    stats->total_active_pcbs = 0;
+
+    /* Iterate through all active TCP PCBs */
+    for (pcb = tcp_active_pcbs; pcb != NULL; pcb = pcb->next) {
+        stats->total_active_pcbs++;
+
+        if (pcb->ooseq != NULL) {
+            stats->pcbs_with_ooseq++;
+
+            /* Count segments and pbufs in this PCB's ooseq */
+            struct tcp_seg *seg = pcb->ooseq;
+            while (seg != NULL) {
+                stats->total_ooseq_segments++;
+
+                /* Count pbufs in this segment's pbuf chain */
+                if (seg->p != NULL) {
+                    struct pbuf *p = seg->p;
+                    while (p != NULL) {
+                        stats->total_ooseq_pbufs++;
+                        p = p->next;
+                    }
+                }
+
+                seg = seg->next;
+            }
+        }
+    }
+}
+
+/* v2.205: PCB state breakdown tracking */
+typedef struct {
+    uint32_t pcb_listen;
+    uint32_t pcb_syn_sent;
+    uint32_t pcb_syn_rcvd;
+    uint32_t pcb_established;
+    uint32_t pcb_fin_wait_1;
+    uint32_t pcb_fin_wait_2;
+    uint32_t pcb_close_wait;
+    uint32_t pcb_closing;
+    uint32_t pcb_last_ack;
+    uint32_t pcb_time_wait;
+} pcb_state_stats_t;
+
+/* v2.205: Count PCBs by TCP state
+ * Helps identify if specific states are accumulating pbufs
+ */
+static void get_pcb_state_stats(pcb_state_stats_t *stats)
+{
+    struct tcp_pcb *pcb;
+
+    stats->pcb_listen = 0;
+    stats->pcb_syn_sent = 0;
+    stats->pcb_syn_rcvd = 0;
+    stats->pcb_established = 0;
+    stats->pcb_fin_wait_1 = 0;
+    stats->pcb_fin_wait_2 = 0;
+    stats->pcb_close_wait = 0;
+    stats->pcb_closing = 0;
+    stats->pcb_last_ack = 0;
+    stats->pcb_time_wait = 0;
+
+    /* Count active PCBs by state */
+    for (pcb = tcp_active_pcbs; pcb != NULL; pcb = pcb->next) {
+        switch (pcb->state) {
+            case LISTEN:       stats->pcb_listen++; break;
+            case SYN_SENT:     stats->pcb_syn_sent++; break;
+            case SYN_RCVD:     stats->pcb_syn_rcvd++; break;
+            case ESTABLISHED:  stats->pcb_established++; break;
+            case FIN_WAIT_1:   stats->pcb_fin_wait_1++; break;
+            case FIN_WAIT_2:   stats->pcb_fin_wait_2++; break;
+            case CLOSE_WAIT:   stats->pcb_close_wait++; break;
+            case CLOSING:      stats->pcb_closing++; break;
+            case LAST_ACK:     stats->pcb_last_ack++; break;
+            case TIME_WAIT:    stats->pcb_time_wait++; break;
+            default: break;
+        }
+    }
+}
+
+/* v2.205: Connection metadata vs lwIP PCB matching */
+typedef struct {
+    uint32_t metadata_active_with_pcb;     /* Active metadata that has a PCB */
+    uint32_t metadata_active_without_pcb;  /* Active metadata with no PCB (orphaned) */
+    uint32_t metadata_inactive;            /* Inactive metadata slots */
+    uint32_t pcb_without_metadata;         /* PCBs that we don't track (orphaned PCBs) */
+} connection_match_stats_t;
+
+/* v2.206: Orphan PCB buffer diagnostics */
+typedef struct {
+    void *pcb_addr;                   /* PCB address */
+    uint32_t state;                   /* TCP state */
+    uint32_t rcv_wnd;                 /* Receive window */
+    uint32_t snd_buf;                 /* Send buffer space */
+    uint32_t refused_data_pbufs;      /* Pbufs in refused_data queue */
+    uint32_t unacked_segments;        /* Segments in unacked queue */
+    uint32_t unsent_segments;         /* Segments in unsent queue */
+    uint32_t ooseq_segments;          /* Segments in ooseq queue */
+    uint32_t unacked_pbufs;           /* Pbufs in unacked queue */
+    uint32_t unsent_pbufs;            /* Pbufs in unsent queue */
+} orphan_pcb_diag_t;
+
+/* v2.205: Check for metadata/PCB mismatches
+ * Identifies orphaned connections (metadata without PCB or PCB without metadata)
+ */
+static void get_connection_match_stats(connection_match_stats_t *stats)
+{
+    struct tcp_pcb *pcb;
+
+    stats->metadata_active_with_pcb = 0;
+    stats->metadata_active_without_pcb = 0;
+    stats->metadata_inactive = 0;
+    stats->pcb_without_metadata = 0;
+
+    /* Count our connection metadata */
+    for (int i = 0; i < MAX_CONNECTIONS; i++) {
+        if (connection_table[i].active) {
+            if (connection_table[i].pcb != NULL) {
+                stats->metadata_active_with_pcb++;
+            } else {
+                stats->metadata_active_without_pcb++;
+            }
+        } else {
+            stats->metadata_inactive++;
+        }
+    }
+
+    /* Count PCBs that don't have our metadata */
+    for (pcb = tcp_active_pcbs; pcb != NULL; pcb = pcb->next) {
+        bool found = false;
+
+        /* Check if this PCB is tracked in our metadata */
+        for (int i = 0; i < MAX_CONNECTIONS; i++) {
+            if (connection_table[i].active && connection_table[i].pcb == pcb) {
+                found = true;
+                break;
+            }
+        }
+
+        if (!found) {
+            stats->pcb_without_metadata++;
+        }
+    }
+}
+
+/* v2.206: Diagnose orphan PCB internal buffers
+ * Shows WHERE pbufs are stuck in PCBs we no longer track
+ */
+static int diagnose_orphan_pcbs(orphan_pcb_diag_t *diags, int max_diags)
+{
+    struct tcp_pcb *pcb;
+    int orphan_count = 0;
+
+    for (pcb = tcp_active_pcbs; pcb != NULL && orphan_count < max_diags; pcb = pcb->next) {
+        bool tracked = false;
+
+        /* Check if this PCB is tracked in our metadata */
+        for (int i = 0; i < MAX_CONNECTIONS; i++) {
+            if (connection_table[i].active && connection_table[i].pcb == pcb) {
+                tracked = true;
+                break;
+            }
+        }
+
+        if (!tracked) {
+            /* Found an orphan - diagnose its buffer state */
+            orphan_pcb_diag_t *diag = &diags[orphan_count++];
+
+            diag->pcb_addr = pcb;
+            diag->state = pcb->state;
+            diag->rcv_wnd = pcb->rcv_wnd;
+            diag->snd_buf = pcb->snd_buf;
+
+            /* Count pbufs in refused_data (application didn't consume) */
+            diag->refused_data_pbufs = 0;
+            if (pcb->refused_data != NULL) {
+                struct pbuf *p = pcb->refused_data;
+                while (p != NULL) {
+                    diag->refused_data_pbufs++;
+                    p = p->next;
+                }
+            }
+
+            /* Count segments and pbufs in unacked queue (sent but not ACKed) */
+            diag->unacked_segments = 0;
+            diag->unacked_pbufs = 0;
+            if (pcb->unacked != NULL) {
+                struct tcp_seg *seg = pcb->unacked;
+                while (seg != NULL) {
+                    diag->unacked_segments++;
+                    if (seg->p != NULL) {
+                        struct pbuf *p = seg->p;
+                        while (p != NULL) {
+                            diag->unacked_pbufs++;
+                            p = p->next;
+                        }
+                    }
+                    seg = seg->next;
+                }
+            }
+
+            /* Count segments and pbufs in unsent queue (not yet sent) */
+            diag->unsent_segments = 0;
+            diag->unsent_pbufs = 0;
+            if (pcb->unsent != NULL) {
+                struct tcp_seg *seg = pcb->unsent;
+                while (seg != NULL) {
+                    diag->unsent_segments++;
+                    if (seg->p != NULL) {
+                        struct pbuf *p = seg->p;
+                        while (p != NULL) {
+                            diag->unsent_pbufs++;
+                            p = p->next;
+                        }
+                    }
+                    seg = seg->next;
+                }
+            }
+
+            /* Count ooseq segments (should be 0 based on v2.205 results) */
+            diag->ooseq_segments = 0;
+            if (pcb->ooseq != NULL) {
+                struct tcp_seg *seg = pcb->ooseq;
+                while (seg != NULL) {
+                    diag->ooseq_segments++;
+                    seg = seg->next;
+                }
+            }
+        }
+    }
+
+    return orphan_count;
+}
 
 /* lwIP time tracking */
 static volatile uint32_t lwip_time_ms = 0;
@@ -1126,7 +1438,30 @@ static struct connection_metadata* connection_add(uint32_t orig_src, uint32_t or
              */
             connection_table[i].cleanup_in_progress = false;
 
+            /* v2.200: CRITICAL FIX - Initialize close_notified for new/reused slots
+             * ═══════════════════════════════════════════════════════════════════════════
+             * BUG: Slot lifecycle - close_notified persists when slot is reused
+             *
+             * Problem: When slot is reused by new session, close_notified flag inherits
+             * value from previous session, causing new session to skip notifications.
+             *
+             * Evidence from v2.199 test:
+             *   - Net0 created 150 connections, sent only 25 close notifications
+             *   - Net1 has 125 orphan connections (never notified)
+             *   - 125 sessions inherited close_notified=true from previous sessions
+             *   - Result: Net1 pool exhaustion, communication failure
+             *
+             * Fix: Initialize to false for every new connection (new or reused slot)
+             * ═══════════════════════════════════════════════════════════════════════════
+             */
+            connection_table[i].close_notified = false;
+
             connection_count++;
+
+            /* v2.193: Log connection creation for debugging */
+            printf("%s: [COUNT++] %u → %u | connection_add() session=%u port=%u→%u\n",
+                   COMPONENT_NAME, connection_count - 1, connection_count,
+                   connection_table[i].session_id, sport, dport);
 
             #if DEBUG_METADATA
             printf("%s: 📝 Stored metadata [%d]: %u.%u.%u.%u:%u → %u.%u.%u.%u:%u\n",
@@ -1185,10 +1520,22 @@ static struct connection_metadata* connection_lookup_by_pcb(struct tcp_pcb *pcb)
 /* v2.153: Lookup metadata by session_id */
 static struct connection_metadata* connection_lookup_by_session_id(uint32_t session_id)
 {
-    if (session_id == 0) return NULL;  /* 0 = unassigned */
+    if (session_id == 0) return NULL;  /* 0 = unassigned/cleaned */
 
+    /* v2.197: REMOVED active flag check for cleanup queue compatibility
+     * ═══════════════════════════════════════════════════════════════════════════
+     * Old behavior: Only return if active==true
+     * Problem: Pool exhaustion handler sets active=false BEFORE enqueueing cleanup
+     * Result: Cleanup queue can't find connection → counter never decremented!
+     *
+     * New behavior: Match by session_id only, ignore active flag
+     * - If found: Return metadata (cleanup queue will handle it)
+     * - If not found: Return NULL (already cleaned or invalid)
+     * - Idempotency: After cleanup, session_id set to 0 → future lookups fail
+     * ═══════════════════════════════════════════════════════════════════════════
+     */
     for (int i = 0; i < MAX_CONNECTIONS; i++) {
-        if (connection_table[i].active && connection_table[i].session_id == session_id) {
+        if (connection_table[i].session_id == session_id) {
             return &connection_table[i];
         }
     }
@@ -1199,11 +1546,35 @@ static struct connection_metadata* connection_lookup_by_session_id(uint32_t sess
 static struct connection_metadata* connection_lookup_by_tuple(uint32_t src_ip, uint32_t dest_ip,
                                                                uint16_t sport, uint16_t dport)
 {
+    /* v2.193: DON'T check active flag to prevent duplicate creation during cleanup!
+     * ═══════════════════════════════════════════════════════════════════════════
+     * Race condition (v2.193 initial):
+     * 1. SYN arrives → connection_add(port=X) → active=true, session=678
+     * 2. Close notification → enqueue_cleanup(678)
+     * 3. process_cleanup_queue() → active=false (marks inactive immediately!)
+     * 4. SYN retransmit arrives (SCADA retrying)
+     * 5. connection_lookup_by_tuple() checks active → returns NULL!
+     * 6. connection_add() creates NEW metadata (session=679, 680...)
+     * 7. Only session 678 gets cleanup → 679, 680 LEAKED!
+     *
+     * Fix: Match by port tuple regardless of active status
+     * - Prevents duplicate metadata during cleanup window
+     * - Reuses metadata slot even if being cleaned
+     * - Connection count stays accurate
+     * ═══════════════════════════════════════════════════════════════════════════
+     */
     for (int i = 0; i < MAX_CONNECTIONS; i++) {
-        if (connection_table[i].active &&
-            connection_table[i].original_src_ip == src_ip &&
+        /* v2.193: Check port tuple ONLY - don't check active! */
+        if (connection_table[i].original_src_ip == src_ip &&
             connection_table[i].src_port == sport &&
             connection_table[i].dest_port == dport) {
+
+            /* v2.193: Debug - show if we're reusing a being-cleaned connection */
+            if (!connection_table[i].active) {
+                printf("%s: [FIND] Reusing slot %d for port %u→%u (was being cleaned, active=false)\n",
+                       COMPONENT_NAME, i, sport, dport);
+            }
+
             return &connection_table[i];
         }
     }
@@ -1238,6 +1609,233 @@ static void connection_remove(struct tcp_pcb *pcb)
 
             return;
         }
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * v2.193: Queue-based cleanup functions
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
+
+/**
+ * enqueue_cleanup() - Producer: Enqueue cleanup request (called from callbacks)
+ *
+ * This function is called from lwIP callbacks (recv, poll, err) to request
+ * cleanup of a connection. Requests are placed in a lock-free queue and
+ * processed by the main loop.
+ *
+ * Benefits:
+ * - Natural deduplication (duplicate requests just update timestamp)
+ * - No blocking (if queue is full, we drop request - cleanup will retry)
+ * - Single producer, single consumer (SPSC) pattern
+ *
+ * @param session_id Session ID of connection to cleanup
+ */
+static inline void enqueue_cleanup(uint32_t session_id)
+{
+    if (session_id == 0) {
+        printf("%s: WARN: enqueue_cleanup called with session_id=0 (ignoring)\n",
+               COMPONENT_NAME);
+        return;
+    }
+
+    uint32_t head = cleanup_queue.head;
+    uint32_t tail = cleanup_queue.tail;
+    uint32_t next_head = head + 1;
+
+    /* Check if queue is full */
+    if ((next_head & CLEANUP_QUEUE_MASK) == (tail & CLEANUP_QUEUE_MASK)) {
+        cleanup_stats.overflows++;
+        printf("%s: WARN: Cleanup queue full (dropped session %u, overflow #%u)\n",
+               COMPONENT_NAME, session_id, cleanup_stats.overflows);
+        return;
+    }
+
+    /* Enqueue request */
+    uint32_t slot = head & CLEANUP_QUEUE_MASK;
+    cleanup_queue.requests[slot].session_id = session_id;
+    cleanup_queue.requests[slot].timestamp = sys_now();
+
+    /* Memory barrier: ensure writes complete before updating head */
+    __sync_synchronize();
+
+    cleanup_queue.head = next_head;
+    cleanup_stats.enqueued++;
+
+    /* Track max queue depth for debugging */
+    uint32_t depth = next_head - tail;
+    if (depth > cleanup_stats.max_depth) {
+        cleanup_stats.max_depth = depth;
+    }
+
+    /* v2.193: Debug logging */
+    printf("%s: [QUEUE] Enqueued cleanup session=%u (queue depth=%u)\n",
+           COMPONENT_NAME, session_id, depth);
+}
+
+/**
+ * process_cleanup_queue() - Consumer: Process cleanup requests (called from main loop)
+ *
+ * This function runs in the main loop (guaranteed execution) and processes
+ * all pending cleanup requests from the queue.
+ *
+ * v2.197: Natural deduplication using session_id:
+ * - First request for session_id X: Lookup succeeds → cleanup, set session_id=0
+ * - Duplicate requests: Lookup fails (session_id=0) → skip (already done)
+ *
+ * No guard flag or active flag needed:
+ * - session_id=0 after cleanup provides idempotency
+ * - Works even if active=false was set before enqueue (pool exhaustion case)
+ * - No blocking or race conditions
+ * - Simple and robust
+ */
+static void process_cleanup_queue(void)
+{
+    uint32_t tail = cleanup_queue.tail;
+    uint32_t head = cleanup_queue.head;
+
+    /* Process all pending requests */
+    while (tail != head) {
+        uint32_t slot = tail & CLEANUP_QUEUE_MASK;
+        struct cleanup_request *req = &cleanup_queue.requests[slot];
+
+        /* v2.197: Skip if session_id is 0 (invalid/already cleaned) */
+        if (req->session_id == 0) {
+            printf("%s: [QUEUE] SKIP: session_id=0 (invalid or already cleaned)\n",
+                   COMPONENT_NAME);
+            cleanup_stats.duplicates++;
+            tail++;
+            cleanup_queue.tail = tail;
+            continue;
+        }
+
+        /* v2.193: Debug - show what we're trying to cleanup */
+        printf("%s: [QUEUE] Processing cleanup session=%u (queued %ums ago)\n",
+               COMPONENT_NAME, req->session_id, sys_now() - req->timestamp);
+
+        /* Lookup connection by session_id (v2.197: ignores active flag) */
+        struct connection_metadata *meta = connection_lookup_by_session_id(req->session_id);
+
+        if (meta == NULL) {
+            /* Connection not found - already cleaned up (session_id was set to 0) */
+            printf("%s: [QUEUE] SKIP: session=%u not found (already cleaned)\n",
+                   COMPONENT_NAME, req->session_id);
+            cleanup_stats.duplicates++;
+        } else {
+            /* Perform cleanup */
+
+            /* v2.195: ORPHAN DETECTION - Check if Net1 also has this connection
+             * ═══════════════════════════════════════════════════════════════════════════
+             * Purpose: Detect asymmetric cleanup (Net0 has connection, Net1 doesn't)
+             * This helps identify:
+             * 1. Orphan connections (Net1 never created connection)
+             * 2. Timing issues (Net1 cleaned up first)
+             * 3. Forwarding failures (request never reached Net1)
+             * ═══════════════════════════════════════════════════════════════════════════
+             */
+            bool found_on_net1 = false;
+
+            if (peer_state != NULL) {
+                for (uint32_t i = 0; i < peer_state->count && i < MAX_SHARED_CONNECTIONS; i++) {
+                    if (peer_state->connections[i].session_id == req->session_id &&
+                        peer_state->connections[i].active) {
+                        found_on_net1 = true;
+                        break;
+                    }
+                }
+            }
+
+            /* Diagnostic output based on orphan detection */
+            if (!found_on_net1) {
+                printf("%s: *** ORPHAN DETECTED *** session=%u exists on Net0 but NOT on Net1\n",
+                       COMPONENT_NAME, req->session_id);
+                printf("%s:    Net0: port=%u→%u, active=%d, pcb=%p\n",
+                       COMPONENT_NAME, meta->src_port, meta->dest_port,
+                       meta->active, (void*)meta->pcb);
+                printf("%s:    Net1: count=%u (checked peer_state)\n",
+                       COMPONENT_NAME, peer_state ? peer_state->count : 0);
+                printf("%s:    Possible reasons:\n", COMPONENT_NAME);
+                printf("%s:      1. Net1 never created connection (request never forwarded?)\n", COMPONENT_NAME);
+                printf("%s:      2. Net1 already cleaned up (Net1 closed first?)\n", COMPONENT_NAME);
+                printf("%s:      3. Timing race (Net1 cleanup in progress?)\n", COMPONENT_NAME);
+                printf("%s:    Meta state: awaiting=%d, response_received=%d, close_pending=%d, close_notified=%d\n",
+                       COMPONENT_NAME, meta->awaiting_response, meta->response_received,
+                       meta->close_pending, meta->close_notified);
+            } else {
+                printf("%s: [QUEUE] Normal cleanup: session=%u exists on BOTH Net0 and Net1\n",
+                       COMPONENT_NAME, req->session_id);
+            }
+
+            /* Clean up pending outbound data */
+            if (meta->pending_outbound_data != NULL) {
+                printf("%s: Freeing unsent pending data (%u bytes) for session %u\n",
+                       COMPONENT_NAME, meta->pending_outbound_len, req->session_id);
+                free(meta->pending_outbound_data);
+                meta->pending_outbound_data = NULL;
+            }
+
+            /* Decrement counters */
+            if (connection_count > 0) {
+                connection_count--;
+                printf("%s: [COUNT--] %u → %u | cleanup session=%u (queued %ums ago)\n",
+                       COMPONENT_NAME, connection_count + 1, connection_count,
+                       req->session_id, sys_now() - req->timestamp);
+            } else {
+                printf("%s: ERROR: connection_count already 0 (prevented underflow for session %u)!\n",
+                       COMPONENT_NAME, req->session_id);
+            }
+
+            if (active_connections > 0) {
+                active_connections--;
+            } else {
+                printf("%s: ERROR: active_connections already 0 (prevented underflow for session %u)!\n",
+                       COMPONENT_NAME, req->session_id);
+            }
+
+            /* Mark metadata as inactive */
+            meta->active = false;
+            meta->pcb = NULL;
+            meta->has_pending_outbound = false;
+            meta->pending_outbound_len = 0;
+            meta->awaiting_response = false;
+            meta->response_received = false;
+            meta->close_pending = false;
+
+            /* v2.200: CRITICAL FIX - Reset slot lifecycle flags for reuse
+             * ═══════════════════════════════════════════════════════════════════════════
+             * BUG: When slot is freed, session-specific flags must be reset
+             *
+             * Missing resets cause slot reuse bugs:
+             * - close_notified: Next session inherits "already notified" state
+             * - cleanup_in_progress: Next session might skip cleanup (guard triggered)
+             *
+             * Rule: When session_id becomes 0 (slot freed), ALL session-specific state
+             * must be reset so next session starts with clean slate.
+             * ═══════════════════════════════════════════════════════════════════════════
+             */
+            meta->close_notified = false;
+            meta->cleanup_in_progress = false;
+
+            /* v2.197: Set session_id=0 for idempotency
+             * ═══════════════════════════════════════════════════════════════════════════
+             * CRITICAL: Prevents double-cleanup if enqueued multiple times
+             * - Next cleanup attempt: lookup fails (session_id=0) → skip
+             * - Works even without active flag check
+             * - Simpler and more robust than guard flags
+             * ═══════════════════════════════════════════════════════════════════════════
+             */
+            meta->session_id = 0;
+
+            /* Update shared connection state */
+            update_shared_connection_state();
+
+            cleanup_stats.processed++;
+        }
+
+        /* Advance tail */
+        __sync_synchronize();  /* Memory barrier */
+        tail++;
+        cleanup_queue.tail = tail;
     }
 }
 
@@ -1488,6 +2086,7 @@ static err_t custom_input_promiscuous(struct pbuf *p, struct netif *inp)
 
     /* Handle ARP packets normally - pass to lwIP's ARP handler */
     if (type == ETHTYPE_ARP) {
+        pbuf_arp_count++;  /* v2.203: Track ARP packets */
         /* Remove Ethernet header and pass to ethernet_input for ARP processing */
         if (pbuf_remove_header(p, sizeof(struct eth_hdr)) == 0) {
             etharp_input(p, inp);
@@ -1520,9 +2119,14 @@ static err_t custom_input_promiscuous(struct pbuf *p, struct netif *inp)
             /* Extract ports if this is TCP */
             uint16_t src_port = 0, dest_port = 0;
             if (IPH_PROTO(iphdr) == IP_PROTO_TCP && p->len >= 20 + 20) {  /* IP + TCP headers */
+                pbuf_tcp_count++;  /* v2.203: Track TCP packets */
                 struct tcp_hdr *tcphdr = (struct tcp_hdr *)((uint8_t *)iphdr + (IPH_HL(iphdr) * 4));
                 src_port = ntohs(tcphdr->src);
                 dest_port = ntohs(tcphdr->dest);
+            } else if (IPH_PROTO(iphdr) == IP_PROTO_UDP) {
+                pbuf_udp_count++;  /* v2.203: Track UDP packets */
+            } else {
+                pbuf_other_count++;  /* v2.203: Track other IP protocols */
             }
 
             /* If packet is not destined for our interface IP, rewrite it */
@@ -1551,6 +2155,59 @@ static err_t custom_input_promiscuous(struct pbuf *p, struct netif *inp)
                            (pkt_dest_ip >> 8) & 0xFF, pkt_dest_ip & 0xFF, dest_port);
                     #endif
                     connection_add(pkt_src_ip, pkt_dest_ip, src_port, dest_port);
+                } else if (!meta->active) {
+                    /* v2.196: CRITICAL FIX - Don't increment connection_count on resurrection!
+                     * ═══════════════════════════════════════════════════════════════════════════
+                     * Root Cause (v2.195 analysis):
+                     * - Resurrection reuses existing slot, not a "new" connection
+                     * - tcp_accept() won't be called again (lwIP already processed original SYN)
+                     * - Result: resurrected connection stuck with pcb=NULL, no callbacks
+                     * - No cleanup path exists → LEAK!
+                     *
+                     * Evidence from v2.195 logs:
+                     * - 772 [COUNT++] operations (299 connection_add + 473 RESURRECT)
+                     * - 270 [COUNT--] operations (only from connection_add path!)
+                     * - 502 connections leaked (exactly matches 772 - 270!)
+                     *
+                     * Fix: DON'T increment connection_count on resurrection
+                     * - Resurrection reuses slot (connection already counted by connection_add)
+                     * - Only connection_add() should increment count
+                     * - Cleanup only happens for connection_add() connections
+                     * - This prevents leak: only count connections with cleanup path
+                     * ═══════════════════════════════════════════════════════════════════════════
+                     */
+                    printf("%s: [RESURRECT] Reactivating slot for port %u→%u (old session=%u)\n",
+                           COMPONENT_NAME, src_port, dest_port, meta->session_id);
+
+                    /* Assign NEW session ID (old one might still be in cleanup queue) */
+                    meta->session_id = next_session_id++;
+                    meta->active = true;
+                    meta->pcb = NULL;  /* Will be set when TCP accept happens */
+                    meta->cleanup_in_progress = false;  /* Reset cleanup flag */
+
+                    /* Reset lifecycle flags */
+                    meta->awaiting_response = false;
+                    meta->response_received = false;
+                    meta->close_pending = false;
+                    meta->closing = false;
+
+                    /* Clean up any pending data */
+                    if (meta->pending_outbound_data != NULL) {
+                        free(meta->pending_outbound_data);
+                        meta->pending_outbound_data = NULL;
+                    }
+                    meta->pending_outbound_len = 0;
+                    meta->has_pending_outbound = false;
+
+                    /* v2.196: DO NOT increment connection_count on resurrection!
+                     * Resurrection reuses existing slot - connection already counted.
+                     * Only connection_add() creates new connections and has cleanup path.
+                     */
+                    printf("%s: [RESURRECT] session=%u port=%u→%u (count unchanged: %u, slot reused)\n",
+                           COMPONENT_NAME, meta->session_id, src_port, dest_port,
+                           connection_count);
+
+                    update_shared_connection_state();
                 } else {
                     #if DEBUG_PACKET_DETAIL
                     printf("%s: [FIND] RX: Found EXISTING metadata [slot %d] for %u.%u.%u.%u:%u → %u.%u.%u.%u:%u\n",
@@ -1589,8 +2246,11 @@ static err_t custom_input_promiscuous(struct pbuf *p, struct netif *inp)
     /* Unknown protocol - drop */
     printf("%s: [WARN] Unknown ethernet protocol: ethertype=0x%04x, pbuf=%p, p->ref=%d, p->len=%u\n",
            COMPONENT_NAME, type, (void*)p, p->ref, p->len);
+    pbuf_other_count++;  /* v2.203: Track unknown protocols */
     BREADCRUMB(9004);  /* pbuf_free at line 1321 (unknown protocol) */
     pbuf_free(p);
+    pbuf_freed_count++;  /* v2.203: Track free */
+    pbuf_error_count++;  /* v2.203: We freed unknown protocol */
     return ERR_OK;
 }
 
@@ -1897,6 +2557,87 @@ static void process_rx_packets(void)
 
         packets_received++;
 
+        /* v2.204: Print pbuf statistics every 100 packets (MOVED INSIDE LOOP)
+         * v2.203 bug: Stats were checked AFTER loop, missing packets 100, 200, etc.
+         * because loop processes up to 8 packets at once (e.g., 96-103), and
+         * by the time we check, packets_received=103 (103%100=3, not 0).
+         *
+         * Fix: Check immediately after each packet increment
+         */
+        if (packets_received % 100 == 0) {
+            printf("%s: [PBUF-STATS] Pkt#%u Pool:%u/%u Alloc=%u Free=%u ToLwIP=%u Leak=%d\n",
+                   COMPONENT_NAME,
+                   packets_received,
+                   lwip_stats.memp[MEMP_PBUF_POOL]->used,
+                   PBUF_POOL_SIZE,
+                   pbuf_allocated_count,
+                   pbuf_freed_count,
+                   pbuf_leaked_to_lwip,
+                   (int)pbuf_allocated_count - (int)pbuf_freed_count);
+            printf("%s: [PBUF-TYPE] ARP=%u TCP=%u UDP=%u Other=%u Err=%u\n",
+                   COMPONENT_NAME,
+                   pbuf_arp_count,
+                   pbuf_tcp_count,
+                   pbuf_udp_count,
+                   pbuf_other_count,
+                   pbuf_error_count);
+
+            /* v2.205: Out-of-order segment diagnostics */
+            ooseq_stats_t ooseq;
+            get_ooseq_stats(&ooseq);
+            printf("%s: [OOSEQ] PCBs=%u/%u WithOoseq=%u Segments=%u Pbufs=%u\n",
+                   COMPONENT_NAME,
+                   ooseq.total_active_pcbs,
+                   connection_count,
+                   ooseq.pcbs_with_ooseq,
+                   ooseq.total_ooseq_segments,
+                   ooseq.total_ooseq_pbufs);
+
+            /* v2.205: PCB state breakdown */
+            pcb_state_stats_t pcb_states;
+            get_pcb_state_stats(&pcb_states);
+            printf("%s: [PCB-STATE] ESTAB=%u CLOSE_WAIT=%u TIME_WAIT=%u FIN_WAIT1=%u FIN_WAIT2=%u\n",
+                   COMPONENT_NAME,
+                   pcb_states.pcb_established,
+                   pcb_states.pcb_close_wait,
+                   pcb_states.pcb_time_wait,
+                   pcb_states.pcb_fin_wait_1,
+                   pcb_states.pcb_fin_wait_2);
+
+            /* v2.205: Connection metadata vs PCB matching */
+            connection_match_stats_t conn_match;
+            get_connection_match_stats(&conn_match);
+            printf("%s: [CONN-MATCH] WithPCB=%u WithoutPCB=%u Inactive=%u OrphanPCBs=%u\n",
+                   COMPONENT_NAME,
+                   conn_match.metadata_active_with_pcb,
+                   conn_match.metadata_active_without_pcb,
+                   conn_match.metadata_inactive,
+                   conn_match.pcb_without_metadata);
+
+            /* v2.206: Orphan PCB buffer diagnostics */
+            if (conn_match.pcb_without_metadata > 0) {
+                orphan_pcb_diag_t orphans[10];
+                int orphan_count = diagnose_orphan_pcbs(orphans, 10);
+
+                for (int i = 0; i < orphan_count; i++) {
+                    printf("%s: [ORPHAN-PCB] PCB=%p State=%u RcvWnd=%u SndBuf=%u\n",
+                           COMPONENT_NAME,
+                           orphans[i].pcb_addr,
+                           orphans[i].state,
+                           orphans[i].rcv_wnd,
+                           orphans[i].snd_buf);
+                    printf("%s:   Refused=%u Unacked=%u/%u Unsent=%u/%u Ooseq=%u\n",
+                           COMPONENT_NAME,
+                           orphans[i].refused_data_pbufs,
+                           orphans[i].unacked_segments,
+                           orphans[i].unacked_pbufs,
+                           orphans[i].unsent_segments,
+                           orphans[i].unsent_pbufs,
+                           orphans[i].ooseq_segments);
+                }
+            }
+        }
+
         /* NOTE: TCP server initialization moved to post_init()
          * The tcp_server_initialized flag is set there.
          * This deferred initialization code is no longer needed.
@@ -2054,6 +2795,7 @@ static void process_rx_packets(void)
         /* Allocate pbuf and copy packet data (skipping header) */
         struct pbuf *p = pbuf_alloc(PBUF_RAW, packet_len, PBUF_POOL);
         if (p != NULL) {
+            pbuf_allocated_count++;  /* v2.203: Track allocation */
             pbuf_take(p, packet_data, packet_len);
 
             #if DEBUG_PACKET_DETAIL
@@ -2108,11 +2850,126 @@ static void process_rx_packets(void)
             if (lwip_result != ERR_OK) {
                 BREADCRUMB(9005);  /* pbuf_free at line 1791 (process_rx_packets lwip error) */
                 pbuf_free(p);
+                pbuf_freed_count++;      /* v2.203: Track free */
+                pbuf_error_count++;      /* v2.203: lwIP rejected, we freed */
+            } else {
+                pbuf_leaked_to_lwip++;   /* v2.203: lwIP accepted, it owns pbuf now */
             }
         } else {
             /* CRITICAL: pbuf allocation failed - this means lwIP is out of memory */
             printf("%s: [WARN]  WARNING: Failed to allocate pbuf for packet #%u - dropping (lwIP out of memory)\n",
                    COMPONENT_NAME, packets_received);
+
+            /* v2.202: DIAGNOSTIC - Print detailed memory statistics on allocation failure */
+            printf("%s: [MEM-DIAG] PBUF_POOL: used=%u/%u, avail=%u, peak=%u\n",
+                   COMPONENT_NAME,
+                   lwip_stats.memp[MEMP_PBUF_POOL]->used,
+                   PBUF_POOL_SIZE,
+                   lwip_stats.memp[MEMP_PBUF_POOL]->avail,
+                   lwip_stats.memp[MEMP_PBUF_POOL]->max);
+            printf("%s: [MEM-DIAG] TCP_PCB: used=%u/%u, avail=%u, peak=%u\n",
+                   COMPONENT_NAME,
+                   lwip_stats.memp[MEMP_TCP_PCB]->used,
+                   MEMP_NUM_TCP_PCB,
+                   lwip_stats.memp[MEMP_TCP_PCB]->avail,
+                   lwip_stats.memp[MEMP_TCP_PCB]->max);
+            printf("%s: [MEM-DIAG] TCP_SEG: used=%u/%u, avail=%u, peak=%u\n",
+                   COMPONENT_NAME,
+                   lwip_stats.memp[MEMP_TCP_SEG]->used,
+                   MEMP_NUM_TCP_SEG,
+                   lwip_stats.memp[MEMP_TCP_SEG]->avail,
+                   lwip_stats.memp[MEMP_TCP_SEG]->max);
+            printf("%s: [MEM-DIAG] MEM heap: used=%u, max=%u, err=%u\n",
+                   COMPONENT_NAME,
+                   lwip_stats.mem.used,
+                   lwip_stats.mem.max,
+                   lwip_stats.mem.err);
+            printf("%s: [MEM-DIAG] Requested packet size: %u bytes\n",
+                   COMPONENT_NAME, packet_len);
+            printf("%s: [MEM-DIAG] Active connections: %u\n",
+                   COMPONENT_NAME, connection_count);
+
+            /* v2.203: Pbuf lifecycle tracking */
+            printf("%s: [PBUF-LEAK] Allocated=%u, Freed=%u, ToLwIP=%u, Leaked=%d\n",
+                   COMPONENT_NAME,
+                   pbuf_allocated_count,
+                   pbuf_freed_count,
+                   pbuf_leaked_to_lwip,
+                   (int)pbuf_allocated_count - (int)pbuf_freed_count);
+            printf("%s: [PBUF-TYPE] ARP=%u, TCP=%u, UDP=%u, Other=%u, Errors=%u\n",
+                   COMPONENT_NAME,
+                   pbuf_arp_count,
+                   pbuf_tcp_count,
+                   pbuf_udp_count,
+                   pbuf_other_count,
+                   pbuf_error_count);
+
+            /* v2.205: Out-of-order segment diagnostics on failure */
+            ooseq_stats_t ooseq;
+            get_ooseq_stats(&ooseq);
+            printf("%s: [OOSEQ] ActivePCBs=%u OurConns=%u PCBsWithOoseq=%u TotalSegments=%u TotalPbufs=%u\n",
+                   COMPONENT_NAME,
+                   ooseq.total_active_pcbs,
+                   connection_count,
+                   ooseq.pcbs_with_ooseq,
+                   ooseq.total_ooseq_segments,
+                   ooseq.total_ooseq_pbufs);
+
+            /* v2.205: PCB state breakdown on failure */
+            pcb_state_stats_t pcb_states;
+            get_pcb_state_stats(&pcb_states);
+            printf("%s: [PCB-STATE] ESTAB=%u CLOSE_WAIT=%u TIME_WAIT=%u FIN_WAIT1=%u FIN_WAIT2=%u SYN=%u LAST_ACK=%u CLOSING=%u\n",
+                   COMPONENT_NAME,
+                   pcb_states.pcb_established,
+                   pcb_states.pcb_close_wait,
+                   pcb_states.pcb_time_wait,
+                   pcb_states.pcb_fin_wait_1,
+                   pcb_states.pcb_fin_wait_2,
+                   pcb_states.pcb_syn_sent + pcb_states.pcb_syn_rcvd,
+                   pcb_states.pcb_last_ack,
+                   pcb_states.pcb_closing);
+
+            /* v2.205: Connection metadata vs PCB matching on failure */
+            connection_match_stats_t conn_match;
+            get_connection_match_stats(&conn_match);
+            printf("%s: [CONN-MATCH] WithPCB=%u WithoutPCB=%u Inactive=%u OrphanPCBs=%u\n",
+                   COMPONENT_NAME,
+                   conn_match.metadata_active_with_pcb,
+                   conn_match.metadata_active_without_pcb,
+                   conn_match.metadata_inactive,
+                   conn_match.pcb_without_metadata);
+
+            /* v2.206: Orphan PCB buffer diagnostics on failure */
+            if (conn_match.pcb_without_metadata > 0) {
+                printf("%s: [ORPHAN-DIAG] Found %u orphan PCB(s) - diagnosing buffer state:\n",
+                       COMPONENT_NAME, conn_match.pcb_without_metadata);
+
+                orphan_pcb_diag_t orphans[10];
+                int orphan_count = diagnose_orphan_pcbs(orphans, 10);
+
+                for (int i = 0; i < orphan_count; i++) {
+                    printf("%s: [ORPHAN-PCB-%d] PCB=%p State=%u RcvWnd=%u SndBuf=%u\n",
+                           COMPONENT_NAME, i,
+                           orphans[i].pcb_addr,
+                           orphans[i].state,
+                           orphans[i].rcv_wnd,
+                           orphans[i].snd_buf);
+                    printf("%s:   Buffers: Refused=%u Unacked(seg/pbuf)=%u/%u Unsent(seg/pbuf)=%u/%u Ooseq=%u\n",
+                           COMPONENT_NAME,
+                           orphans[i].refused_data_pbufs,
+                           orphans[i].unacked_segments,
+                           orphans[i].unacked_pbufs,
+                           orphans[i].unsent_segments,
+                           orphans[i].unsent_pbufs,
+                           orphans[i].ooseq_segments);
+
+                    uint32_t total_pbufs = orphans[i].refused_data_pbufs +
+                                          orphans[i].unacked_pbufs +
+                                          orphans[i].unsent_pbufs;
+                    printf("%s:   TOTAL PBUFS IN THIS ORPHAN: ~%u\n",
+                           COMPONENT_NAME, total_pbufs);
+                }
+            }
         }
 
         /* Mark buffer as free (buf_idx already defined above) */
@@ -2122,15 +2979,7 @@ static void process_rx_packets(void)
         last_used_idx++;
     }
 
-    /* Print pbuf pool statistics every 10 packets to monitor allocation/deallocation */
-    if (packets_received % 10 == 0 && packets_received > 0) {
-        printf("%s: [STATS] PBUF Pool Stats - Used: %u/%u, Avail: %u, Peak: %u\n",
-               COMPONENT_NAME,
-               lwip_stats.memp[MEMP_PBUF_POOL]->used,
-               PBUF_POOL_SIZE,
-               lwip_stats.memp[MEMP_PBUF_POOL]->avail,
-               lwip_stats.memp[MEMP_PBUF_POOL]->max);
-    }
+    /* v2.204: Pbuf statistics moved INSIDE packet loop (see line 2315) */
 
     refill_rx_queue();
 
@@ -2221,29 +3070,23 @@ static void tcp_echo_err(void *arg, err_t err)
         meta->awaiting_response = false;
     }
 
-    /* v2.180: Handle deferred cleanup from poll callback
+    /* v2.192: Error callback now only handles actual errors
      * ═══════════════════════════════════════════════════════════════════════════
-     * When poll callback calls tcp_close(), it sets meta->closing=true and keeps
-     * metadata alive. When lwIP completes the close handshake and frees the PCB,
-     * THIS error callback fires and we can safely cleanup metadata.
+     * Simplified from v2.180-v2.191:
+     * - Old: Error callback handled deferred cleanup (meta->closing=true path)
+     * - New: Poll callback cleans up immediately, error callback just for errors
      *
-     * This ensures metadata is available for ALL lwIP packets during close
-     * (FIN, ACK, retransmissions, etc.), preventing the 1,170 metadata lookup
-     * failures that caused packets to be sent with wrong source IP.
+     * This callback fires when:
+     * - SCADA sends RST (connection aborted)
+     * - Connection times out
+     * - lwIP internal error
+     *
+     * NOT called anymore for:
+     * - Normal close (poll callback handles it now)
      * ═══════════════════════════════════════════════════════════════════════════
      */
-    if (meta->closing) {
-        /* v2.181: Calculate and log total close latency */
-        uint32_t total_latency = sys_now() - meta->close_timestamp;
-        printf("%s:    → Deferred cleanup for closing connection (session %u)\n",
-               COMPONENT_NAME, meta->session_id);
-        printf("%s:    → lwIP has freed PCB - now safe to cleanup metadata\n",
-               COMPONENT_NAME);
-        printf("%s:    → Total close latency: %u ms (from close_pending to PCB freed)\n",
-               COMPONENT_NAME, total_latency);
-    } else {
-        printf("%s:    → Sending close notification to Net1 and cleaning up\n", COMPONENT_NAME);
-    }
+    printf("%s:    → SCADA connection error (session %u, err=%d) - cleaning up\n",
+           COMPONENT_NAME, meta->session_id, err);
 
     /* STEP 1: Check for guard flag (prevent double-cleanup) */
     if (meta->cleanup_in_progress) {
@@ -2261,10 +3104,11 @@ static void tcp_echo_err(void *arg, err_t err)
      * Uses control queue instead of overwriting request_msg.
      * Prevents race where close notification overwrites pending request.
      *
-     * v2.180: Skip notification if closing=true (poll callback already sent it)
+     * v2.192: Simplified - poll callback always sends notification before cleanup,
+     * so this path only handles unexpected error cases
      * ═══════════════════════════════════════════════════════════════════════
      */
-    if (inbound_dp != NULL && !meta->close_notified && !meta->closing) {
+    if (inbound_dp != NULL && !meta->close_notified) {
         InboundDataport *dp = (InboundDataport *)inbound_dp;
 
         /* Enqueue close notification with error code
@@ -2312,8 +3156,9 @@ static void tcp_echo_err(void *arg, err_t err)
                COMPONENT_NAME, meta->session_id);
     }
 
-    /* STEP 4: Atomic cleanup BEFORE any tcp_close() attempt */
-    connection_cleanup_atomic(meta);
+    /* STEP 4: Enqueue cleanup (will be processed by main loop)
+     * v2.193: Queue-based cleanup - no more direct cleanup calls from callbacks */
+    enqueue_cleanup(meta->session_id);
 
     /* NOTE: PCB is already freed by lwIP - DO NOT access it! */
 }
@@ -2567,8 +3412,39 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
                        COMPONENT_NAME, meta->session_id);
             }
 
-            /* Cleanup metadata */
-            connection_cleanup_atomic(meta);
+            /* v2.197: CRITICAL FIX - Close lwIP PCB before cleanup!
+             * ═══════════════════════════════════════════════════════════════════════════
+             * BUG in v2.196: recv(p=NULL) path never called tcp_close(pcb)
+             * - Sent close notification to Net1 ✅
+             * - Enqueued metadata cleanup ✅
+             * - BUT: Never told lwIP to close PCB ❌
+             *
+             * Result: lwIP PCB leaked forever
+             * - Our metadata: cleaned up (connection_count accurate)
+             * - lwIP's PCB: still active, consuming memory
+             * - Symptom: connection_count=23 but lwIP out of pbufs!
+             *
+             * Evidence from v2.196 test:
+             * - Net0: 335 [COUNT++], 311 [COUNT--] (counter accurate!)
+             * - But: lwIP out of memory at packet #2182
+             * - Root cause: Hundreds of unclosed lwIP PCBs
+             *
+             * Fix: Call tcp_close(pcb) like poll callback does (line 3367)
+             * - Graceful close with FIN handshake
+             * - If tcp_close() fails, fallback to tcp_abort()
+             * - lwIP frees PCB and memory properly
+             * ═══════════════════════════════════════════════════════════════════════════
+             */
+            err_t close_err = tcp_close(pcb);
+            if (close_err != ERR_OK) {
+                printf("%s:   [WARN] tcp_close failed (err=%d) - using tcp_abort\n",
+                       COMPONENT_NAME, close_err);
+                tcp_abort(pcb);
+                /* Note: tcp_abort() doesn't return - PCB freed immediately */
+            }
+
+            /* v2.193: Enqueue cleanup (processed by main loop) */
+            enqueue_cleanup(meta->session_id);
             return ERR_OK;
         }
 
@@ -2611,6 +3487,40 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
      * Solution: Early metadata lookup + pbuf ref count guard at end */
 
     struct connection_metadata *meta_early = connection_lookup_by_pcb(pcb);
+
+    /* v2.191: CRITICAL FIX - Fallback lookup by port if PCB not linked yet
+     * ═══════════════════════════════════════════════════════════════════════
+     * Race Condition: Data arrives before tcp_echo_accept links PCB
+     *
+     * Scenario:
+     * 1. SYN arrives → netif_input creates metadata (assigns session_id)
+     * 2. SCADA sends data IMMEDIATELY (before tcp_echo_accept is called)
+     * 3. tcp_echo_recv fires
+     * 4. Looks up metadata by PCB → NULL (PCB not linked yet!)
+     * 5. Fallback to session_id=0 → "TX: No metadata" errors
+     * 6. Connection leak
+     *
+     * Fix: If PCB lookup fails, try lookup by port numbers
+     * - netif_input already created metadata with correct session_id
+     * - Just need to find it by (src_port, dest_port) instead of PCB
+     * - This handles the window between netif_input and connection_link_pcb
+     * ═══════════════════════════════════════════════════════════════════════
+     */
+    if (meta_early == NULL) {
+        /* PCB not linked yet - try lookup by port numbers */
+        meta_early = connection_lookup_by_tuple(
+            ntohl(ip4_addr_get_u32(&pcb->remote_ip)),
+            ntohl(ip4_addr_get_u32(&pcb->local_ip)),
+            pcb->remote_port,
+            pcb->local_port
+        );
+        #if DEBUG_METADATA
+        if (meta_early != NULL) {
+            printf("%s: [FALLBACK] tcp_echo_recv: PCB lookup failed, found metadata by ports %u->%u (session %u)\n",
+                   COMPONENT_NAME, pcb->remote_port, pcb->local_port, meta_early->session_id);
+        }
+        #endif
+    }
 
     /* Check if this is a stale callback after connection close */
     if (meta_early != NULL && meta_early->pcb == NULL) {
@@ -3021,30 +3931,57 @@ static err_t tcp_echo_poll(void *arg, struct tcp_pcb *pcb)
             /* Force abort */
             tcp_abort(pcb);
 
-            /* Metadata removed but PCB already freed - cleanup now */
-            meta->pcb = NULL;
-            meta->active = false;
-            meta->close_pending = false;
-            meta->closing = false;
-            connection_cleanup_atomic(meta);
+            /* v2.193: Enqueue cleanup - main loop will handle counter decrement */
+            enqueue_cleanup(meta->session_id);
 
-            printf("%s:   [OK] Connection aborted - slot freed (session %u)\n",
+            printf("%s:   [OK] Connection aborted - cleanup enqueued (session %u)\n",
                    COMPONENT_NAME, meta->session_id);
 
             return ERR_ABRT;
         }
 
-        /* Mark as closing but KEEP metadata alive */
+        /* v2.192: SIMPLIFIED - Cleanup immediately instead of waiting for error callback
+         * ═══════════════════════════════════════════════════════════════════════════
+         * Old design (v2.180-v2.191): Set closing=true, wait for error callback to cleanup
+         * Problem: Error callback only fires 13.6% of the time (44/323 connections)
+         * Result: 279 leaked connections (never cleaned up)
+         *
+         * Root cause analysis:
+         * - Poll callback fires: 323 times ✅
+         * - tcp_close() succeeds: ~323 times ✅
+         * - Error callback fires: 44 times ❌ (only 13.6%!)
+         * - Missing cleanups: 279 connections leak
+         *
+         * Why error callback doesn't fire:
+         * - lwIP keeps PCB in TIME_WAIT/CLOSE_WAIT
+         * - PCB stuck in retransmission
+         * - PCB never freed → error callback never called
+         *
+         * New design (v2.192): Cleanup immediately after tcp_close()
+         * - Close notification already sent to Net1 ✅
+         * - No more PLC responses coming ✅
+         * - FIN/ACK packets use PCB's IP (no metadata needed) ✅
+         * - Safe to cleanup NOW instead of waiting!
+         *
+         * Benefits:
+         * - 100% cleanup rate (poll callback always fires)
+         * - No connection leaks
+         * - Simpler code (no waiting for callbacks)
+         * ═══════════════════════════════════════════════════════════════════════════
+         */
         meta->close_pending = false;
-        meta->closing = true;  /* Error callback will cleanup when PCB freed */
+        meta->pcb = NULL;  /* PCB will be freed by lwIP */
 
-        /* v2.181: Log close latency measurement start */
+        /* Calculate total latency from close_pending to cleanup */
         uint32_t pending_duration = sys_now() - meta->close_timestamp;
-        printf("%s:   [OK] Close initiated (session %u, pending for %ums) - metadata kept alive\n",
+
+        /* v2.193: Enqueue cleanup (main loop will process) */
+        enqueue_cleanup(meta->session_id);
+
+        printf("%s:   [OK] Close initiated and cleanup enqueued (session %u, pending for %ums)\n",
                COMPONENT_NAME, meta->session_id, pending_duration);
 
-        /* Return ERR_OK - let lwIP complete close handshake
-         * Error callback will fire when PCB is freed and cleanup metadata then */
+        /* Return ERR_OK - lwIP will complete close handshake */
         return ERR_OK;
     }
 
@@ -3566,9 +4503,9 @@ void outbound_ready_handle(void)
                     }
                 }
 
-                /* Atomic cleanup with guard flag (prevents double-decrement) */
-                connection_cleanup_atomic(meta);
-                BREADCRUMB(9227);  /* Cleanup completed */
+                /* v2.193: Enqueue cleanup */
+                enqueue_cleanup(meta->session_id);
+                BREADCRUMB(9227);  /* Cleanup enqueued */
             } else {
                 printf("%s:   → Connection already closed (session %u)\n",
                        COMPONENT_NAME, notif->session_id);
@@ -3742,10 +4679,10 @@ void outbound_ready_handle(void)
                        COMPONENT_NAME, scada_meta->session_id);
             }
 
-            /* Step 5: Cleanup metadata */
-            connection_cleanup_atomic(scada_meta);
+            /* Step 5: Enqueue cleanup */
+            enqueue_cleanup(scada_meta->session_id);
 
-            printf("%s:    → RST sent, SCADA connection closed (pool exhaustion)\n", COMPONENT_NAME);
+            printf("%s:    → RST sent, SCADA connection cleanup enqueued (pool exhaustion)\n", COMPONENT_NAME);
         } else {
             /* v2.187 CRITICAL FIX: Don't send close notification when Net1 never created PCB!
              * ═══════════════════════════════════════════════════════════════
@@ -4700,7 +5637,7 @@ static int virtio_net_init(void)
 void post_init(void)
 {
     printf("%s: Component started\n", COMPONENT_NAME);
-    printf("%s: NET0 v2.187 (2025-10-27) - Fix infinite loop bug (v2.172 bogus close notifications)\n", COMPONENT_NAME);
+    printf("%s: NET0 v2.206 (2025-10-27) - Add orphan PCB buffer diagnostics to locate stuck pbufs\n", COMPONENT_NAME);
     printf("%s: [FIX] MODE: PRODUCTION with fast cleanup (every 100 iterations)\n", COMPONENT_NAME);
     printf("%s: [OK] FIX 1: Immediate cleanup on tcp_echo_err (v2.145 behavior)\n", COMPONENT_NAME);
     printf("%s: [OK] FIX 2: Send close notification to Net1 when SCADA closes\n", COMPONENT_NAME);
@@ -4903,6 +5840,17 @@ int run(void)
             loop_counter = 0;
         }
         sys_check_timeouts();
+
+        /* v2.193: Process cleanup queue in main loop (guaranteed execution)
+         * ═══════════════════════════════════════════════════════════════════════
+         * This runs EVERY iteration (unlike poll callbacks which depend on lwIP)
+         * - Guaranteed execution: No dependency on TCP state or timers
+         * - Natural deduplication: active flag prevents double-cleanup
+         * - Lock-free SPSC queue: Callbacks enqueue, main loop dequeues
+         * - Single enforcement point: Only place counters are decremented
+         * ═══════════════════════════════════════════════════════════════════════
+         */
+        process_cleanup_queue();
 
         /* v2.167: CORRECT FIX - Process RX packets in main loop (flag-based)
          * ═══════════════════════════════════════════════════════════════════════

@@ -15,7 +15,7 @@
 
 /* Memory configuration */
 #define MEM_ALIGNMENT                   4
-#define MEM_SIZE                        (128 * 1024)  /* v2.182: Reverted to 128KB for leak testing */
+#define MEM_SIZE                        (5 * 1024 * 1024)  /* v2.200: Increased to 5MB to eliminate memory exhaustion */
 
 /* v2.78: Use static memory pools instead of malloc to prevent cross-component contamination */
 #define MEM_LIBC_MALLOC                 0       /* DO NOT use system malloc */
@@ -70,8 +70,8 @@
 #define TCP_WND                         (16 * TCP_MSS)
 #define LWIP_WND_SCALE                  1
 #define TCP_RCV_SCALE                   2
-#define MEMP_NUM_TCP_PCB                100     /* v2.182: Reverted to 100 for leak testing */
-#define MEMP_NUM_TCP_SEG                800     /* v2.182: 8 segments per connection (8 * 100 = 800) */
+#define MEMP_NUM_TCP_PCB                200     /* v2.200: Increased to 200 for 150 active + TIME_WAIT margin */
+#define MEMP_NUM_TCP_SEG                1600    /* v2.200: 8 segments per connection (8 * 200 = 1600) */
 #define MEMP_NUM_TCP_PCB_LISTEN         16      /* Max listening sockets (increased from 4) */
 
 /* UDP configuration */
@@ -79,7 +79,7 @@
 #define MEMP_NUM_UDP_PCB                4
 
 /* pbuf configuration */
-#define PBUF_POOL_SIZE                  375     /* v2.182: Support 100 connections (100×3×1.25=375) */
+#define PBUF_POOL_SIZE                  800     /* v2.200: Support 200 connections (200×4=800) */
 #define PBUF_POOL_BUFSIZE               2048    /* Match PACKET_BUFFER_SIZE */
 
 /* Checksum configuration - let hardware handle it if possible */

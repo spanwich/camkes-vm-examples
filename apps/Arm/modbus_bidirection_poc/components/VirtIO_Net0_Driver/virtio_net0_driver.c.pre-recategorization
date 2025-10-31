@@ -18,7 +18,7 @@
  */
 
 /* v2.207: New industry-standard 5-level debug system */
-#define DEBUG_LEVEL DEBUG_LEVEL_INFO  /* v2.210: INFO level (DEBUG has compilation errors) */
+#define DEBUG_LEVEL DEBUG_LEVEL_INFO
 #include "debug_levels.h"
 
 #include <camkes.h>
@@ -149,7 +149,7 @@ struct connection_metadata {
      * ══════════════════════════════════════════════════════════════════════════
      */
     bool closing;                  /* True if close initiated, waiting for PCB free */
-    /* NOTE: close_timestamp moved to v2.209 section below (reused for metadata_close_pending) */
+    uint32_t close_timestamp;      /* v2.181: Timestamp when close_pending set (for latency measurement) */
 
     /* v2.111: Pending outbound data (fix for pbuf ref count bug)
      * ══════════════════════════════════════════════════════════════════════════
@@ -201,46 +201,6 @@ struct connection_metadata {
      * ══════════════════════════════════════════════════════════════════════════
      */
     bool close_notified;             /* True if close notification already queued (Net0 → Net1) */
-
-    /* v2.209: Delayed metadata cleanup (fix pbuf leak race condition)
-     * ══════════════════════════════════════════════════════════════════════════
-     * Problem (v2.208): Metadata deleted immediately when SCADA closes
-     *   T+92.979 ms: PLC response arrives at Net0 (packet on wire)
-     *   T+141.610 ms: SCADA closes (FIN) → tcp_echo_recv(p=NULL)
-     *                 → connection_cleanup_atomic() → metadata.active = FALSE
-     *   T+145.000 ms: TX path executes (processing delay)
-     *                 → find_connection_by_port() → metadata NOT FOUND!
-     *                 → Sends with WRONG source IP (192.168.96.2 vs 192.168.95.2)
-     *                 → SCADA rejects → no ACK → pbuf LEAKED!
-     *
-     *   Result: 939 TX failures (78%), 1192 pbuf leaks (99%)
-     *
-     * Solution (v2.209): Delay metadata cleanup until TX completes
-     *   T+141.610 ms: SCADA closes → metadata_close_pending = TRUE
-     *                 (DON'T delete metadata yet!)
-     *   T+145.000 ms: TX path executes
-     *                 → find_connection_by_port() → FOUND! ✅
-     *                 → Sends with CORRECT source IP (192.168.95.2)
-     *                 → last_tx_timestamp updated
-     *   T+1145.000 ms: check_pending_cleanups() runs (main loop)
-     *                  → tx_idle = now - last_tx_timestamp = 1000 ms
-     *                  → Fast-track cleanup (tx_idle > 1000 ms)
-     *                  → connection_cleanup_atomic() (NOW safe!)
-     *
-     * Two-tier cleanup:
-     *   1. Fast-track: Cleanup after 1 second of TX idle (normal case)
-     *   2. Grace period: Cleanup after 5 seconds max (safety net)
-     *
-     * Benefits:
-     *   - 0% TX failures (metadata persists until TX completes)
-     *   - 0% pbuf leaks (correct IP → SCADA accepts → ACK → pbuf freed)
-     *   - No connection pool exhaustion (1s cleanup keeps usage at 19.5%)
-     *   - 103× safety margin (5s grace / 48ms race window)
-     * ══════════════════════════════════════════════════════════════════════════
-     */
-    bool metadata_close_pending;     /* True if SCADA closed but metadata persists for TX */
-    uint32_t close_timestamp;        /* When metadata_close_pending was set (for grace period) */
-    uint32_t last_tx_timestamp;      /* Last TX path activity (for fast-track cleanup) */
 };
 
 static struct connection_metadata connection_table[MAX_CONNECTIONS];
@@ -1393,25 +1353,6 @@ static struct connection_metadata* connection_add(uint32_t orig_src, uint32_t or
              */
             connection_table[i].close_notified = false;
 
-            /* v2.209: Initialize delayed metadata cleanup fields (fix pbuf leak)
-             * ═══════════════════════════════════════════════════════════════════════════
-             * Purpose: Support two-tier cleanup strategy to prevent "TX: No metadata"
-             *
-             * Fields:
-             *   - metadata_close_pending: False initially, set when SCADA closes
-             *   - close_timestamp: 0 initially, set when metadata_close_pending=true
-             *   - last_tx_timestamp: Current time (connection creation time)
-             *
-             * Why initialize last_tx_timestamp to sys_now():
-             *   - Prevents premature fast-track cleanup for new connections
-             *   - Gives new connection at least 1 second to complete TX
-             *   - After first TX, this gets updated to actual TX completion time
-             * ═══════════════════════════════════════════════════════════════════════════
-             */
-            connection_table[i].metadata_close_pending = false;
-            connection_table[i].close_timestamp = 0;
-            connection_table[i].last_tx_timestamp = sys_now();
-
             connection_count++;
 
             /* v2.193: Log connection creation for debugging */
@@ -1748,43 +1689,6 @@ static void process_cleanup_queue(void)
                        COMPONENT_NAME, req->session_id);
             }
 
-            /* v2.209 Complete: CRITICAL FIX - Defer cleanup if metadata_close_pending is set
-             * ═══════════════════════════════════════════════════════════════════════════
-             * BUG FIX: Prevent immediate cleanup when transmission may still be pending
-             *
-             * Root cause of "TX: No metadata" errors:
-             * - When SCADA FIN arrives with response_received=true, enqueue_cleanup() was called
-             * - But response_received just means tcp_write() was called, NOT transmission complete
-             * - process_cleanup_queue() would immediately set active=false
-             * - Then netif_output() can't find metadata → "TX: No metadata" error
-             *
-             * Fix: Check metadata_close_pending flag before cleanup
-             * - If set: TX may still be pending, defer cleanup
-             * - Let check_pending_cleanups() handle it after TX idle >1s (fast-track)
-             * - Or after 5s grace period (safety net)
-             * - Or at 80% pool usage (emergency cleanup)
-             *
-             * This prevents the bypass where enqueue_cleanup() would cause immediate cleanup
-             * before transmission completed, eliminating the "TX: No metadata" errors.
-             * ═══════════════════════════════════════════════════════════════════════════
-             */
-            if (meta->metadata_close_pending) {
-                DEBUG("%s: [v2.209] DEFERRED cleanup: session=%u has metadata_close_pending=true\n",
-                       COMPONENT_NAME, req->session_id);
-                DEBUG("%s:   → TX may still be pending, letting check_pending_cleanups() handle it\n",
-                       COMPONENT_NAME);
-                DEBUG("%s:   → Will cleanup after TX idle >1s (fast-track) or 5s grace period\n",
-                       COMPONENT_NAME);
-
-                /* Advance tail to prevent infinite loop, then skip cleanup */
-                __sync_synchronize();  /* Memory barrier */
-                tail++;
-                cleanup_queue.tail = tail;
-
-                /* check_pending_cleanups() will handle this later */
-                continue;
-            }
-
             /* Mark metadata as inactive */
             meta->active = false;
             meta->pcb = NULL;
@@ -2046,130 +1950,6 @@ static void connection_cleanup_stale(void)
         #if DEBUG_METADATA
         DEBUG("%s: [CLEAN] Cleaned %d stale connection(s)\n", COMPONENT_NAME, cleaned);
         connection_print_stats();
-        #endif
-    }
-}
-
-/* v2.209: Check and cleanup connections with metadata_close_pending
- * ══════════════════════════════════════════════════════════════════════════
- * Purpose: Process delayed metadata cleanups (fix pbuf leak race condition)
- *
- * This function implements two-tier cleanup strategy:
- *
- * Tier 1: Fast-track cleanup (normal case, ~99% of connections)
- *   - Wait for TX path to finish (1 second of TX inactivity)
- *   - Typical cleanup time: ~1 second after SCADA close
- *   - Pool usage: 19.5% at 100 conn/sec
- *
- * Tier 2: Grace period cleanup (safety net, ~1% of connections)
- *   - Wait maximum 5 seconds after close_pending flag set
- *   - Handles edge cases where TX timestamp doesn't update
- *   - Pool usage: 97.7% at 100 conn/sec (triggers emergency cleanup)
- *
- * Emergency Protection:
- *   - Force cleanup at 80% pool threshold (410 connections)
- *   - Prevents pool exhaustion even if everything goes wrong
- *
- * Why This Works:
- *   - Metadata persists until TX definitely completes (no more "TX: No metadata")
- *   - Fast-track keeps normal cleanup delay at 1 second (not 5 seconds!)
- *   - Grace period provides 103× safety margin (5000ms / 48ms race window)
- *   - Emergency cleanup prevents pool exhaustion
- *
- * Called from: Main loop (periodic check)
- * ══════════════════════════════════════════════════════════════════════════
- */
-static void check_pending_cleanups(void)
-{
-    uint32_t now = sys_now();
-    int active_count = 0;
-    int pending_count = 0;
-    int cleaned = 0;
-
-    /* Count active and pending connections */
-    for (int i = 0; i < MAX_CONNECTIONS; i++) {
-        if (connection_table[i].active) {
-            active_count++;
-            if (connection_table[i].metadata_close_pending) {
-                pending_count++;
-            }
-        }
-    }
-
-    /* Emergency cleanup if pool filling up
-     * Trigger at 80% threshold (410 out of 512 connections) */
-    float pool_usage = (float)active_count / MAX_CONNECTIONS;
-    if (pool_usage > 0.8) {
-        DEBUG_WARN("%s: [WARN] Connection pool at %.1f%% (%d/%d), forcing emergency cleanup\n",
-                   COMPONENT_NAME, pool_usage * 100, active_count, MAX_CONNECTIONS);
-
-        /* Force cleanup of oldest pending connections (up to 10) */
-        int emergency_cleaned = 0;
-        for (int i = 0; i < MAX_CONNECTIONS && emergency_cleaned < 10; i++) {
-            struct connection_metadata *meta = &connection_table[i];
-
-            if (meta->active && meta->metadata_close_pending) {
-                DEBUG_WARN("%s:    → Emergency cleanup: session_id=%u, pending for %u ms\n",
-                           COMPONENT_NAME, meta->session_id,
-                           (unsigned int)(now - meta->close_timestamp));
-                connection_cleanup_atomic(meta);
-                emergency_cleaned++;
-                cleaned++;
-            }
-        }
-        DEBUG_WARN("%s:    → Emergency cleaned %d connection(s)\n",
-                   COMPONENT_NAME, emergency_cleaned);
-    }
-
-    /* Process pending cleanups (two-tier strategy) */
-    for (int i = 0; i < MAX_CONNECTIONS; i++) {
-        struct connection_metadata *meta = &connection_table[i];
-
-        if (!meta->active || !meta->metadata_close_pending) {
-            continue;
-        }
-
-        uint32_t grace_elapsed = now - meta->close_timestamp;
-        uint32_t tx_idle = now - meta->last_tx_timestamp;
-
-        /* Tier 1: Fast-track cleanup after 1 second TX idle (normal case)
-         * This handles 99% of connections:
-         *   - TX completes quickly (50-100ms typical)
-         *   - Wait 1 second after last TX activity
-         *   - Metadata stays in pool for ~1 second total
-         */
-        if (tx_idle > 1000) {
-            #if DEBUG_METADATA
-            DEBUG("%s: [CLEAN] Fast-track cleanup: session_id=%u (tx_idle=%u ms)\n",
-                  COMPONENT_NAME, meta->session_id, (unsigned int)tx_idle);
-            #endif
-            connection_cleanup_atomic(meta);
-            cleaned++;
-            continue;
-        }
-
-        /* Tier 2: Grace period cleanup after 5 seconds max (safety net)
-         * This handles edge cases:
-         *   - TX timestamp not updated (bug)
-         *   - TX keeps running >1 second (impossible for Modbus)
-         *   - Provides 103× safety margin (5000ms / 48ms race window)
-         */
-        if (grace_elapsed > 5000) {
-            DEBUG_WARN("%s: [WARN] Grace period cleanup: session_id=%u (grace_elapsed=%u ms, tx_idle=%u ms)\n",
-                       COMPONENT_NAME, meta->session_id,
-                       (unsigned int)grace_elapsed, (unsigned int)tx_idle);
-            connection_cleanup_atomic(meta);
-            cleaned++;
-        }
-    }
-
-    /* Log cleanup summary if anything was cleaned */
-    if (cleaned > 0) {
-        #if DEBUG_METADATA
-        DEBUG("%s: [CLEAN] check_pending_cleanups: %d cleaned, %d pending, %d/%d active (%.1f%%)\n",
-              COMPONENT_NAME, cleaned, pending_count - cleaned,
-              active_count - cleaned, MAX_CONNECTIONS,
-              ((float)(active_count - cleaned) / MAX_CONNECTIONS) * 100);
         #endif
     }
 }
@@ -2771,7 +2551,7 @@ static void process_rx_packets(void)
             pbuf_take(p, packet_data, packet_len);
 
             #if DEBUG_ENABLED_DEBUG
-            DEBUG("   [OK] pbuf allocated, passing to lwIP input handler\n");
+            DEBUG_INFO("   [OK] pbuf allocated, passing to lwIP input handler\n");
             #endif
 
             /* v2.137: Track before lwIP input call */
@@ -2785,7 +2565,7 @@ static void process_rx_packets(void)
 
             #if DEBUG_ENABLED_DEBUG
             if (lwip_result == ERR_OK) {
-                DEBUG("   [OK] lwIP accepted packet (will route to TCP/UDP/etc.)\n");
+                DEBUG_INFO("   [OK] lwIP accepted packet (will route to TCP/UDP/etc.)\n");
             } else {
                 DEBUG("   ✗ lwIP rejected packet (err=%d)\n", lwip_result);
             }
@@ -2833,42 +2613,42 @@ static void process_rx_packets(void)
                    COMPONENT_NAME, packets_received);
 
             /* v2.202: DIAGNOSTIC - Print detailed memory statistics on allocation failure */
-            DEBUG("%s: [MEM-DIAG] PBUF_POOL: used=%u/%u, avail=%u, peak=%u\n",
+            DEBUG_INFO("%s: [MEM-DIAG] PBUF_POOL: used=%u/%u, avail=%u, peak=%u\n",
                    COMPONENT_NAME,
                    lwip_stats.memp[MEMP_PBUF_POOL]->used,
                    PBUF_POOL_SIZE,
                    lwip_stats.memp[MEMP_PBUF_POOL]->avail,
                    lwip_stats.memp[MEMP_PBUF_POOL]->max);
-            DEBUG("%s: [MEM-DIAG] TCP_PCB: used=%u/%u, avail=%u, peak=%u\n",
+            DEBUG_INFO("%s: [MEM-DIAG] TCP_PCB: used=%u/%u, avail=%u, peak=%u\n",
                    COMPONENT_NAME,
                    lwip_stats.memp[MEMP_TCP_PCB]->used,
                    MEMP_NUM_TCP_PCB,
                    lwip_stats.memp[MEMP_TCP_PCB]->avail,
                    lwip_stats.memp[MEMP_TCP_PCB]->max);
-            DEBUG("%s: [MEM-DIAG] TCP_SEG: used=%u/%u, avail=%u, peak=%u\n",
+            DEBUG_INFO("%s: [MEM-DIAG] TCP_SEG: used=%u/%u, avail=%u, peak=%u\n",
                    COMPONENT_NAME,
                    lwip_stats.memp[MEMP_TCP_SEG]->used,
                    MEMP_NUM_TCP_SEG,
                    lwip_stats.memp[MEMP_TCP_SEG]->avail,
                    lwip_stats.memp[MEMP_TCP_SEG]->max);
-            DEBUG("%s: [MEM-DIAG] MEM heap: used=%u, max=%u, err=%u\n",
+            DEBUG_INFO("%s: [MEM-DIAG] MEM heap: used=%u, max=%u, err=%u\n",
                    COMPONENT_NAME,
                    lwip_stats.mem.used,
                    lwip_stats.mem.max,
                    lwip_stats.mem.err);
-            DEBUG("%s: [MEM-DIAG] Requested packet size: %u bytes\n",
+            DEBUG_INFO("%s: [MEM-DIAG] Requested packet size: %u bytes\n",
                    COMPONENT_NAME, packet_len);
-            DEBUG("%s: [MEM-DIAG] Active connections: %u\n",
+            DEBUG_INFO("%s: [MEM-DIAG] Active connections: %u\n",
                    COMPONENT_NAME, connection_count);
 
             /* v2.203: Pbuf lifecycle tracking */
-            DEBUG("%s: [PBUF-LEAK] Allocated=%u, Freed=%u, ToLwIP=%u, Leaked=%d\n",
+            DEBUG_INFO("%s: [PBUF-LEAK] Allocated=%u, Freed=%u, ToLwIP=%u, Leaked=%d\n",
                    COMPONENT_NAME,
                    pbuf_allocated_count,
                    pbuf_freed_count,
                    pbuf_leaked_to_lwip,
                    (int)pbuf_allocated_count - (int)pbuf_freed_count);
-            DEBUG("%s: [PBUF-TYPE] ARP=%u, TCP=%u, UDP=%u, Other=%u, Errors=%u\n",
+            DEBUG_INFO("%s: [PBUF-TYPE] ARP=%u, TCP=%u, UDP=%u, Other=%u, Errors=%u\n",
                    COMPONENT_NAME,
                    pbuf_arp_count,
                    pbuf_tcp_count,
@@ -2879,7 +2659,7 @@ static void process_rx_packets(void)
             /* v2.205: Out-of-order segment diagnostics on failure */
             ooseq_stats_t ooseq;
             get_ooseq_stats(&ooseq);
-            DEBUG("%s: [OOSEQ] ActivePCBs=%u OurConns=%u PCBsWithOoseq=%u TotalSegments=%u TotalPbufs=%u\n",
+            DEBUG_INFO("%s: [OOSEQ] ActivePCBs=%u OurConns=%u PCBsWithOoseq=%u TotalSegments=%u TotalPbufs=%u\n",
                    COMPONENT_NAME,
                    ooseq.total_active_pcbs,
                    connection_count,
@@ -3380,7 +3160,7 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
                 inbound_ready_emit();
                 meta->close_notified = true;
 
-                DEBUG("%s:   [OK] Close notification queued for Net1 (session %u)\n",
+                DEBUG_INFO("%s:   [OK] Close notification queued for Net1 (session %u)\n",
                        COMPONENT_NAME, meta->session_id);
             }
 
@@ -3415,39 +3195,8 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
                 /* Note: tcp_abort() doesn't return - PCB freed immediately */
             }
 
-            /* v2.209 COMPLETE: CRITICAL FIX - Don't call enqueue_cleanup()!
-             * ═══════════════════════════════════════════════════════════════════════════
-             * BUG in v2.193-v2.208: Called enqueue_cleanup() when response_received=true
-             *
-             * Problem:
-             *   - response_received=true means tcp_write() was called
-             *   - But tcp_write() only QUEUES data in lwIP, doesn't transmit!
-             *   - enqueue_cleanup() → process_cleanup_queue() → meta->active=FALSE
-             *   - Then netif_output() tries to transmit → "TX: No metadata" ❌
-             *
-             * Timeline of the bug:
-             *   T+20ms: PLC response arrives, tcp_write() queued, response_received=TRUE
-             *   T+21ms: SCADA FIN arrives, this path executes
-             *   T+21ms: enqueue_cleanup() queued ❌ BUG!
-             *   T+22ms: process_cleanup_queue() → meta->active=FALSE ❌
-             *   T+25ms: netif_output() → metadata NOT FOUND ❌
-             *
-             * Fix: Use delayed cleanup instead
-             *   - Set metadata_close_pending = TRUE
-             *   - Let check_pending_cleanups() handle it after TX idle >1s
-             *   - process_cleanup_queue() will see close_pending and skip
-             *
-             * Result: Metadata persists until transmission complete ✅
-             * ═══════════════════════════════════════════════════════════════════════════
-             */
-            meta->metadata_close_pending = true;
-            meta->close_timestamp = sys_now();
-
-            DEBUG("%s:   [v2.209] Metadata marked for delayed cleanup (session %u)\n",
-                   COMPONENT_NAME, meta->session_id);
-            DEBUG("%s:   → Will cleanup after TX idle >1s (prevents TX metadata errors)\n",
-                   COMPONENT_NAME);
-
+            /* v2.193: Enqueue cleanup (processed by main loop) */
+            enqueue_cleanup(meta->session_id);
             return ERR_OK;
         }
 
@@ -3469,15 +3218,6 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
         /* DON'T call connection_cleanup_atomic() - keep metadata alive!
          * DON'T call tcp_close() - keep PCB alive in CLOSE_WAIT state!
          * lwIP will keep the connection open so we can send the response */
-
-        /* v2.209: Set delayed cleanup flag (fix pbuf leak)
-         * ═══════════════════════════════════════════════════════════════════════
-         * Mark that SCADA closed but keep metadata alive for TX path
-         * Cleanup will occur in check_pending_cleanups() after TX completes
-         * ═══════════════════════════════════════════════════════════════════════
-         */
-        meta->metadata_close_pending = true;
-        meta->close_timestamp = sys_now();
 
         BREADCRUMB(9200);  /* v2.153: awaiting_response mode */
 
@@ -3554,7 +3294,7 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
     }
 
     #if DEBUG_ENABLED_DEBUG
-    DEBUG("%s: [OK] Dataport check: inbound_dp=%p (valid)\n", COMPONENT_NAME, (void*)inbound_dp);
+    DEBUG_INFO("%s: [OK] Dataport check: inbound_dp=%p (valid)\n", COMPONENT_NAME, (void*)inbound_dp);
     #endif
 
     /* Step 1: Create ICS message with metadata */
@@ -3665,7 +3405,7 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
     #endif
 
     #if DEBUG_ENABLED_DEBUG
-    DEBUG("   [OK] ICS message prepared in shared memory (inbound_dp)\n");
+    DEBUG_INFO("   [OK] ICS message prepared in shared memory (inbound_dp)\n");
     DEBUG("   Action: Signaling ICS_Inbound component via inbound_ready_emit()\n");
     #endif
 
@@ -3681,7 +3421,7 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
     inbound_ready_emit();
 
     #if DEBUG_ENABLED_DEBUG
-    DEBUG("   [OK] Signal sent to ICS_Inbound - message handoff complete\n");
+    DEBUG_INFO("   [OK] Signal sent to ICS_Inbound - message handoff complete\n");
     DEBUG("   [MSG #%u now in ICS pipeline - waiting for processing]\n\n", msg_id);
     #endif
 
@@ -3704,7 +3444,7 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
                                     meta->pending_outbound_len, TCP_WRITE_FLAG_COPY);
 
         if (write_err == ERR_OK) {
-            DEBUG("%s: [OK] tcp_echo_recv: Sent pending outbound %u bytes\n",
+            DEBUG_INFO("%s: [OK] tcp_echo_recv: Sent pending outbound %u bytes\n",
                    COMPONENT_NAME, meta->pending_outbound_len);
 
             /* Clean up */
@@ -3844,7 +3584,7 @@ static err_t tcp_echo_poll(void *arg, struct tcp_pcb *pcb)
         meta->has_pending_outbound = false;
 
         #if DEBUG_TRAFFIC
-        DEBUG("%s:   [OK] Outbound data flushed by poll callback\n", COMPONENT_NAME);
+        DEBUG_INFO("%s:   [OK] Outbound data flushed by poll callback\n", COMPONENT_NAME);
         #endif
     }
 
@@ -3894,7 +3634,7 @@ static err_t tcp_echo_poll(void *arg, struct tcp_pcb *pcb)
 
             inbound_ready_emit();  /* Signal Net1 to process queue */
 
-            DEBUG("%s:   [OK] Close notification queued for Net1 (session %u)\n",
+            DEBUG_INFO("%s:   [OK] Close notification queued for Net1 (session %u)\n",
                    COMPONENT_NAME, meta->session_id);
         } else {
             DEBUG_WARN("%s:   [WARN] inbound_dp NULL - cannot notify Net1\n", COMPONENT_NAME);
@@ -3924,7 +3664,7 @@ static err_t tcp_echo_poll(void *arg, struct tcp_pcb *pcb)
             /* v2.193: Enqueue cleanup - main loop will handle counter decrement */
             enqueue_cleanup(meta->session_id);
 
-            DEBUG("%s:   [OK] Connection aborted - cleanup enqueued (session %u)\n",
+            DEBUG_INFO("%s:   [OK] Connection aborted - cleanup enqueued (session %u)\n",
                    COMPONENT_NAME, meta->session_id);
 
             return ERR_ABRT;
@@ -3968,7 +3708,7 @@ static err_t tcp_echo_poll(void *arg, struct tcp_pcb *pcb)
         /* v2.193: Enqueue cleanup (main loop will process) */
         enqueue_cleanup(meta->session_id);
 
-        DEBUG("%s:   [OK] Close initiated and cleanup enqueued (session %u, pending for %ums)\n",
+        DEBUG_INFO("%s:   [OK] Close initiated and cleanup enqueued (session %u, pending for %ums)\n",
                COMPONENT_NAME, meta->session_id, pending_duration);
 
         /* Return ERR_OK - lwIP will complete close handshake */
@@ -4114,7 +3854,7 @@ static void setup_tcp_echo_server(void)
     }
 
 #if DEBUG_ENABLED_DEBUG
-    DEBUG("%s: [DEBUG] [OK] TCP PCB created successfully at %p\n", COMPONENT_NAME, (void*)pcb);
+    DEBUG_INFO("%s: [DEBUG] [OK] TCP PCB created successfully at %p\n", COMPONENT_NAME, (void*)pcb);
     DEBUG("%s: [DEBUG] About to call tcp_bind(pcb, IP_ADDR_ANY, %d)...\n", COMPONENT_NAME, TCP_ECHO_PORT);
     fflush(stdout);
 #endif
@@ -4133,7 +3873,7 @@ static void setup_tcp_echo_server(void)
     }
 
 #if DEBUG_ENABLED_DEBUG
-    DEBUG("%s: [DEBUG] [OK] Successfully bound to port %d\n", COMPONENT_NAME, TCP_ECHO_PORT);
+    DEBUG_INFO("%s: [DEBUG] [OK] Successfully bound to port %d\n", COMPONENT_NAME, TCP_ECHO_PORT);
     DEBUG("%s: [DEBUG] About to call tcp_listen_with_backlog(pcb, %d)...\n", COMPONENT_NAME, MAX_TCP_CONNECTIONS);
     fflush(stdout);
 #endif
@@ -4151,7 +3891,7 @@ static void setup_tcp_echo_server(void)
     }
 
 #if DEBUG_ENABLED_DEBUG
-    DEBUG("%s: [DEBUG] [OK] Now listening on port %d\n", COMPONENT_NAME, TCP_ECHO_PORT);
+    DEBUG_INFO("%s: [DEBUG] [OK] Now listening on port %d\n", COMPONENT_NAME, TCP_ECHO_PORT);
     DEBUG("%s: [DEBUG] About to call tcp_accept(pcb, tcp_echo_accept)...\n", COMPONENT_NAME);
     fflush(stdout);
 #endif
@@ -4159,7 +3899,7 @@ static void setup_tcp_echo_server(void)
     tcp_accept(pcb, tcp_echo_accept);
 
 #if DEBUG_ENABLED_DEBUG
-    DEBUG("%s: [DEBUG] [OK] Accept callback registered\n", COMPONENT_NAME);
+    DEBUG_INFO("%s: [DEBUG] [OK] Accept callback registered\n", COMPONENT_NAME);
     DEBUG("%s: [DEBUG] Exiting setup_tcp_echo_server() - SUCCESS\n", COMPONENT_NAME);
     fflush(stdout);
 #endif
@@ -4348,7 +4088,7 @@ void outbound_ready_handle(void)
     }
 
     #if DEBUG_TRAFFIC
-    DEBUG("%s: [OK] Dataport check: outbound_dp=%p (valid)\n", COMPONENT_NAME, (void*)outbound_dp);
+    DEBUG_INFO("%s: [OK] Dataport check: outbound_dp=%p (valid)\n", COMPONENT_NAME, (void*)outbound_dp);
     #endif
 
     BREADCRUMB(3003);  /* Reading ICS message */
@@ -5030,24 +4770,6 @@ void outbound_ready_handle(void)
 
     BREADCRUMB(3011);  /* tcp_write succeeded */
 
-    /* v2.209: Update TX timestamp for delayed metadata cleanup
-     * ═══════════════════════════════════════════════════════════════════════════
-     * Purpose: Track last successful TX activity for fast-track cleanup
-     *
-     * This timestamp enables two-tier cleanup strategy:
-     *   - Fast-track: Cleanup after 1 second TX idle (normal case)
-     *   - Grace period: Cleanup after 5 seconds max (safety net)
-     *
-     * Why update here:
-     *   - tcp_write() succeeded → data queued for transmission
-     *   - This is the last TX activity for this connection
-     *   - check_pending_cleanups() uses this to calculate tx_idle time
-     *
-     * Result: Metadata persists until TX completes, preventing "TX: No metadata"
-     * ═══════════════════════════════════════════════════════════════════════════
-     */
-    meta->last_tx_timestamp = sys_now();
-
     /* v2.189: CRITICAL FIX - Mark response received BEFORE checking awaiting_response
      * ═══════════════════════════════════════════════════════════════════════════
      * Problem: Race condition between response arrival and SCADA close
@@ -5102,12 +4824,12 @@ void outbound_ready_handle(void)
     meta->has_pending_outbound = true;  /* Signal poll callback to flush */
 
     #if DEBUG_TRAFFIC
-    DEBUG("%s: [OK] OUTBOUND: Queued %u bytes (poll callback will flush)\n",
+    DEBUG_INFO("%s: [OK] OUTBOUND: Queued %u bytes (poll callback will flush)\n",
            COMPONENT_NAME, ics_msg->payload_length);
     #endif
 
     #if DEBUG_ENABLED_DEBUG
-    DEBUG("   [OK] [MSG #%u] Response sent immediately to SCADA\n\n", msg_id);
+    DEBUG_INFO("   [OK] [MSG #%u] Response sent immediately to SCADA\n\n", msg_id);
     #endif
 
     /* v2.179: CRITICAL FIX - Only close if SCADA already sent FIN
@@ -5876,24 +5598,6 @@ int run(void)
         if (++cleanup_counter >= 100) {
             cleanup_counter = 0;
             connection_cleanup_stale();
-
-            /* v2.209: Check and cleanup connections with metadata_close_pending
-             * ═══════════════════════════════════════════════════════════════════════════
-             * Purpose: Process delayed metadata cleanups (fix pbuf leak race condition)
-             *
-             * This implements two-tier cleanup:
-             *   1. Fast-track: Cleanup after 1 second TX idle (normal case)
-             *   2. Grace period: Cleanup after 5 seconds max (safety net)
-             *
-             * Why here:
-             *   - Runs periodically with connection_cleanup_stale() (every 100 iterations)
-             *   - Ensures pending cleanups are processed promptly
-             *   - Prevents connection pool exhaustion
-             *
-             * Result: Metadata persists until TX completes, preventing "TX: No metadata"
-             * ═══════════════════════════════════════════════════════════════════════════
-             */
-            check_pending_cleanups();
         }
 
         seL4_Yield();

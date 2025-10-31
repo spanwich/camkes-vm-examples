@@ -227,28 +227,22 @@ static inline bool everparse_validate(const uint8_t* payload, size_t length) {
 }
 
 /*
- * Simple logging macros for debug output
- * Uses printf-style formatting but can be redirected to serial/syslog
+ * v2.208: ALL LOGGING MACROS MOVED TO debug_levels.h
+ * =============================================================================
+ * This file (common.h) now contains ONLY data structure definitions.
+ *
+ * For logging, use debug_levels.h macros:
+ *   DEBUG_ERROR(...)  - Critical failures (level 1)
+ *   DEBUG_WARN(...)   - Warnings (level 2)
+ *   DEBUG_INFO(...)   - Operational info (level 3)
+ *   DEBUG(...)        - Detailed diagnostics (level 4)
+ *   BREADCRUMB(id)    - Execution tracing (controlled by BREADCRUMB_TRACE)
+ *
+ * Previous LOG_* macros removed (zero usage found - dead code)
+ * Previous BREADCRUMB definitions removed (duplicate/conflicting with debug_levels.h)
+ *
+ * See debug_levels.h for complete logging system documentation.
  */
-#define LOG_DEBUG(fmt, ...) printf("[DEBUG] " fmt "\n", ##__VA_ARGS__)
-#define LOG_INFO(fmt, ...)  printf("[INFO] " fmt "\n", ##__VA_ARGS__)
-#define LOG_WARN(fmt, ...)  printf("[WARN] " fmt "\n", ##__VA_ARGS__)
-#define LOG_ERROR(fmt, ...) printf("[ERROR] " fmt "\n", ##__VA_ARGS__)
-
-/*
- * Minimal breadcrumb tracing for debugging race conditions
- * These are ultra-minimal - just marks execution points
- * Enable/disable by setting BREADCRUMB_TRACE to 1/0
- */
-#ifndef BREADCRUMB_TRACE
-#define BREADCRUMB_TRACE 1
-#endif
-
-#if BREADCRUMB_TRACE
-    #define BREADCRUMB(id) printf("B%d\n", (id))
-#else
-    #define BREADCRUMB(id) do {} while(0)
-#endif
 
 /*
  * Timestamp utility (simple incrementing counter for now)

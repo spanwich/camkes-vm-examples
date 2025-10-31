@@ -1,3 +1,7 @@
+/* v2.207: New industry-standard 5-level debug system */
+#define DEBUG_LEVEL DEBUG_LEVEL_INFO
+#include "debug_levels.h"
+
 /*
  * ICS_Outbound - Internal to External Validation Component
  *
@@ -18,13 +22,13 @@
 #include "common.h"
 
 /* Debug output control - set to 0 for silent mode (breadcrumbs only) */
-#define DEBUG_SILENT 1
-
-#if DEBUG_SILENT
-    #define DEBUG_PRINTF(...) do {} while(0)
-#else
-    #define DEBUG_PRINTF printf
-#endif
+/* OLD: #define DEBUG_SILENT 1  */
+/* OLD:   */
+/* OLD: #if DEBUG_SILENT  */
+/* OLD:     #define DEBUG(...) do {} while(0)  */
+/* OLD: #else  */
+/* OLD:     #define DEBUG_PRINTF printf  */
+/* OLD: #endif  */
 
 /* Global timestamp counter definition */
 uint64_t global_timestamp_counter = 0;
@@ -42,37 +46,37 @@ static uint64_t other_messages = 0;
  * Print frame metadata for debugging
  */
 static void print_frame_metadata(const FrameMetadata *meta) {
-    DEBUG_PRINTF("ICS_Outbound: Frame Metadata:\n");
-    DEBUG_PRINTF("  EtherType: 0x%04X\n", meta->ethertype);
-    DEBUG_PRINTF("  Src MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
+    DEBUG("ICS_Outbound: Frame Metadata:\n");
+    DEBUG("  EtherType: 0x%04X\n", meta->ethertype);
+    DEBUG("  Src MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
            meta->src_mac[0], meta->src_mac[1], meta->src_mac[2],
            meta->src_mac[3], meta->src_mac[4], meta->src_mac[5]);
-    DEBUG_PRINTF("  Dst MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
+    DEBUG("  Dst MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
            meta->dst_mac[0], meta->dst_mac[1], meta->dst_mac[2],
            meta->dst_mac[3], meta->dst_mac[4], meta->dst_mac[5]);
 
     if (meta->is_ip) {
-        DEBUG_PRINTF("  IP Protocol: %u (", meta->ip_protocol);
-        if (meta->is_tcp) DEBUG_PRINTF("TCP");
-        else if (meta->is_udp) DEBUG_PRINTF("UDP");
-        else DEBUG_PRINTF("Other");
-        DEBUG_PRINTF(")\n");
-        DEBUG_PRINTF("  Src IP: %u.%u.%u.%u\n",
+        DEBUG("  IP Protocol: %u (", meta->ip_protocol);
+        if (meta->is_tcp) DEBUG("TCP");
+        else if (meta->is_udp) DEBUG("UDP");
+        else DEBUG("Other");
+        DEBUG(")\n");
+        DEBUG("  Src IP: %u.%u.%u.%u\n",
                (meta->src_ip >> 24) & 0xFF, (meta->src_ip >> 16) & 0xFF,
                (meta->src_ip >> 8) & 0xFF, meta->src_ip & 0xFF);
-        DEBUG_PRINTF("  Dst IP: %u.%u.%u.%u\n",
+        DEBUG("  Dst IP: %u.%u.%u.%u\n",
                (meta->dst_ip >> 24) & 0xFF, (meta->dst_ip >> 16) & 0xFF,
                (meta->dst_ip >> 8) & 0xFF, meta->dst_ip & 0xFF);
 
         if (meta->is_tcp || meta->is_udp) {
-            DEBUG_PRINTF("  Src Port: %u\n", meta->src_port);
-            DEBUG_PRINTF("  Dst Port: %u\n", meta->dst_port);
+            DEBUG("  Src Port: %u\n", meta->src_port);
+            DEBUG("  Dst Port: %u\n", meta->dst_port);
         }
     } else if (meta->is_arp) {
-        DEBUG_PRINTF("  ARP packet\n");
+        DEBUG("  ARP packet\n");
     }
 
-    DEBUG_PRINTF("  Payload: offset=%u, length=%u\n",
+    DEBUG("  Payload: offset=%u, length=%u\n",
            meta->payload_offset, meta->payload_length);
 }
 
@@ -84,13 +88,13 @@ static bool validate_message(const ICS_Message *msg) {
 
     /* Basic validation */
     if (msg->payload_length > MAX_PAYLOAD_SIZE) {
-        DEBUG_PRINTF("ICS_Outbound: REJECT - Payload too large (%u > %u)\n",
+        DEBUG("ICS_Outbound: REJECT - Payload too large (%u > %u)\n",
                msg->payload_length, MAX_PAYLOAD_SIZE);
         return false;
     }
 
     if (msg->payload_length != meta->payload_length) {
-        DEBUG_PRINTF("ICS_Outbound: REJECT - Payload length mismatch (msg=%u, meta=%u)\n",
+        DEBUG("ICS_Outbound: REJECT - Payload length mismatch (msg=%u, meta=%u)\n",
                msg->payload_length, meta->payload_length);
         return false;
     }
@@ -98,7 +102,7 @@ static bool validate_message(const ICS_Message *msg) {
     /* EverParse validation hook (Phase 1: no-op) */
     if (msg->payload_length > 0) {
         if (!everparse_validate(msg->payload, msg->payload_length)) {
-            DEBUG_PRINTF("ICS_Outbound: REJECT - EverParse validation failed\n");
+            DEBUG("ICS_Outbound: REJECT - EverParse validation failed\n");
             return false;
         }
     }
@@ -110,7 +114,7 @@ static bool validate_message(const ICS_Message *msg) {
     else other_messages++;
 
     /* Phase 1: Allow all valid messages */
-    DEBUG_PRINTF("ICS_Outbound: ALLOW - Message passed validation\n");
+    DEBUG("ICS_Outbound: ALLOW - Message passed validation\n");
     return true;
 }
 
@@ -124,7 +128,7 @@ static bool process_message(void) {
 
     /* Basic bounds check */
     if (!basic_bounds_check(in_msg, sizeof(Buf))) {
-        DEBUG_PRINTF("ICS_Outbound: ERROR - Bounds check failed\n");
+        DEBUG("ICS_Outbound: ERROR - Bounds check failed\n");
         stats.messages_dropped++;
         return false;
     }
@@ -171,7 +175,7 @@ static bool process_message(void) {
     stats.messages_forwarded++;
     stats.bytes_processed += sizeof(FrameMetadata) + sizeof(uint16_t) + in_msg->payload_length;
 
-    DEBUG_PRINTF("ICS_Outbound: Forwarded message to external network\n");
+    DEBUG("ICS_Outbound: Forwarded message to external network\n");
     return true;
 }
 
@@ -185,12 +189,12 @@ void in_ntfy_handle(void) {
         /* Print periodic stats */
         static uint32_t stats_counter = 0;
         if (++stats_counter % 10 == 0) {
-            DEBUG_PRINTF("\n=== ICS_Outbound Statistics ===\n");
-            DEBUG_PRINTF("Received: %llu, Forwarded: %llu, Dropped: %llu\n",
+            DEBUG("\n=== ICS_Outbound Statistics ===\n");
+            DEBUG("Received: %llu, Forwarded: %llu, Dropped: %llu\n",
                    stats.messages_received, stats.messages_forwarded, stats.messages_dropped);
-            DEBUG_PRINTF("TCP: %llu, UDP: %llu, ARP: %llu, Other: %llu\n",
+            DEBUG("TCP: %llu, UDP: %llu, ARP: %llu, Other: %llu\n",
                    tcp_messages, udp_messages, arp_messages, other_messages);
-            DEBUG_PRINTF("===============================\n\n");
+            DEBUG("===============================\n\n");
         }
     }
 }
@@ -201,16 +205,16 @@ void in_ntfy_handle(void) {
 void pre_init(void) {
     memset(&stats, 0, sizeof(stats));
     tcp_messages = udp_messages = arp_messages = other_messages = 0;
-    DEBUG_PRINTF("ICS_Outbound: Initializing internal→external validation...\n");
-    DEBUG_PRINTF("ICS_Outbound: 🔖 SOFTWARE VERSION: v2.161 (2025-10-25)\n");
-    DEBUG_PRINTF("ICS_Outbound: 🔧 Features: Metadata logging + EverParse validation hooks + error_queue forwarding\n");
-    DEBUG_PRINTF("ICS_Outbound: 📊 Protocols: TCP, UDP, ARP detection\n");
-    DEBUG_PRINTF("ICS_Outbound: ✅ CRITICAL FIX: Forwards error_queue from Net1 to Net0 (fixes error notification delivery)\n\n");
+    DEBUG("ICS_Outbound: Initializing internal→external validation...\n");
+    DEBUG("ICS_Outbound: 🔖 SOFTWARE VERSION: v2.161 (2025-10-25)\n");
+    DEBUG("ICS_Outbound: 🔧 Features: Metadata logging + EverParse validation hooks + error_queue forwarding\n");
+    DEBUG("ICS_Outbound: 📊 Protocols: TCP, UDP, ARP detection\n");
+    DEBUG("ICS_Outbound: ✅ CRITICAL FIX: Forwards error_queue from Net1 to Net0 (fixes error notification delivery)\n\n");
 }
 
 int run(void) {
-    DEBUG_PRINTF("ICS_Outbound: Ready to validate internal→external traffic\n");
-    DEBUG_PRINTF("ICS_Outbound: Phase 1 - Pass-through with comprehensive logging\n");
+    DEBUG("ICS_Outbound: Ready to validate internal→external traffic\n");
+    DEBUG("ICS_Outbound: Phase 1 - Pass-through with comprehensive logging\n");
 
     /* Main event loop */
     while (1) {

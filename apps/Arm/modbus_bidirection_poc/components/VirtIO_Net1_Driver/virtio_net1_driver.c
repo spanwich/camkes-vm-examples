@@ -177,6 +177,23 @@ struct connection_metadata {
     /* v2.153: Deduplication flags (symmetrical with Net0) */
     bool close_notified;             /* True if close notification already queued */
 
+    /* v2.212-phase1: PCB lifecycle tracking for centralized cleanup
+     * ══════════════════════════════════════════════════════════════════════════
+     * Purpose: Prevent double-close attempts and track PCB state independently
+     *
+     * Problem: Multiple code paths try to close the same PCB:
+     *   - Close notification handler calls tcp_close()
+     *   - Error callback may have already closed it
+     *   - Trying to close already-freed PCB → crash
+     *
+     * Solution: Track whether PCB has been closed/aborted
+     *   - Set pcb_closed=true when tcp_close() or tcp_abort() called
+     *   - Check flag before attempting close operations
+     *   - Allows metadata to persist with pcb=NULL safely
+     * ══════════════════════════════════════════════════════════════════════════
+     */
+    bool pcb_closed;                 /* True if PCB has been closed/aborted (don't close again) */
+
 };
 
 static struct connection_metadata connection_table[MAX_CONNECTIONS];
@@ -2950,13 +2967,24 @@ static err_t inbound_tcp_recv_callback(void *arg, struct tcp_pcb *pcb, struct pb
             return ERR_OK;
         }
 
-        /* Mark PCB as NULL in metadata */
-        DEBUG_WARN("%s: [WARN]  PLC closed connection - marking PCB as NULL (keeping metadata)\n",
+        /* v2.212-phase1: CRITICAL FIX - Don't set pcb=NULL prematurely!
+         * ═══════════════════════════════════════════════════════════════
+         * OLD CODE (v2.211): Set pcb=NULL immediately
+         *   meta->pcb = NULL;  // ❌ Causes "TX: No metadata" errors!
+         *
+         * Problem:
+         *   - lwIP needs to send FIN-ACK after this callback returns
+         *   - TX path looks up metadata by port
+         *   - If pcb=NULL, TX can't restore IP addresses correctly
+         *   - Result: Packet sent with wrong IP → no ACK → pbuf leak
+         *
+         * NEW CODE (v2.212): Keep pcb valid, use flag to track state
+         *   - Don't modify meta->pcb here
+         *   - Let process_cleanup_queue() handle it after TX idle
+         * ═══════════════════════════════════════════════════════════════
+         */
+        DEBUG_WARN("%s: [WARN]  PLC closed connection - keeping metadata for FIN-ACK TX\n",
                COMPONENT_NAME);
-        meta->pcb = NULL;
-
-        /* Memory barrier to ensure metadata update is visible */
-        __sync_synchronize();
 
         /* Check if PCB is still valid (not NULL) */
         if (pcb == NULL) {
@@ -3000,7 +3028,7 @@ static err_t inbound_tcp_recv_callback(void *arg, struct tcp_pcb *pcb, struct pb
          * ═══════════════════════════════════════════════════════════════════════════
          */
         if (meta != NULL) {
-            meta->pcb = NULL;
+            /* v2.212-phase1: Don't set pcb=NULL here - keep it for TX path */
 
             /* v2.210: CRITICAL FIX - Use delayed metadata cleanup (same as Net0)
              * ═══════════════════════════════════════════════════════════════════════════
@@ -3036,6 +3064,15 @@ static err_t inbound_tcp_recv_callback(void *arg, struct tcp_pcb *pcb, struct pb
 
             /* DON'T decrement connection_count here - check_pending_cleanups() will handle it */
             /* DON'T set active=false - lwIP needs metadata for FIN-ACK transmission */
+
+            /* v2.212-phase1: Enqueue cleanup for centralized processing
+             * ═══════════════════════════════════════════════════════════════
+             * NEW: Enqueue cleanup request so main loop can handle it
+             * - Main loop will wait for TX idle before cleanup
+             * - Prevents "TX: No metadata" errors during FIN-ACK exchange
+             * ═══════════════════════════════════════════════════════════════
+             */
+            enqueue_cleanup(meta->session_id);
 
             update_shared_connection_state();
             __sync_synchronize();  /* Ensure metadata update visible */
@@ -3342,22 +3379,42 @@ static void inbound_tcp_err_callback(void *arg, err_t err)
              * That means: if we're in this callback, it's NEVER from close handler.
              * So we should ALWAYS clean up metadata!
              */
-            DEBUG("%s:   → Clearing metadata PCB pointer (PCB was freed by lwIP)\n",
+            /* v2.212-phase1: CENTRALIZED CLEANUP - Don't modify metadata directly
+             * ═══════════════════════════════════════════════════════════════
+             * OLD CODE (v2.211):
+             *   meta->pcb = NULL;       // ❌ Direct manipulation
+             *   meta->active = false;   // ❌ Direct manipulation
+             *   enqueue_cleanup();      // ✅ Enqueue
+             *
+             * NEW CODE (v2.212-phase1):
+             *   Set intent flags only
+             *   Enqueue cleanup request
+             *   Let process_cleanup_queue() handle metadata atomically
+             *
+             * Benefits:
+             *   - TX path can still find metadata until main loop processes cleanup
+             *   - Eliminates race window where TX sees active=false or pcb=NULL
+             *   - Single point of truth for metadata modification
+             * ═══════════════════════════════════════════════════════════════
+             */
+            DEBUG("%s:   → Setting metadata_close_pending flag (PCB was freed by lwIP)\n",
                    COMPONENT_NAME);
 
-            meta->pcb = NULL;  /* PCB already freed by lwIP */
-            meta->active = false;
+            meta->metadata_close_pending = true;  /* Intent flag: cleanup needed */
+            meta->close_timestamp = sys_now();     /* For deferred cleanup timeout */
+            meta->pcb_closed = true;               /* PCB already freed by lwIP */
             /* DON'T clear error_notified - keeps deduplication active for retransmitted RSTs */
 
             /* v2.117: Update shared connection state */
             update_shared_connection_state();
 
-            /* v2.198: Enqueue cleanup instead of direct connection_count--
+            /* v2.198/v2.212: Enqueue cleanup - main loop will handle metadata atomically
              * ═══════════════════════════════════════════════════════════════
              * Symmetrical with Net0 v2.198 - Single cleanup logic
              * - Old code: Complex logic to determine if we should decrement
              * - New code: Always enqueue, queue handles deduplication via session_id
              * - Works even if close handler already enqueued (natural dedup)
+             * - v2.212: No longer sets active=false or pcb=NULL here!
              * ═══════════════════════════════════════════════════════════════
              */
             enqueue_cleanup(meta->session_id);
@@ -3441,16 +3498,29 @@ static err_t inbound_tcp_connected_callback(void *arg, struct tcp_pcb *pcb, err_
             }
         }
 
-        /* v2.186: Clean up metadata for failed handshake */
+        /* v2.212-phase1: Clean up metadata for failed handshake using centralized cleanup
+         * ═══════════════════════════════════════════════════════════════
+         * OLD CODE (v2.211):
+         *   meta->pcb = NULL;       // ❌ Direct manipulation
+         *   meta->active = false;   // ❌ Direct manipulation
+         *   connection_count--;     // ❌ Direct decrement
+         *
+         * NEW CODE (v2.212-phase1):
+         *   Set intent flags and enqueue cleanup
+         *   Let process_cleanup_queue() handle metadata atomically
+         * ═══════════════════════════════════════════════════════════════
+         */
         if (meta != NULL) {
-            meta->pcb = NULL;
-            meta->active = false;
-            if (connection_count > 0) {
-                uint32_t old_count = connection_count;
-                connection_count--;
-                DEBUG("%s: [COUNT--] %u → %u | inbound_tcp_connected_callback() handshake failed err=%d\n",
-                       COMPONENT_NAME, old_count, connection_count, err);
-            }
+            meta->metadata_close_pending = true;  /* Intent: cleanup needed */
+            meta->close_timestamp = sys_now();     /* For timeout tracking */
+            meta->pcb_closed = true;               /* Handshake failed, PCB invalid */
+
+            /* Enqueue for centralized cleanup */
+            enqueue_cleanup(meta->session_id);
+
+            DEBUG("%s: [ENQUEUE] Handshake failed (err=%d), enqueued cleanup for session %u\n",
+                   COMPONENT_NAME, err, meta->session_id);
+
             update_shared_connection_state();
         }
 
@@ -3809,10 +3879,26 @@ void inbound_ready_handle(void)
                 tcp_err(pcb, NULL);   /* Prevent error callback during close */
                 tcp_poll(pcb, NULL, 0);
 
-                /* Step 2: Mark PCB as NULL in metadata BEFORE closing */
-                meta->pcb = NULL;
-                meta->active = false;
-                meta->error_notified = false;  /* Clear dedup flag */
+                /* Step 2: v2.212-phase1: Set intent flags instead of direct manipulation
+                 * ═══════════════════════════════════════════════════════════════
+                 * OLD CODE (v2.211):
+                 *   meta->pcb = NULL;       // ❌ Direct manipulation
+                 *   meta->active = false;   // ❌ Direct manipulation
+                 *
+                 * NEW CODE (v2.212-phase1):
+                 *   meta->metadata_close_pending = true;  // ✅ Intent flag
+                 *   meta->pcb_closed = true;              // ✅ State tracking
+                 *
+                 * Benefits:
+                 *   - Metadata remains accessible to TX path
+                 *   - process_cleanup_queue() handles atomic cleanup
+                 *   - Prevents race conditions
+                 * ═══════════════════════════════════════════════════════════════
+                 */
+                meta->metadata_close_pending = true;   /* Intent: cleanup needed */
+                meta->close_timestamp = sys_now();     /* For timeout tracking */
+                meta->pcb_closed = true;               /* PCB will be closed below */
+                meta->error_notified = false;          /* Clear dedup flag */
 
                 __sync_synchronize();  /* Ensure metadata updates visible */
 

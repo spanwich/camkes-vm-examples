@@ -1437,10 +1437,16 @@ static inline void enqueue_cleanup(uint32_t session_id)
 }
 
 /**
- * connection_cleanup_atomic() - Atomic cleanup of a single connection
- * v2.143: SINGLE source of truth for counter decrements
+ * v2.212-phase3: DEPRECATED - connection_cleanup_atomic()
+ * v2.143: Was the SINGLE source of truth for counter decrements
+ * v2.212: Replaced by process_cleanup_queue() for centralization
+ *
+ * This function is NO LONGER USED. All cleanup logic moved to
+ * process_cleanup_queue() which is now the ONLY place that
+ * modifies metadata and decrements counters.
  */
-static void connection_cleanup_atomic(struct connection_metadata *meta)
+#if 0  /* DEPRECATED - keeping for reference only */
+static void connection_cleanup_atomic_DEPRECATED(struct connection_metadata *meta)
 {
     if (meta == NULL) {
         DEBUG("%s: ERROR: connection_cleanup_atomic called with NULL meta\n",
@@ -1496,10 +1502,12 @@ static void connection_cleanup_atomic(struct connection_metadata *meta)
     /* Update shared connection state */
     update_shared_connection_state();
 }
+#endif  /* DEPRECATED */
 
 /**
  * process_cleanup_queue() - Consumer: Process pending cleanup requests
  * Called from main loop to atomically clean up connections
+ * v2.212-phase3: Now the ONLY place that modifies metadata!
  */
 static void process_cleanup_queue(void)
 {
@@ -1798,8 +1806,21 @@ static bool was_recently_self_cleaned(uint32_t src_ip, uint16_t src_port, uint16
     return false;
 }
 
-/* Remove connection metadata */
-static void connection_remove(struct tcp_pcb *pcb)
+/* v2.212-phase3: DEPRECATED - connection_remove()
+ * ═══════════════════════════════════════════════════════════════════════════
+ * This function is NO LONGER USED in v2.212. All cleanup must go through
+ * the centralized cleanup queue (enqueue_cleanup()).
+ *
+ * Why deprecated:
+ * - Direct metadata manipulation bypasses cleanup queue
+ * - Caused race conditions (meta set to NULL while TX path needs it)
+ * - PCB pointer matching unreliable (lwIP reuses addresses)
+ *
+ * Replacement: Use enqueue_cleanup(session_id) instead
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
+#if 0  /* DEPRECATED - keeping for reference only */
+static void connection_remove_DEPRECATED(struct tcp_pcb *pcb)
 {
     for (int i = 0; i < MAX_CONNECTIONS; i++) {
         if (connection_table[i].active && connection_table[i].pcb == pcb) {
@@ -1832,6 +1853,7 @@ static void connection_remove(struct tcp_pcb *pcb)
         }
     }
 }
+#endif  /* DEPRECATED */
 
 /* Print connection table statistics
  *
@@ -2509,11 +2531,24 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
          *   - Queue searches by session_id (not PCB pointer)
          *   - Prevents wrong metadata deletion
          *   - Allows TX path to complete before cleanup
+         *
+         * v2.212-phase3: Use centralized cleanup instead of connection_remove()
+         *   - Find metadata by PCB
+         *   - Enqueue cleanup by session_id
+         *   - Let process_cleanup_queue() handle it atomically
          * ═══════════════════════════════════════════════════════════════════════════
          */
 
-        /* Clean up connection metadata before lwIP frees PCB */
-        connection_remove(pcb);
+        /* v2.212-phase3: Clean up via centralized queue instead of direct removal */
+        struct connection_metadata *meta = connection_lookup_by_pcb(pcb);
+        if (meta != NULL) {
+            meta->metadata_close_pending = true;
+            meta->close_timestamp = sys_now();
+            meta->pcb_closed = true;
+            enqueue_cleanup(meta->session_id);
+            DEBUG("%s: [ECHO-RECV] Enqueued cleanup for session %u (PCB=%p)\n",
+                   COMPONENT_NAME, meta->session_id, (void*)pcb);
+        }
 
         /* v2.82: Return ERR_ABRT - lwIP handles tcp_abort() internally */
         return ERR_ABRT;
@@ -3697,8 +3732,19 @@ static err_t outbound_tcp_sent_callback(void *arg, struct tcp_pcb *pcb, u16_t le
          * - lwIP callback returns and tries to use freed PCB
          * - Crash at address 0x10 (NULL + offset)
          *
-         * Correct protocol: Return ERR_ABRT, lwIP handles tcp_abort() internally */
-        connection_remove(pcb);
+         * Correct protocol: Return ERR_ABRT, lwIP handles tcp_abort() internally
+         *
+         * v2.212-phase3: Use centralized cleanup instead of connection_remove()
+         */
+        struct connection_metadata *meta = connection_lookup_by_pcb(pcb);
+        if (meta != NULL) {
+            meta->metadata_close_pending = true;
+            meta->close_timestamp = sys_now();
+            meta->pcb_closed = true;
+            enqueue_cleanup(meta->session_id);
+            DEBUG("%s: [OUTBOUND-ERR] Enqueued cleanup for session %u (PCB=%p)\n",
+                   COMPONENT_NAME, meta->session_id, (void*)pcb);
+        }
         state->active = false;  /* v2.106: Mark outbound client as free */
 
         return ERR_ABRT;  /* Let lwIP handle tcp_abort() internally */
@@ -4417,10 +4463,26 @@ cleanup_and_create_new:
         BREADCRUMB(2108);  /* Cleanup path - about to abort and remove metadata */
         DEBUG("%s:   [CLEAN] Sending RST to PLC for old connection (SCADA opened new one)\n",
                COMPONENT_NAME);
-        tcp_abort(existing_pcb);  /* Immediate cleanup - no FIN_WAIT */
 
-        /* v2.107: connection_remove() will automatically free the associated pool state */
-        connection_remove(existing_pcb);  /* Frees pool_state inside */
+        /* v2.212-phase3: Use centralized cleanup instead of connection_remove() */
+        struct connection_metadata *existing_meta = connection_lookup_by_pcb(existing_pcb);
+        if (existing_meta != NULL) {
+            existing_meta->metadata_close_pending = true;
+            existing_meta->close_timestamp = sys_now();
+            existing_meta->pcb_closed = true;  /* Will be closed below */
+
+            /* Free pool state before tcp_abort (it needs to be freed before PCB is freed) */
+            if (existing_meta->pool_state != NULL) {
+                inbound_free_state(existing_meta->pool_state);
+                existing_meta->pool_state = NULL;
+            }
+
+            enqueue_cleanup(existing_meta->session_id);
+            DEBUG("%s:   [CLEAN] Enqueued cleanup for old session %u\n",
+                   COMPONENT_NAME, existing_meta->session_id);
+        }
+
+        tcp_abort(existing_pcb);  /* Immediate cleanup - no FIN_WAIT */
 
         DEBUG("%s:   [OK] Cleanup complete - proceeding to create new connection\n", COMPONENT_NAME);
     }

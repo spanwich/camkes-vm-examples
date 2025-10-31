@@ -1533,18 +1533,52 @@ static void process_cleanup_queue(void)
                    COMPONENT_NAME, req->session_id);
             cleanup_stats.duplicates++;
         } else {
-            /* v2.209: Check if metadata_close_pending is set */
+            /* v2.212-phase2: Integrated deferred cleanup logic
+             * ═══════════════════════════════════════════════════════════════
+             * OLD CODE (v2.211): Unconditionally skip if metadata_close_pending
+             *   - Delegated to check_pending_cleanups() function
+             *   - Separate timeout logic
+             *
+             * NEW CODE (v2.212-phase2): Check conditions inline
+             *   - Fast-track: After 1000ms TX idle
+             *   - Grace period: After 5000ms max
+             *   - Emergency: At 80% pool usage
+             *   - If conditions not met: Skip and retry next iteration
+             * ═══════════════════════════════════════════════════════════════
+             */
             if (meta->metadata_close_pending) {
-                DEBUG("%s: [v2.209] DEFERRED cleanup: session=%u has metadata_close_pending=true\n",
-                       COMPONENT_NAME, req->session_id);
-                DEBUG("%s:   → TX may still be pending, letting check_pending_cleanups() handle it\n",
-                       COMPONENT_NAME);
+                uint32_t time_since_close = sys_now() - meta->close_timestamp;
+                uint32_t time_since_tx = sys_now() - meta->last_tx_timestamp;
+                bool tx_idle = (time_since_tx > 1000);       /* No TX for 1 second */
+                bool timeout = (time_since_close > 5000);    /* Forced cleanup after 5 seconds */
+                float pool_usage = (float)connection_count / MAX_CONNECTIONS;
+                bool emergency = (pool_usage > 0.8);         /* Pool filling up */
 
-                /* Advance tail to prevent infinite loop, then skip cleanup */
-                __sync_synchronize();
-                tail++;
-                cleanup_queue.tail = tail;
-                continue;
+                if (tx_idle || timeout || emergency) {
+                    /* Conditions met - perform cleanup NOW */
+                    const char *reason = tx_idle ? "TX idle 1000ms" :
+                                        timeout ? "timeout 5000ms" :
+                                        "emergency pool 80%";
+                    DEBUG("%s: [v2.212] Deferred cleanup NOW: session=%u (%s)\n",
+                           COMPONENT_NAME, req->session_id, reason);
+                    DEBUG("%s:   → time_since_close=%ums, time_since_tx=%ums, pool=%d/%d\n",
+                           COMPONENT_NAME, time_since_close, time_since_tx,
+                           connection_count, MAX_CONNECTIONS);
+                    /* Continue to cleanup below... */
+                } else {
+                    /* Still waiting - defer cleanup */
+                    DEBUG("%s: [v2.212] DEFERRED cleanup: session=%u (waiting for conditions)\n",
+                           COMPONENT_NAME, req->session_id);
+                    DEBUG("%s:   → time_since_close=%ums, time_since_tx=%ums, pool=%d/%d\n",
+                           COMPONENT_NAME, time_since_close, time_since_tx,
+                           connection_count, MAX_CONNECTIONS);
+
+                    /* Advance tail to prevent infinite loop, then skip cleanup */
+                    __sync_synchronize();
+                    tail++;
+                    cleanup_queue.tail = tail;
+                    continue;
+                }
             }
 
             /* Clean up pending outbound data */
@@ -1573,7 +1607,12 @@ static void process_cleanup_queue(void)
                        COMPONENT_NAME, req->session_id);
             }
 
-            /* Mark metadata as inactive */
+            /* v2.212-phase2: Mark metadata as inactive - ONLY place this happens!
+             * ═══════════════════════════════════════════════════════════════
+             * This is the SINGLE SOURCE OF TRUTH for metadata cleanup.
+             * All other code paths must enqueue cleanup, not modify directly.
+             * ═══════════════════════════════════════════════════════════════
+             */
             meta->active = false;
             meta->pcb = NULL;
             meta->has_pending_outbound = false;
@@ -1583,6 +1622,8 @@ static void process_cleanup_queue(void)
             meta->close_pending = false;
             meta->close_notified = false;
             meta->cleanup_in_progress = false;
+            meta->metadata_close_pending = false;  /* v2.212: Clear deferred cleanup flag */
+            meta->pcb_closed = false;              /* v2.212: Reset PCB state */
 
             /* Set session_id=0 for idempotency */
             meta->session_id = 0;
@@ -1601,10 +1642,15 @@ static void process_cleanup_queue(void)
 }
 
 /**
- * check_pending_cleanups() - Check and cleanup connections with metadata_close_pending
+ * check_pending_cleanups() - DEPRECATED in v2.212-phase2
  * v2.210: Delayed metadata cleanup to prevent "TX: No metadata" errors
+ * v2.212-phase2: Logic moved into process_cleanup_queue() for centralization
+ *
+ * This function is NO LONGER CALLED. All cleanup logic is now in
+ * process_cleanup_queue() which handles both immediate and deferred cleanup.
  */
-static void check_pending_cleanups(void)
+#if 0  /* DEPRECATED - keeping for reference only */
+static void check_pending_cleanups_DEPRECATED(void)
 {
     uint32_t now = sys_now();
     int active_count = 0;
@@ -1687,6 +1733,7 @@ static void check_pending_cleanups(void)
         #endif
     }
 }
+#endif  /* DEPRECATED */
 
 
 /* v2.117: Self-cleaned connection tracking functions
@@ -5794,11 +5841,13 @@ int run(void)
          * - Fast-track: After 1000ms TX idle (99% of connections)
          * - Grace period: After 5000ms max (safety net)
          * - Emergency: At 80% pool usage (prevents exhaustion)
+         *
+         * v2.212-phase2: Logic moved into process_cleanup_queue()
+         * - No separate periodic call needed
+         * - Deferred cleanup conditions checked during queue processing
          * ═══════════════════════════════════════════════════════════════════════════
          */
-        if (loop_iterations % 1000 == 0) {  /* Check every ~1000 iterations (~1-3 seconds) */
-            check_pending_cleanups();
-        }
+        /* REMOVED in v2.212-phase2: check_pending_cleanups() - logic now in process_cleanup_queue() */
 
         /* v2.74: Heartbeat to detect silent hangs */
         if (++heartbeat_counter >= 50000) {

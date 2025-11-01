@@ -2370,6 +2370,17 @@ static err_t custom_input_promiscuous(struct pbuf *p, struct netif *inp)
                 src_port = ntohs(tcphdr->src);
                 dest_port = ntohs(tcphdr->dest);
 
+                /* v2.231: DEBUG - Track where port 62977 packets go */
+                if (dest_port == 62977 || src_port == 62977) {
+                    DEBUG("%s: [DEBUG-62977] custom_input_promiscuous: %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u, pbuf=%p, will pass to ip_input\n",
+                          COMPONENT_NAME,
+                          (pkt_src_ip >> 24) & 0xFF, (pkt_src_ip >> 16) & 0xFF,
+                          (pkt_src_ip >> 8) & 0xFF, pkt_src_ip & 0xFF, src_port,
+                          (pkt_dest_ip >> 24) & 0xFF, (pkt_dest_ip >> 16) & 0xFF,
+                          (pkt_dest_ip >> 8) & 0xFF, pkt_dest_ip & 0xFF, dest_port,
+                          (void*)p);
+                }
+
                 /* v2.222: TCP leak handling removed per user request (breaks connection)
                  * TCP packets to non-listening ports will be handled by lwIP
                  * Note: This may cause pbuf leaks for TCP to wrong ports, but connection
@@ -4161,15 +4172,24 @@ static err_t tcp_echo_accept(void *arg, struct tcp_pcb *newpcb, err_t err)
         return err != ERR_OK ? err : ERR_VAL;
     }
 
+    /* v2.231: DEBUG - Check if port 62977 ever reaches accept callback */
+    uint16_t local_port = newpcb->local_port;
+    uint16_t remote_port = newpcb->remote_port;
+
+    if (local_port == 62977 || remote_port == 62977) {
+        DEBUG("%s: [DEBUG-62977] tcp_echo_accept CALLED for port 62977! remote=%u.%u.%u.%u:%u, local:%u\n",
+               COMPONENT_NAME,
+               ip4_addr1(&newpcb->remote_ip), ip4_addr2(&newpcb->remote_ip),
+               ip4_addr3(&newpcb->remote_ip), ip4_addr4(&newpcb->remote_ip),
+               remote_port, local_port);
+    }
+
     /* v2.231: REJECT non-Modbus TCP connections immediately
      * Problem: Port 62977 and other non-Modbus ports cause pbuf leaks
      * Solution: Check ports and abort connection before creating metadata
      * - Prevents pbufs from accumulating in unwanted connections
      * - lwIP will properly clean up when we call tcp_abort()
      */
-    uint16_t local_port = newpcb->local_port;
-    uint16_t remote_port = newpcb->remote_port;
-
     if (local_port != TCP_SERVER_PORT && remote_port != TCP_SERVER_PORT) {
         DEBUG("%s: [REJECT-TCP] Non-Modbus connection from %u.%u.%u.%u:%u -> local:%u (aborting)\n",
                COMPONENT_NAME,

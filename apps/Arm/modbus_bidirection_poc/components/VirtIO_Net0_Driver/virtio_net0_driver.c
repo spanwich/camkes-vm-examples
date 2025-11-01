@@ -2951,28 +2951,33 @@ static void process_rx_packets(void)
 
                 if (eth_proto_check == 0x0800 && packet_len >= sizeof(struct ethhdr) + sizeof(struct iphdr)) {  /* IPv4 */
                     struct iphdr *ip = (struct iphdr *)(packet_data + sizeof(struct ethhdr));
-                    if (ip->protocol == 6) {  /* TCP */
+                    if (ip->protocol == 6) {  /* TCP - reject all except port 502 */
                         size_t ip_hdr_len = (ip->ihl) * 4;
+
+                        /* v2.227: Check if TCP packet is well-formed before parsing */
                         if (packet_len >= sizeof(struct ethhdr) + ip_hdr_len + sizeof(struct tcphdr)) {
+                            /* Well-formed TCP - parse ports and check */
                             struct tcphdr *tcp = (struct tcphdr *)(packet_data + sizeof(struct ethhdr) + ip_hdr_len);
                             uint16_t src_port = ntohs(tcp->source);
                             uint16_t dest_port = ntohs(tcp->dest);
-                            uint32_t saddr = ntohl(ip->saddr);
-                            uint32_t daddr = ntohl(ip->daddr);
 
-                            /* v2.226: REJECT all TCP except port 502 (Modbus)
-                             * Accept if EITHER src or dest port is 502
-                             */
+                            /* REJECT if neither port is 502 (Modbus) - catches SYN/FIN/ACK too */
                             if (src_port != TCP_SERVER_PORT && dest_port != TCP_SERVER_PORT) {
+                                uint32_t saddr = ntohl(ip->saddr);
+                                uint32_t daddr = ntohl(ip->daddr);
                                 DEBUG_WARN("%s: [REJECT-PRE-LWIP] TCP non-Modbus: %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u (dropping)\n",
                                        COMPONENT_NAME,
                                        (saddr >> 24) & 0xFF, (saddr >> 16) & 0xFF,
                                        (saddr >> 8) & 0xFF, saddr & 0xFF, src_port,
                                        (daddr >> 24) & 0xFF, (daddr >> 16) & 0xFF,
                                        (daddr >> 8) & 0xFF, daddr & 0xFF, dest_port);
-
                                 should_drop_packet = true;
                             }
+                        } else {
+                            /* v2.227: Malformed TCP (too short to parse) - REJECT it */
+                            DEBUG_WARN("%s: [REJECT-PRE-LWIP] Malformed TCP (too short: %zu bytes)\n",
+                                   COMPONENT_NAME, packet_len);
+                            should_drop_packet = true;
                         }
                     }
                 }
@@ -5861,7 +5866,7 @@ static int virtio_net_init(void)
 void post_init(void)
 {
     DEBUG("%s: Component started\n", COMPONENT_NAME);
-    DEBUG("%s: NET0 v2.226 (2025-11-01) - TCP port filtering in process_rx_packets() BEFORE lwIP\n", COMPONENT_NAME);
+    DEBUG("%s: NET0 v2.227 (2025-11-01) - Fixed TCP filter: reject SYN/FIN/ACK and malformed TCP\n", COMPONENT_NAME);
     DEBUG("%s: [FIX] MODE: PRODUCTION with fast cleanup (every 100 iterations)\n", COMPONENT_NAME);
     DEBUG_INFO("%s: [OK] FIX 1: Immediate cleanup on tcp_echo_err (v2.145 behavior)\n", COMPONENT_NAME);
     DEBUG_INFO("%s: [OK] FIX 2: Send close notification to Net1 when SCADA closes\n", COMPONENT_NAME);

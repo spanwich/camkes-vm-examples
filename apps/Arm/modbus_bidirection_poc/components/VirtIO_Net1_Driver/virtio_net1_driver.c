@@ -2110,36 +2110,10 @@ static err_t custom_input_promiscuous(struct pbuf *p, struct netif *inp)
                 src_port = ntohs(tcphdr->src);
                 dest_port = ntohs(tcphdr->dest);
 
-                /* v2.224: TCP Port Filtering - ONLY accept Modbus port 502
-                 * ════════════════════════════════════════════════════════════════════
-                 * Purpose: Prevent PBUF leaks from unwanted TCP services
-                 *
-                 * Analysis: Port 62977 traffic observed on both Net0 and Net1:
-                 *   - Net0: SCADA (192.168.90.5) → System (192.168.96.2:62977)
-                 *   - Net1: System (192.168.95.2:62977) → PLC (192.168.95.1)
-                 *   - Port 62977 is NOT standard Modbus or OpenPLC protocol
-                 *   - This traffic was causing majority of PBUF leaks (10K+ on Net1)
-                 *
-                 * Solution: Silently drop all TCP except port 502 (Modbus)
-                 *   - Net1 receives PLC responses (source port should be 502)
-                 *   - Only accept responses from intended ICS service
-                 *   - Return ERR_OK after freeing (we handled the packet)
+                /* v2.226: REMOVED old v2.224 filter from here - it was in the wrong location!
+                 * Filtering now happens in process_rx_packets() BEFORE netif_data.input()
+                 * This prevents packets from reaching lwIP in the first place.
                  */
-                if (src_port != TCP_SERVER_PORT) {
-                    DEBUG_WARN("%s: [REJECT] TCP from non-Modbus port: %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u (dropping)\n",
-                           COMPONENT_NAME,
-                           (pkt_src_ip >> 24) & 0xFF, (pkt_src_ip >> 16) & 0xFF,
-                           (pkt_src_ip >> 8) & 0xFF, pkt_src_ip & 0xFF, src_port,
-                           (pkt_dest_ip >> 24) & 0xFF, (pkt_dest_ip >> 16) & 0xFF,
-                           (pkt_dest_ip >> 8) & 0xFF, pkt_dest_ip & 0xFF, dest_port);
-
-                    /* Free the packet and return ERR_OK (we handled it) */
-                    PBUF_TRACK_FREE(p);
-                    pbuf_free(p);
-                    pbuf_freed_count++;  /* v2.223: Track free (matching Net0) */
-                    pbuf_error_count++;  /* v2.223: Count as error - rejected traffic (matching Net0) */
-                    return ERR_OK;
-                }
 
                 /* v2.222: TCP leak handling removed per user request (breaks connection)
                  * Net1 is primarily a TCP client (outbound to PLC)
@@ -2494,6 +2468,73 @@ static void process_rx_packets(void)
             }
             #endif
 
+            /* v2.226: TCP Port Filtering - Pre-filter BEFORE passing to lwIP
+             * ═══════════════════════════════════════════════════════════════════
+             * CRITICAL: Filter HERE in process_rx_packets() BEFORE netif_data.input()!
+             *
+             * Why here?
+             * - Packets from PLC (192.168.95.2) arrive in RX queue
+             * - We allocate pbuf and copy packet data (lines 2475-2485)
+             * - MUST filter BEFORE line netif_data.input() call
+             * - If we pass to lwIP, it accepts based on dest IP match
+             * - Then lwIP checks for listener on dest port
+             * - No listener → lwIP leaks the pbuf
+             *
+             * Leak Pattern Observed:
+             * - Source: 192.168.95.2:62977 (PLC using non-Modbus port)
+             * - Dest: 192.168.95.1:XXXXX (our interface, random high port)
+             * - PLC trying to connect FROM port 62977 to our interface
+             * - Not Modbus (502) traffic
+             *
+             * Solution: Drop non-Modbus TCP BEFORE lwIP sees it
+             */
+            bool should_drop_packet = false;
+            if (packet_len >= sizeof(struct ethhdr)) {
+                struct ethhdr *eth = (struct ethhdr *)packet_data;
+                uint16_t eth_proto_check = ntohs(eth->h_proto);
+
+                if (eth_proto_check == 0x0800 && packet_len >= sizeof(struct ethhdr) + sizeof(struct iphdr)) {  /* IPv4 */
+                    struct iphdr *ip = (struct iphdr *)(packet_data + sizeof(struct ethhdr));
+                    if (ip->protocol == 6) {  /* TCP */
+                        size_t ip_hdr_len = (ip->ihl) * 4;
+                        if (packet_len >= sizeof(struct ethhdr) + ip_hdr_len + sizeof(struct tcphdr)) {
+                            struct tcphdr *tcp = (struct tcphdr *)(packet_data + sizeof(struct ethhdr) + ip_hdr_len);
+                            uint16_t src_port = ntohs(tcp->source);
+                            uint16_t dest_port = ntohs(tcp->dest);
+                            uint32_t saddr = ntohl(ip->saddr);
+                            uint32_t daddr = ntohl(ip->daddr);
+
+                            /* v2.226: REJECT all TCP except port 502 (Modbus)
+                             * Accept if EITHER src or dest port is 502
+                             */
+                            if (src_port != TCP_SERVER_PORT && dest_port != TCP_SERVER_PORT) {
+                                DEBUG_WARN("%s: [REJECT-PRE-LWIP] TCP non-Modbus: %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u (dropping)\n",
+                                       COMPONENT_NAME,
+                                       (saddr >> 24) & 0xFF, (saddr >> 16) & 0xFF,
+                                       (saddr >> 8) & 0xFF, saddr & 0xFF, src_port,
+                                       (daddr >> 24) & 0xFF, (daddr >> 16) & 0xFF,
+                                       (daddr >> 8) & 0xFF, daddr & 0xFF, dest_port);
+
+                                should_drop_packet = true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            /* Drop packet if non-Modbus TCP detected */
+            if (should_drop_packet) {
+                PBUF_TRACK_FREE(p);
+                pbuf_free(p);
+                pbuf_freed_count++;
+                pbuf_error_count++;
+                /* Mark buffer as free and move to next packet */
+                rx_buffer_used[buf_idx] = false;
+                last_used_idx++;
+                loop_count++;
+                continue;  /* Skip lwIP input - packet dropped */
+            }
+
             /* Feed packet to lwIP */
             err_t lwip_result = netif_data.input(p, &netif_data);
 
@@ -2516,81 +2557,6 @@ static void process_rx_packets(void)
                 }
             }
             #endif
-
-            /* v2.224: TCP Port Filtering - Pre-filter BEFORE passing to lwIP
-             * ═══════════════════════════════════════════════════════════════════
-             * CRITICAL: Must filter HERE in process_rx_packets(), not in custom_input_promiscuous()!
-             *
-             * Why here?
-             * - Packets from PLC bypass custom_input_promiscuous() initially
-             * - lwIP accepts packets if dest IP matches interface IP
-             * - lwIP THEN checks if there's a listener on the port
-             * - If no listener, lwIP leaks the PBUF
-             *
-             * Leak Pattern Observed:
-             * - Source: 192.168.95.2:62977 (our interface IP)
-             * - Dest: 192.168.95.1:XXXXX (PLC)
-             * - These are responses from system port 62977 (not Modbus)
-             * - lwIP accepts (dest IP match) but no listener → leak
-             *
-             * Solution: Reject non-Modbus TCP BEFORE lwIP sees it
-             */
-            bool should_drop_packet = false;
-            if (packet_len >= sizeof(struct ethhdr)) {
-                struct ethhdr *eth = (struct ethhdr *)packet_data;
-                uint16_t eth_proto_check = ntohs(eth->h_proto);
-
-                if (eth_proto_check == 0x0800 && packet_len >= sizeof(struct ethhdr) + sizeof(struct iphdr)) {  /* IPv4 */
-                    struct iphdr *ip = (struct iphdr *)(packet_data + sizeof(struct ethhdr));
-                    if (ip->protocol == 6) {  /* TCP */
-                        size_t ip_hdr_len = (ip->ihl) * 4;
-                        if (packet_len >= sizeof(struct ethhdr) + ip_hdr_len + sizeof(struct tcphdr)) {
-                            struct tcphdr *tcp = (struct tcphdr *)(packet_data + sizeof(struct ethhdr) + ip_hdr_len);
-                            uint16_t src_port = ntohs(tcp->source);
-                            uint16_t dest_port = ntohs(tcp->dest);
-                            uint32_t saddr = ntohl(ip->saddr);
-                            uint32_t daddr = ntohl(ip->daddr);
-
-                            /* v2.224: REJECT all TCP except port 502 (Modbus)
-                             * Check BOTH source and dest ports to catch all non-Modbus traffic
-                             */
-                            if (src_port != TCP_SERVER_PORT && dest_port != TCP_SERVER_PORT) {
-                                DEBUG_WARN("%s: [REJECT-PRE-LWIP] TCP non-Modbus: %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u (dropping before lwIP)\n",
-                                       COMPONENT_NAME,
-                                       (saddr >> 24) & 0xFF, (saddr >> 16) & 0xFF,
-                                       (saddr >> 8) & 0xFF, saddr & 0xFF, src_port,
-                                       (daddr >> 24) & 0xFF, (daddr >> 16) & 0xFF,
-                                       (daddr >> 8) & 0xFF, daddr & 0xFF, dest_port);
-
-                                should_drop_packet = true;
-                            } else {
-                                /* Diagnostic logging for accepted TCP packets */
-                                if (tcp->syn && !tcp->ack) {
-                                    /* This is a SYN packet (connection attempt) */
-                                    DEBUG("%s: [FIND] SYN packet detected: Dest IP = %u.%u.%u.%u:%u (Interface IP = 192.168.95.2)\n",
-                                           COMPONENT_NAME,
-                                           (daddr >> 24) & 0xFF, (daddr >> 16) & 0xFF, (daddr >> 8) & 0xFF, daddr & 0xFF,
-                                           dest_port);
-                                    DEBUG("%s:    → If dest IP matches interface IP, lwIP should accept. Otherwise it rejects.\n", COMPONENT_NAME);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            /* Drop packet if filtering determined it should be rejected */
-            if (should_drop_packet) {
-                PBUF_TRACK_FREE(p);
-                pbuf_free(p);
-                pbuf_freed_count++;
-                pbuf_error_count++;
-                /* Mark buffer as free and move to next packet */
-                rx_buffer_used[buf_idx] = false;
-                last_used_idx++;
-                loop_count++;
-                continue;
-            }
 
             /* v2.223: Track lwIP acceptance/rejection (matching Net0) */
             if (lwip_result != ERR_OK) {

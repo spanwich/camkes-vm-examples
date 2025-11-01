@@ -2396,7 +2396,15 @@ static void process_rx_packets(void)
         /* Allocate pbuf and copy packet data (skipping header) */
         struct pbuf *p = pbuf_alloc(PBUF_RAW, packet_len, PBUF_POOL);
         if (p != NULL) {
+            /* v2.214: Track PBUF_POOL allocation with interface identification */
+            extern struct stats_ lwip_stats;
+            uint32_t pbuf_before_take = lwip_stats.memp[MEMP_PBUF_POOL]->used;
+
             pbuf_take(p, packet_data, packet_len);
+
+            uint32_t pbuf_after_take = lwip_stats.memp[MEMP_PBUF_POOL]->used;
+            DEBUG_ERROR("[Net1][PBUF_POOL][RX-ALLOC] pbuf=%p, len=%u | PBUF: %u/800 (after take: %u/800)\n",
+                       (void*)p, packet_len, pbuf_before_take, pbuf_after_take);
 
             #if 0  /* DEBUG_ENABLED_DEBUG && DEBUG_PACKET_DETAIL - show_packet undefined */
             if (show_packet) {
@@ -2406,6 +2414,16 @@ static void process_rx_packets(void)
 
             /* Feed packet to lwIP */
             err_t lwip_result = netif_data.input(p, &netif_data);
+
+            /* v2.214: Track lwIP input acceptance/rejection */
+            uint32_t pbuf_after_input = lwip_stats.memp[MEMP_PBUF_POOL]->used;
+            if (lwip_result == ERR_OK) {
+                DEBUG_ERROR("[Net1][PBUF_POOL][RX-ACCEPT] lwIP accepted pbuf=%p | PBUF: %u/800\n",
+                           (void*)p, pbuf_after_input);
+            } else {
+                DEBUG_ERROR("[Net1][PBUF_POOL][RX-REJECT] lwIP rejected (err=%d), must free pbuf=%p | PBUF: %u/800\n",
+                           lwip_result, (void*)p, pbuf_after_input);
+            }
 
             #if 0  /* DEBUG_ENABLED_DEBUG && DEBUG_PACKET_DETAIL - show_packet undefined */
             if (show_packet) {
@@ -3272,33 +3290,27 @@ static err_t inbound_tcp_recv_callback(void *arg, struct tcp_pcb *pcb, struct pb
 
     tcp_recved(pcb, p->len);
 
-    /* v2.213: TESTING - Add pbuf_free() back to fix PBUF pool leak
+    /* v2.215: REVERT - Remove pbuf_free() to prevent double-free (back to v2.156 behavior)
      * ═══════════════════════════════════════════════════════════════════════
-     * INVESTIGATION RESULTS (v2.140):
-     * - ZERO packet rejections (all accepted, result=0)
-     * - len=89 packets (Modbus data) triggered this recv callback
-     * - PBUF pool grew monotonically (no double-free observed)
-     * - Each data packet leaked 1 pbuf
+     * EMPIRICAL TEST RESULTS (v2.213-v2.214):
+     * - Adding pbuf_free() here did NOT fix the leak
+     * - PBUF pool still grows monotonically
+     * - Evidence of double-free: same pbuf freed by both tcp_input() and recv callback
+     * - User observation: "Your leak prevention is nonsense. The pbuf still leaking."
      *
-     * lwIP recv callback ownership rules (from tcp_recv_null pattern):
-     * - When callback returns ERR_OK: Application MUST free pbuf
-     * - When callback returns error: lwIP stores in refused_data
+     * lwIP ownership model (CORRECT understanding from v2.156):
+     * - lwIP owns ALL pbuf lifecycle management for recv callbacks
+     * - Application code MUST NEVER call pbuf_free() on callback pbufs
+     * - tcp_input() frees the pbuf after callback returns (tcp_in.c:587)
+     * - Calling pbuf_free() here causes double-free
      *
-     * v2.155 claimed double-free, but we need to test:
-     * - If pbuf_free() causes "pbuf_free: p->ref > 0" → double-free exists
-     * - If PBUF pool stabilizes → leak was real, no double-free
-     *
-     * This is EMPIRICAL TESTING to determine which is true.
+     * The leak must be coming from a DIFFERENT source, not the recv callback.
+     * Need to investigate:
+     * - Packets rejected by lwIP (netif->input() returns error)
+     * - Other allocation paths
+     * - Net0 vs Net1 to identify which interface is leaking
      * ═══════════════════════════════════════════════════════════════════════
      */
-    extern struct stats_ lwip_stats;
-    uint32_t pbuf_before = lwip_stats.memp[MEMP_PBUF_POOL]->used;
-    DEBUG_ERROR("[PBUF-TRACK] RECV CALLBACK: Calling pbuf_free(p=%p, ref=%d, len=%u) | PBUF BEFORE: %u/800\n",
-               (void*)p, p->ref, p->len, pbuf_before);
-    pbuf_free(p);
-    uint32_t pbuf_after = lwip_stats.memp[MEMP_PBUF_POOL]->used;
-    DEBUG_ERROR("[PBUF-TRACK] RECV CALLBACK: After pbuf_free() | PBUF AFTER: %u/800 (freed=%d)\n",
-               pbuf_after, (int)(pbuf_before - pbuf_after));
 
     BREADCRUMB(1010);  /* Response sent to ICS_Outbound */
 
@@ -5752,7 +5764,7 @@ static int virtio_net_init(void)
 void post_init(void)
 {
     DEBUG("%s: Component started\n", COMPONENT_NAME);
-    DEBUG("%s: NET1 v2.201 (2025-10-27) - Increase lwIP memory pools to 5MB (eliminate memory exhaustion)\n", COMPONENT_NAME);
+    DEBUG("%s: NET1 v2.216 (2025-11-01) - Add IP address to lwIP tcp_input() debug: [lwIP@IP]\n", COMPONENT_NAME);
     DEBUG("%s: [FIX] MODE: PRODUCTION-READY with Multi-Layer Validation\n", COMPONENT_NAME);
     DEBUG_INFO("%s: [OK] FIX 1: payload_data buffer (prevents dataport corruption)\n", COMPONENT_NAME);
     DEBUG_INFO("%s: [OK] FIX 2: tcp_abort() removed from callbacks (crash at 0x38a9c fixed!)\n", COMPONENT_NAME);

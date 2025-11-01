@@ -2767,8 +2767,16 @@ static void process_rx_packets(void)
         /* Allocate pbuf and copy packet data (skipping header) */
         struct pbuf *p = pbuf_alloc(PBUF_RAW, packet_len, PBUF_POOL);
         if (p != NULL) {
+            /* v2.215: Track PBUF_POOL allocation with interface identification */
             pbuf_allocated_count++;  /* v2.203: Track allocation */
+            extern struct stats_ lwip_stats;
+            uint32_t pbuf_before_take = lwip_stats.memp[MEMP_PBUF_POOL]->used;
+
             pbuf_take(p, packet_data, packet_len);
+
+            uint32_t pbuf_after_take = lwip_stats.memp[MEMP_PBUF_POOL]->used;
+            DEBUG_ERROR("[Net0][PBUF_POOL][RX-ALLOC] pbuf=%p, len=%u | PBUF: %u/800 (after take: %u/800)\n",
+                       (void*)p, packet_len, pbuf_before_take, pbuf_after_take);
 
             #if DEBUG_ENABLED_DEBUG
             DEBUG("   [OK] pbuf allocated, passing to lwIP input handler\n");
@@ -2782,6 +2790,16 @@ static void process_rx_packets(void)
 
             /* v2.137: Track after lwIP input call */
             BREADCRUMB(8009);  /* After lwIP input() */
+
+            /* v2.215: Track lwIP input acceptance/rejection */
+            uint32_t pbuf_after_input = lwip_stats.memp[MEMP_PBUF_POOL]->used;
+            if (lwip_result == ERR_OK) {
+                DEBUG_ERROR("[Net0][PBUF_POOL][RX-ACCEPT] lwIP accepted pbuf=%p | PBUF: %u/800\n",
+                           (void*)p, pbuf_after_input);
+            } else {
+                DEBUG_ERROR("[Net0][PBUF_POOL][RX-REJECT] lwIP rejected (err=%d), must free pbuf=%p | PBUF: %u/800\n",
+                           lwip_result, (void*)p, pbuf_after_input);
+            }
 
             #if DEBUG_ENABLED_DEBUG
             if (lwip_result == ERR_OK) {

@@ -3272,10 +3272,33 @@ static err_t inbound_tcp_recv_callback(void *arg, struct tcp_pcb *pcb, struct pb
 
     tcp_recved(pcb, p->len);
 
-    /* v2.155: CRITICAL FIX - Let lwIP free pbuf, we don't own it
-     * Previous bug: We called pbuf_free(p) here, then lwIP also freed it
-     * Result: Double-free → "pbuf_free: p->ref > 0" assertion failure
-     * Fix: Remove manual pbuf_free(), lwIP's tcp_input() will handle it */
+    /* v2.213: TESTING - Add pbuf_free() back to fix PBUF pool leak
+     * ═══════════════════════════════════════════════════════════════════════
+     * INVESTIGATION RESULTS (v2.140):
+     * - ZERO packet rejections (all accepted, result=0)
+     * - len=89 packets (Modbus data) triggered this recv callback
+     * - PBUF pool grew monotonically (no double-free observed)
+     * - Each data packet leaked 1 pbuf
+     *
+     * lwIP recv callback ownership rules (from tcp_recv_null pattern):
+     * - When callback returns ERR_OK: Application MUST free pbuf
+     * - When callback returns error: lwIP stores in refused_data
+     *
+     * v2.155 claimed double-free, but we need to test:
+     * - If pbuf_free() causes "pbuf_free: p->ref > 0" → double-free exists
+     * - If PBUF pool stabilizes → leak was real, no double-free
+     *
+     * This is EMPIRICAL TESTING to determine which is true.
+     * ═══════════════════════════════════════════════════════════════════════
+     */
+    extern struct stats_ lwip_stats;
+    uint32_t pbuf_before = lwip_stats.memp[MEMP_PBUF_POOL]->used;
+    DEBUG_ERROR("[PBUF-TRACK] RECV CALLBACK: Calling pbuf_free(p=%p, ref=%d, len=%u) | PBUF BEFORE: %u/800\n",
+               (void*)p, p->ref, p->len, pbuf_before);
+    pbuf_free(p);
+    uint32_t pbuf_after = lwip_stats.memp[MEMP_PBUF_POOL]->used;
+    DEBUG_ERROR("[PBUF-TRACK] RECV CALLBACK: After pbuf_free() | PBUF AFTER: %u/800 (freed=%d)\n",
+               pbuf_after, (int)(pbuf_before - pbuf_after));
 
     BREADCRUMB(1010);  /* Response sent to ICS_Outbound */
 

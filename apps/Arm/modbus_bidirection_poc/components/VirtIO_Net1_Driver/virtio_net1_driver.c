@@ -2398,7 +2398,7 @@ static void process_rx_packets(void)
         if (p != NULL) {
             pbuf_take(p, packet_data, packet_len);
 
-            #if DEBUG_ENABLED_DEBUG && DEBUG_PACKET_DETAIL
+            #if 0  /* DEBUG_ENABLED_DEBUG && DEBUG_PACKET_DETAIL - show_packet undefined */
             if (show_packet) {
                 DEBUG("   [OK] pbuf allocated, passing to lwIP input handler\n");
             }
@@ -2407,7 +2407,7 @@ static void process_rx_packets(void)
             /* Feed packet to lwIP */
             err_t lwip_result = netif_data.input(p, &netif_data);
 
-            #if DEBUG_ENABLED_DEBUG && DEBUG_PACKET_DETAIL
+            #if 0  /* DEBUG_ENABLED_DEBUG && DEBUG_PACKET_DETAIL - show_packet undefined */
             if (show_packet) {
                 if (lwip_result == ERR_OK) {
                     DEBUG("   [OK] lwIP accepted packet (will route to TCP/UDP/etc.)\n");
@@ -2707,7 +2707,7 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
 
     #if DEBUG_ENABLED_DEBUG
     DEBUG("   [OK] Signal sent to ICS_Outbound - PLC response handoff complete\n");
-    DEBUG("   [MSG #%u now in OUTBOUND pipeline - forwarding to Net0]\n\n", msg_id);
+    /* DEBUG("   [MSG #%u now in OUTBOUND pipeline - forwarding to Net0]\n\n", msg_id); */ /* msg_id undefined */
     #endif
 
     /* v2.60: Keep connection alive BUT update last_activity timestamp for fast idle cleanup
@@ -4151,7 +4151,7 @@ void inbound_ready_handle(void)
         DEBUG("%s: INBOUND: Invalid payload length %u (max %u)\n",
                COMPONENT_NAME, ics_msg->payload_length, MAX_PAYLOAD_SIZE);
         #if DEBUG_ENABLED_DEBUG
-        DEBUG("   ✗ [MSG #%u] DROPPED - invalid payload size\n\n", msg_id);
+        /* DEBUG("   ✗ [MSG #%u] DROPPED - invalid payload size\n\n", msg_id); */ /* msg_id undefined */
         #endif
         return;
     }
@@ -5150,7 +5150,7 @@ void outbound_ready_handle(void)
         DEBUG("%s: OUTBOUND: Invalid payload length %u (max %u)\n",
                COMPONENT_NAME, ics_msg->payload_length, MAX_PAYLOAD_SIZE);
         #if DEBUG_ENABLED_DEBUG
-        DEBUG("   ✗ [MSG #%u] DROPPED - invalid payload size\n\n", msg_id);
+        /* DEBUG("   ✗ [MSG #%u] DROPPED - invalid payload size\n\n", msg_id); */ /* msg_id undefined */
         #endif
         return;
     }

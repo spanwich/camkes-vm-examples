@@ -5872,7 +5872,7 @@ static int virtio_net_init(void)
 void post_init(void)
 {
     DEBUG("%s: Component started\n", COMPONENT_NAME);
-    DEBUG("%s: NET1 v2.216 (2025-11-01) - Add IP address to lwIP tcp_input() debug: [lwIP@IP]\n", COMPONENT_NAME);
+    DEBUG("%s: NET1 v2.226 (2025-11-01) - TCP port filtering in process_rx_packets() BEFORE lwIP\n", COMPONENT_NAME);
     DEBUG("%s: [FIX] MODE: PRODUCTION-READY with Multi-Layer Validation\n", COMPONENT_NAME);
     DEBUG_INFO("%s: [OK] FIX 1: payload_data buffer (prevents dataport corruption)\n", COMPONENT_NAME);
     DEBUG_INFO("%s: [OK] FIX 2: tcp_abort() removed from callbacks (crash at 0x38a9c fixed!)\n", COMPONENT_NAME);

@@ -5861,7 +5861,7 @@ static int virtio_net_init(void)
 void post_init(void)
 {
     DEBUG("%s: Component started\n", COMPONENT_NAME);
-    DEBUG("%s: NET0 v2.219 (2025-11-01) - Fix duplicate close notifications from poll callback\n", COMPONENT_NAME);
+    DEBUG("%s: NET0 v2.226 (2025-11-01) - TCP port filtering in process_rx_packets() BEFORE lwIP\n", COMPONENT_NAME);
     DEBUG("%s: [FIX] MODE: PRODUCTION with fast cleanup (every 100 iterations)\n", COMPONENT_NAME);
     DEBUG_INFO("%s: [OK] FIX 1: Immediate cleanup on tcp_echo_err (v2.145 behavior)\n", COMPONENT_NAME);
     DEBUG_INFO("%s: [OK] FIX 2: Send close notification to Net1 when SCADA closes\n", COMPONENT_NAME);

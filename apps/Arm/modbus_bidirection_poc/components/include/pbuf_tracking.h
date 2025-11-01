@@ -539,6 +539,71 @@ static inline void pbuf_tracking_report_tcp_state(const char *component)
            component, active_count, tw_count);
 }
 
+/* v2.229: Cleanup leaked pbufs older than threshold
+ *
+ * Problem: Port 62977 and other non-Modbus TCP traffic causes pbuf leaks
+ * Solution: Forcefully free any pbuf that has been leaked for > threshold_ms
+ *
+ * This is a safety mechanism to prevent PBUF pool exhaustion when:
+ * - External services try to connect to non-Modbus ports
+ * - lwIP accepts packet based on dest IP match
+ * - lwIP finds no listener on dest port
+ * - lwIP leaks the pbuf instead of freeing it
+ *
+ * Returns: Number of pbufs cleaned up
+ */
+static inline uint32_t pbuf_tracking_cleanup_old_leaks(const char *component, uint32_t threshold_ms)
+{
+    uint32_t now = sys_now();
+    uint32_t cleaned_count = 0;
+
+    for (uint32_t i = 0; i < MAX_PBUF_TRACKING_ENTRIES; i++) {
+        struct pbuf_track_record *rec = &pbuf_tracking_db[i];
+
+        /* Skip already-freed or empty slots */
+        if (rec->pbuf_ptr == NULL || rec->freed) {
+            continue;
+        }
+
+        /* Check age */
+        uint32_t age_ms = now - rec->alloc_timestamp;
+        if (age_ms >= threshold_ms) {
+            /* Leak persisted too long - force cleanup */
+            printf("[%s] [CLEANUP] Freeing leaked pbuf seq=%u, age=%ums, proto=%s",
+                   component, rec->sequence_num, age_ms,
+                   pbuf_tracking_protocol_name(rec->protocol));
+
+            if (rec->protocol == IP_PROTO_TCP || rec->protocol == IP_PROTO_UDP) {
+                printf(", ");
+                pbuf_tracking_print_ip(rec->src_ip);
+                printf(":%u -> ", rec->src_port);
+                pbuf_tracking_print_ip(rec->dst_ip);
+                printf(":%u", rec->dst_port);
+            }
+            printf("\n");
+
+            /* Free the pbuf */
+            pbuf_free(rec->pbuf_ptr);
+
+            /* Mark as freed in tracking DB */
+            rec->freed = true;
+            rec->free_timestamp = now;
+            rec->lifetime_ms = age_ms;
+            rec->pbuf_ptr = NULL;
+
+            cleaned_count++;
+            pbuf_track_total_frees++;  /* Update stats */
+        }
+    }
+
+    if (cleaned_count > 0) {
+        printf("[%s] [CLEANUP] Freed %u old leaked pbufs (threshold=%ums)\n",
+               component, cleaned_count, threshold_ms);
+    }
+
+    return cleaned_count;
+}
+
 /* Periodic diagnostics (call from run() loop every ~10 seconds) */
 static inline void pbuf_tracking_periodic_diagnostics(const char *component, uint32_t interval_ms)
 {
@@ -550,6 +615,9 @@ static inline void pbuf_tracking_periodic_diagnostics(const char *component, uin
     }
 
     last_report_time = now;
+
+    /* v2.229: Cleanup old leaks BEFORE reporting (so report shows clean state) */
+    uint32_t cleaned = pbuf_tracking_cleanup_old_leaks(component, 10000);  /* 10 second threshold */
 
     /* lwIP internal pool usage */
     pbuf_tracking_report_lwip_pools(component);

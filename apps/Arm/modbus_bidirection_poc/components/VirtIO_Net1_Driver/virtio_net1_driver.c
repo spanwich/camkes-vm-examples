@@ -958,58 +958,15 @@ static err_t netif_output(struct netif *netif, struct pbuf *p)
                         static uint32_t tx_error_count = 0;
                         tx_error_count++;
 
-                        /* ALWAYS log (use DEBUG_ERROR not DEBUG_WARN) - we need this data! */
-                        DEBUG_ERROR("[TX-ERR-%u] Net1: No metadata for port %u→%u | PBUF: %u/%u used (max=%u) | meta=%s\n",
+                        /* Simplified logging - just track pbuf leak */
+                        #if 0  /* Verbose debug disabled */
+                        DEBUG_ERROR("[TX-ERR-%u] Net1: No metadata for port %u→%u | PBUF: %u/%u used (max=%u)\n",
                                tx_error_count,
                                src_port, dest_port,
                                lwip_stats.memp[MEMP_PBUF_POOL]->used,
                                lwip_stats.memp[MEMP_PBUF_POOL]->avail,
-                               lwip_stats.memp[MEMP_PBUF_POOL]->max,
-                               meta == NULL ? "NULL" : (meta->active ? "INACTIVE" : "ACTIVE-but-not-matched"));
-
-                        /* Debug: Log partial match details if found */
-                        if (partial_match != NULL) {
-                            DEBUG_ERROR("[TX-ERR-%u] PARTIAL MATCH FOUND (lwip_ephemeral_port=%u matches, src_port mismatch):\n",
-                                   tx_error_count, src_port);
-                            DEBUG_ERROR("  session_id=%u | active=%d | pcb=%p\n",
-                                   partial_match->session_id,
-                                   partial_match->active,
-                                   (void*)partial_match->pcb);
-                            DEBUG_ERROR("  Ports: lwip_eph=%u (✓match) | src=%u (expect %u ✗) | expected src=%u |  dest=%u\n",
-                                   partial_match->lwip_ephemeral_port,
-                                   partial_match->src_port, dest_port, src_port,
-                                   partial_match->dest_port);
-                            DEBUG_ERROR("  Packet IPs: src=%u.%u.%u.%u | dest=%u.%u.%u.%u\n",
-                                   (current_src >> 24) & 0xFF,
-                                   (current_src >> 16) & 0xFF,
-                                   (current_src >> 8) & 0xFF,
-                                   current_src & 0xFF,
-                                   (current_dest >> 24) & 0xFF,
-                                   (current_dest >> 16) & 0xFF,
-                                   (current_dest >> 8) & 0xFF,
-                                   current_dest & 0xFF);
-                            DEBUG_ERROR("  Stored IPs: orig_src=%u.%u.%u.%u | orig_dest=%u.%u.%u.%u\n",
-                                   (partial_match->original_src_ip >> 24) & 0xFF,
-                                   (partial_match->original_src_ip >> 16) & 0xFF,
-                                   (partial_match->original_src_ip >> 8) & 0xFF,
-                                   partial_match->original_src_ip & 0xFF,
-                                   (partial_match->original_dest_ip >> 24) & 0xFF,
-                                   (partial_match->original_dest_ip >> 16) & 0xFF,
-                                   (partial_match->original_dest_ip >> 8) & 0xFF,
-                                   partial_match->original_dest_ip & 0xFF);
-                            DEBUG_ERROR("  Timestamps: created=%u | last_activity=%u | last_tx=%u\n",
-                                   partial_match->timestamp,
-                                   partial_match->last_activity,
-                                   partial_match->last_tx_timestamp);
-                            DEBUG_ERROR("  State flags: awaiting_resp=%d | resp_received=%d | close_pending=%d\n",
-                                   partial_match->awaiting_response,
-                                   partial_match->response_received,
-                                   partial_match->close_pending);
-                            DEBUG_ERROR("  Cleanup flags: meta_close_pending=%d | closing=%d | cleanup_in_progress=%d\n",
-                                   partial_match->metadata_close_pending,
-                                   partial_match->closing,
-                                   partial_match->cleanup_in_progress);
-                        }
+                               lwip_stats.memp[MEMP_PBUF_POOL]->max);
+                        #endif
                     }
                 }
             }
@@ -2624,8 +2581,10 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
             meta->close_timestamp = sys_now();
             meta->pcb_closed = true;
             enqueue_cleanup(meta->session_id);
-            DEBUG("%s: [ECHO-RECV] Enqueued cleanup for session %u (PCB=%p)\n",
-                   COMPONENT_NAME, meta->session_id, (void*)pcb);
+            DEBUG_ERROR("[CLOSE-SOURCE-1] tcp_echo_recv(p=NULL) - session=%u, PBUF=%u/%u\n",
+                   meta->session_id,
+                   lwip_stats.memp[MEMP_PBUF_POOL]->used,
+                   lwip_stats.memp[MEMP_PBUF_POOL]->avail);
         }
 
         /* v2.82: Return ERR_ABRT - lwIP handles tcp_abort() internally */
@@ -3217,7 +3176,7 @@ static err_t inbound_tcp_recv_callback(void *arg, struct tcp_pcb *pcb, struct pb
             meta->close_timestamp = sys_now();
 
             /* v2.210: EVIDENCE - Always log when delayed cleanup flag is set */
-            DEBUG_ERROR("[DELAYED-CLEANUP] PLC FIN: session=%u, lwip_port=%u, active=TRUE, close_pending=TRUE | PBUF: %u/%u\n",
+            DEBUG_ERROR("[CLOSE-SOURCE-2] inbound_tcp_recv_callback(p=NULL) - PLC FIN session=%u, lwip_port=%u | PBUF: %u/%u\n",
                    meta->session_id, meta->lwip_ephemeral_port,
                    lwip_stats.memp[MEMP_PBUF_POOL]->used,
                    lwip_stats.memp[MEMP_PBUF_POOL]->avail);
@@ -3557,12 +3516,14 @@ static void inbound_tcp_err_callback(void *arg, err_t err)
              *   - Single point of truth for metadata modification
              * ═══════════════════════════════════════════════════════════════
              */
-            DEBUG("%s:   → Setting metadata_close_pending flag (PCB was freed by lwIP)\n",
-                   COMPONENT_NAME);
-
             meta->metadata_close_pending = true;  /* Intent flag: cleanup needed */
             meta->close_timestamp = sys_now();     /* For deferred cleanup timeout */
             meta->pcb_closed = true;               /* PCB already freed by lwIP */
+
+            DEBUG_ERROR("[CLOSE-SOURCE-3] inbound_tcp_err_callback err=%d - session=%u | PBUF=%u/%u\n",
+                   err, meta->session_id,
+                   lwip_stats.memp[MEMP_PBUF_POOL]->used,
+                   lwip_stats.memp[MEMP_PBUF_POOL]->avail);
             /* DON'T clear error_notified - keeps deduplication active for retransmitted RSTs */
 
             /* v2.117: Update shared connection state */
@@ -3674,6 +3635,11 @@ static err_t inbound_tcp_connected_callback(void *arg, struct tcp_pcb *pcb, err_
             meta->metadata_close_pending = true;  /* Intent: cleanup needed */
             meta->close_timestamp = sys_now();     /* For timeout tracking */
             meta->pcb_closed = true;               /* Handshake failed, PCB invalid */
+
+            DEBUG_ERROR("[CLOSE-SOURCE-4] inbound_connected_callback failed - session=%u | PBUF=%u/%u\n",
+                   meta->session_id,
+                   lwip_stats.memp[MEMP_PBUF_POOL]->used,
+                   lwip_stats.memp[MEMP_PBUF_POOL]->avail);
 
             /* Enqueue for centralized cleanup */
             enqueue_cleanup(meta->session_id);
@@ -3820,8 +3786,10 @@ static err_t outbound_tcp_sent_callback(void *arg, struct tcp_pcb *pcb, u16_t le
             meta->close_timestamp = sys_now();
             meta->pcb_closed = true;
             enqueue_cleanup(meta->session_id);
-            DEBUG("%s: [OUTBOUND-ERR] Enqueued cleanup for session %u (PCB=%p)\n",
-                   COMPONENT_NAME, meta->session_id, (void*)pcb);
+            DEBUG_ERROR("[CLOSE-SOURCE-5] outbound_tcp_sent_callback close - session=%u | PBUF=%u/%u\n",
+                   meta->session_id,
+                   lwip_stats.memp[MEMP_PBUF_POOL]->used,
+                   lwip_stats.memp[MEMP_PBUF_POOL]->avail);
         }
         state->active = false;  /* v2.106: Mark outbound client as free */
 
@@ -4070,6 +4038,11 @@ void inbound_ready_handle(void)
                 meta->close_timestamp = sys_now();     /* For timeout tracking */
                 meta->pcb_closed = true;               /* PCB will be closed below */
                 meta->error_notified = false;          /* Clear dedup flag */
+
+                DEBUG_ERROR("[CLOSE-SOURCE-6] inbound_ready_handle close notif - session=%u | PBUF=%u/%u\n",
+                       meta->session_id,
+                       lwip_stats.memp[MEMP_PBUF_POOL]->used,
+                       lwip_stats.memp[MEMP_PBUF_POOL]->avail);
 
                 __sync_synchronize();  /* Ensure metadata updates visible */
 
@@ -4548,6 +4521,11 @@ cleanup_and_create_new:
             existing_meta->metadata_close_pending = true;
             existing_meta->close_timestamp = sys_now();
             existing_meta->pcb_closed = true;  /* Will be closed below */
+
+            DEBUG_ERROR("[CLOSE-SOURCE-7] tcp_connect existing PCB cleanup - session=%u | PBUF=%u/%u\n",
+                   existing_meta->session_id,
+                   lwip_stats.memp[MEMP_PBUF_POOL]->used,
+                   lwip_stats.memp[MEMP_PBUF_POOL]->avail);
 
             /* Free pool state before tcp_abort (it needs to be freed before PCB is freed) */
             if (existing_meta->pool_state != NULL) {

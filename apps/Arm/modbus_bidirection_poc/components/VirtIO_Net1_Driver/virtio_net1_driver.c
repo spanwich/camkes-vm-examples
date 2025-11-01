@@ -550,16 +550,6 @@ static uint32_t packets_received = 0;
 static uint32_t packets_sent = 0;
 static uint32_t dhcp_bound = 0;
 
-/* v2.223: Pbuf leak diagnostics (matching Net0) */
-static uint32_t pbuf_allocated_count = 0;
-static uint32_t pbuf_freed_count = 0;
-static uint32_t pbuf_leaked_to_lwip = 0;  /* Pbufs passed to lwIP successfully */
-static uint32_t pbuf_arp_count = 0;
-static uint32_t pbuf_tcp_count = 0;
-static uint32_t pbuf_udp_count = 0;
-static uint32_t pbuf_other_count = 0;
-static uint32_t pbuf_error_count = 0;  /* Pbufs we had to free due to errors */
-
 /* lwIP time tracking */
 static volatile uint32_t lwip_time_ms = 0;
 
@@ -2061,7 +2051,6 @@ static err_t custom_input_promiscuous(struct pbuf *p, struct netif *inp)
 
     /* Handle ARP packets normally - pass to lwIP's ARP handler */
     if (type == ETHTYPE_ARP) {
-        pbuf_arp_count++;  /* v2.223: Track ARP packets (matching Net0) */
         /* Remove Ethernet header and pass to etharp_input for ARP processing */
         if (pbuf_remove_header(p, sizeof(struct eth_hdr)) == 0) {
             /* v2.222: REVERTED FIX #2 - etharp_input() DOES free pbuf (line 741 in etharp.c)
@@ -2071,7 +2060,6 @@ static err_t custom_input_promiscuous(struct pbuf *p, struct netif *inp)
             return ERR_OK;
         }
         /* pbuf_remove_header failed - return ERR_ARG, caller will free */
-        pbuf_error_count++;  /* v2.223: Track error */
         return ERR_ARG;
     }
 
@@ -2105,15 +2093,9 @@ static err_t custom_input_promiscuous(struct pbuf *p, struct netif *inp)
             /* Extract ports if this is TCP */
             uint16_t src_port = 0, dest_port = 0;
             if (IPH_PROTO(iphdr) == IP_PROTO_TCP && p->len >= 20 + 20) {  /* IP + TCP headers */
-                pbuf_tcp_count++;  /* v2.223: Track TCP packets (matching Net0) */
                 struct tcp_hdr *tcphdr = (struct tcp_hdr *)((uint8_t *)iphdr + (IPH_HL(iphdr) * 4));
                 src_port = ntohs(tcphdr->src);
                 dest_port = ntohs(tcphdr->dest);
-
-                /* v2.226: REMOVED old v2.224 filter from here - it was in the wrong location!
-                 * Filtering now happens in process_rx_packets() BEFORE netif_data.input()
-                 * This prevents packets from reaching lwIP in the first place.
-                 */
 
                 /* v2.222: TCP leak handling removed per user request (breaks connection)
                  * Net1 is primarily a TCP client (outbound to PLC)
@@ -2121,10 +2103,6 @@ static err_t custom_input_promiscuous(struct pbuf *p, struct netif *inp)
                  * Let lwIP handle connection matching - it will send RST if needed
                  * Note: This may cause pbuf leaks, but connection functionality takes precedence
                  */
-            } else if (IPH_PROTO(iphdr) == IP_PROTO_UDP) {
-                pbuf_udp_count++;  /* v2.223: Track UDP packets (matching Net0) */
-            } else {
-                pbuf_other_count++;  /* v2.223: Track other IP protocols (matching Net0) */
             }
 
             /* If packet is not destined for our interface IP, rewrite it */
@@ -2166,11 +2144,10 @@ static err_t custom_input_promiscuous(struct pbuf *p, struct netif *inp)
     /* v2.222: FIX #6 - CRITICAL: Free unknown protocol packets to prevent leak! */
     DEBUG_WARN("%s: [WARN] Unknown ethernet protocol: ethertype=0x%04x, pbuf=%p, p->ref=%d, p->len=%u\n",
            COMPONENT_NAME, type, (void*)p, p->ref, p->len);
-    pbuf_other_count++;  /* v2.223: Track unknown protocols (matching Net0) */
     PBUF_TRACK_FREE(p);
     pbuf_free(p);
-    pbuf_freed_count++;  /* v2.223: Track free (matching Net0) */
-    pbuf_error_count++;  /* v2.223: We freed unknown protocol (matching Net0) */
+    
+    
     return ERR_OK;
 }
 
@@ -2448,7 +2425,6 @@ static void process_rx_packets(void)
         /* Allocate pbuf and copy packet data (skipping header) */
         struct pbuf *p = pbuf_alloc(PBUF_RAW, packet_len, PBUF_POOL);
         if (p != NULL) {
-            pbuf_allocated_count++;  /* v2.223: Track allocation (matching Net0) */
             /* v2.222: Deep pbuf tracking */
             PBUF_TRACK_ALLOC(p, "Net1");
 
@@ -2467,78 +2443,6 @@ static void process_rx_packets(void)
                 DEBUG("   [OK] pbuf allocated, passing to lwIP input handler\n");
             }
             #endif
-
-            /* v2.226: TCP Port Filtering - Pre-filter BEFORE passing to lwIP
-             * ═══════════════════════════════════════════════════════════════════
-             * CRITICAL: Filter HERE in process_rx_packets() BEFORE netif_data.input()!
-             *
-             * Why here?
-             * - Packets from PLC (192.168.95.2) arrive in RX queue
-             * - We allocate pbuf and copy packet data (lines 2475-2485)
-             * - MUST filter BEFORE line netif_data.input() call
-             * - If we pass to lwIP, it accepts based on dest IP match
-             * - Then lwIP checks for listener on dest port
-             * - No listener → lwIP leaks the pbuf
-             *
-             * Leak Pattern Observed:
-             * - Source: 192.168.95.2:62977 (PLC using non-Modbus port)
-             * - Dest: 192.168.95.1:XXXXX (our interface, random high port)
-             * - PLC trying to connect FROM port 62977 to our interface
-             * - Not Modbus (502) traffic
-             *
-             * Solution: Drop non-Modbus TCP BEFORE lwIP sees it
-             */
-            bool should_drop_packet = false;
-            if (packet_len >= sizeof(struct ethhdr)) {
-                struct ethhdr *eth = (struct ethhdr *)packet_data;
-                uint16_t eth_proto_check = ntohs(eth->h_proto);
-
-                if (eth_proto_check == 0x0800 && packet_len >= sizeof(struct ethhdr) + sizeof(struct iphdr)) {  /* IPv4 */
-                    struct iphdr *ip = (struct iphdr *)(packet_data + sizeof(struct ethhdr));
-                    if (ip->protocol == 6) {  /* TCP - reject all except port 502 */
-                        size_t ip_hdr_len = (ip->ihl) * 4;
-
-                        /* v2.227: Check if TCP packet is well-formed before parsing */
-                        if (packet_len >= sizeof(struct ethhdr) + ip_hdr_len + sizeof(struct tcphdr)) {
-                            /* Well-formed TCP - parse ports and check */
-                            struct tcphdr *tcp = (struct tcphdr *)(packet_data + sizeof(struct ethhdr) + ip_hdr_len);
-                            uint16_t src_port = ntohs(tcp->source);
-                            uint16_t dest_port = ntohs(tcp->dest);
-
-                            /* REJECT if neither port is 502 (Modbus) - catches SYN/FIN/ACK too */
-                            if (src_port != TCP_SERVER_PORT && dest_port != TCP_SERVER_PORT) {
-                                uint32_t saddr = ntohl(ip->saddr);
-                                uint32_t daddr = ntohl(ip->daddr);
-                                DEBUG_WARN("%s: [REJECT-PRE-LWIP] TCP non-Modbus: %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u (dropping)\n",
-                                       COMPONENT_NAME,
-                                       (saddr >> 24) & 0xFF, (saddr >> 16) & 0xFF,
-                                       (saddr >> 8) & 0xFF, saddr & 0xFF, src_port,
-                                       (daddr >> 24) & 0xFF, (daddr >> 16) & 0xFF,
-                                       (daddr >> 8) & 0xFF, daddr & 0xFF, dest_port);
-                                should_drop_packet = true;
-                            }
-                        } else {
-                            /* v2.227: Malformed TCP (too short to parse) - REJECT it */
-                            DEBUG_WARN("%s: [REJECT-PRE-LWIP] Malformed TCP (too short: %zu bytes)\n",
-                                   COMPONENT_NAME, packet_len);
-                            should_drop_packet = true;
-                        }
-                    }
-                }
-            }
-
-            /* Drop packet if non-Modbus TCP detected */
-            if (should_drop_packet) {
-                PBUF_TRACK_FREE(p);
-                pbuf_free(p);
-                pbuf_freed_count++;
-                pbuf_error_count++;
-                /* Mark buffer as free and move to next packet */
-                rx_buffer_used[buf_idx] = false;
-                last_used_idx++;
-                loop_count++;
-                continue;  /* Skip lwIP input - packet dropped */
-            }
 
             /* Feed packet to lwIP */
             err_t lwip_result = netif_data.input(p, &netif_data);
@@ -2563,14 +2467,35 @@ static void process_rx_packets(void)
             }
             #endif
 
-            /* v2.223: Track lwIP acceptance/rejection (matching Net0) */
+            /* CRITICAL DIAGNOSTIC: Log TCP SYN packets to diagnose connection acceptance */
+            if (packet_len >= sizeof(struct ethhdr)) {
+                struct ethhdr *eth = (struct ethhdr *)packet_data;
+                uint16_t eth_proto_check = ntohs(eth->h_proto);
+
+                if (eth_proto_check == 0x0800 && packet_len >= sizeof(struct ethhdr) + sizeof(struct iphdr)) {  /* IPv4 */
+                    struct iphdr *ip = (struct iphdr *)(packet_data + sizeof(struct ethhdr));
+                    if (ip->protocol == 6) {  /* TCP */
+                        size_t ip_hdr_len = (ip->ihl) * 4;
+                        if (packet_len >= sizeof(struct ethhdr) + ip_hdr_len + sizeof(struct tcphdr)) {
+                            struct tcphdr *tcp = (struct tcphdr *)(packet_data + sizeof(struct ethhdr) + ip_hdr_len);
+                            uint32_t daddr = ntohl(ip->daddr);
+
+                            if (tcp->syn && !tcp->ack) {
+                                /* This is a SYN packet (connection attempt) */
+                                DEBUG("%s: [FIND] SYN packet detected: Dest IP = %u.%u.%u.%u:%u (Interface IP = 192.168.95.2)\n",
+                                       COMPONENT_NAME,
+                                       (daddr >> 24) & 0xFF, (daddr >> 16) & 0xFF, (daddr >> 8) & 0xFF, daddr & 0xFF,
+                                       ntohs(tcp->dest));
+                                DEBUG("%s:    → If dest IP matches interface IP, lwIP should accept. Otherwise it rejects.\n", COMPONENT_NAME);
+                            }
+                        }
+                    }
+                }
+            }
+
+            /* v2.155: Let lwIP free pbuf on error - we don't own it */
             if (lwip_result != ERR_OK) {
-                PBUF_TRACK_FREE(p);
-                pbuf_free(p);
-                pbuf_freed_count++;      /* v2.223: Track free */
-                pbuf_error_count++;      /* v2.223: lwIP rejected, we freed */
-            } else {
-                pbuf_leaked_to_lwip++;   /* v2.223: lwIP accepted, it owns pbuf now */
+                /* lwIP handles pbuf cleanup */
             }
         } else {
             /* CRITICAL: pbuf allocation failed - this means lwIP is out of memory */
@@ -5877,7 +5802,7 @@ static int virtio_net_init(void)
 void post_init(void)
 {
     DEBUG("%s: Component started\n", COMPONENT_NAME);
-    DEBUG("%s: NET1 v2.227 (2025-11-01) - Fixed TCP filter: reject SYN/FIN/ACK and malformed TCP\n", COMPONENT_NAME);
+    DEBUG("%s: NET1 v2.216 (2025-11-01) - Add IP address to lwIP tcp_input() debug: [lwIP@IP]\n", COMPONENT_NAME);
     DEBUG("%s: [FIX] MODE: PRODUCTION-READY with Multi-Layer Validation\n", COMPONENT_NAME);
     DEBUG_INFO("%s: [OK] FIX 1: payload_data buffer (prevents dataport corruption)\n", COMPONENT_NAME);
     DEBUG_INFO("%s: [OK] FIX 2: tcp_abort() removed from callbacks (crash at 0x38a9c fixed!)\n", COMPONENT_NAME);

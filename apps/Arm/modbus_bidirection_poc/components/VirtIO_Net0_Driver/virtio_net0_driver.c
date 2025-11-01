@@ -2381,11 +2381,6 @@ static err_t custom_input_promiscuous(struct pbuf *p, struct netif *inp)
                 pbuf_other_count++;  /* v2.203: Track other IP protocols */
             }
 
-            /* v2.226: REMOVED old v2.224 filter from here - it was in the wrong location!
-             * Filtering now happens in process_rx_packets() BEFORE netif_data.input()
-             * This prevents packets from reaching lwIP in the first place.
-             */
-
             /* If packet is not destined for our interface IP, rewrite it */
             /* v2.95: CRITICAL FIX - Create metadata for ALL TCP connections!
              * ═══════════════════════════════════════════════════════════════════
@@ -2923,78 +2918,6 @@ static void process_rx_packets(void)
             #if DEBUG_ENABLED_DEBUG
             DEBUG("   [OK] pbuf allocated, passing to lwIP input handler\n");
             #endif
-
-            /* v2.226: TCP Port Filtering - Pre-filter BEFORE passing to lwIP
-             * ═══════════════════════════════════════════════════════════════════
-             * CRITICAL: Filter HERE in process_rx_packets() BEFORE netif_data.input()!
-             *
-             * Why here?
-             * - Packets from SCADA (192.168.90.5) arrive in RX queue
-             * - We allocate pbuf and copy packet data
-             * - MUST filter BEFORE netif_data.input() call
-             * - If we pass to lwIP, it accepts based on dest IP match
-             * - Then lwIP checks for listener on dest port
-             * - No listener → lwIP leaks the pbuf
-             *
-             * Leak Pattern Observed (from logs):
-             * - Source: 192.168.90.5:XXXXX (SCADA, random high port)
-             * - Dest: 192.168.96.2:62977 (our interface, non-Modbus port)
-             * - SCADA trying to connect TO port 62977 on our interface
-             * - Not Modbus (502) traffic
-             *
-             * Solution: Drop non-Modbus TCP BEFORE lwIP sees it
-             */
-            bool should_drop_packet = false;
-            if (packet_len >= sizeof(struct ethhdr)) {
-                struct ethhdr *eth = (struct ethhdr *)packet_data;
-                uint16_t eth_proto_check = ntohs(eth->h_proto);
-
-                if (eth_proto_check == 0x0800 && packet_len >= sizeof(struct ethhdr) + sizeof(struct iphdr)) {  /* IPv4 */
-                    struct iphdr *ip = (struct iphdr *)(packet_data + sizeof(struct ethhdr));
-                    if (ip->protocol == 6) {  /* TCP - reject all except port 502 */
-                        size_t ip_hdr_len = (ip->ihl) * 4;
-
-                        /* v2.227: Check if TCP packet is well-formed before parsing */
-                        if (packet_len >= sizeof(struct ethhdr) + ip_hdr_len + sizeof(struct tcphdr)) {
-                            /* Well-formed TCP - parse ports and check */
-                            struct tcphdr *tcp = (struct tcphdr *)(packet_data + sizeof(struct ethhdr) + ip_hdr_len);
-                            uint16_t src_port = ntohs(tcp->source);
-                            uint16_t dest_port = ntohs(tcp->dest);
-
-                            /* REJECT if neither port is 502 (Modbus) - catches SYN/FIN/ACK too */
-                            if (src_port != TCP_SERVER_PORT && dest_port != TCP_SERVER_PORT) {
-                                uint32_t saddr = ntohl(ip->saddr);
-                                uint32_t daddr = ntohl(ip->daddr);
-                                DEBUG_WARN("%s: [REJECT-PRE-LWIP] TCP non-Modbus: %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u (dropping)\n",
-                                       COMPONENT_NAME,
-                                       (saddr >> 24) & 0xFF, (saddr >> 16) & 0xFF,
-                                       (saddr >> 8) & 0xFF, saddr & 0xFF, src_port,
-                                       (daddr >> 24) & 0xFF, (daddr >> 16) & 0xFF,
-                                       (daddr >> 8) & 0xFF, daddr & 0xFF, dest_port);
-                                should_drop_packet = true;
-                            }
-                        } else {
-                            /* v2.227: Malformed TCP (too short to parse) - REJECT it */
-                            DEBUG_WARN("%s: [REJECT-PRE-LWIP] Malformed TCP (too short: %zu bytes)\n",
-                                   COMPONENT_NAME, packet_len);
-                            should_drop_packet = true;
-                        }
-                    }
-                }
-            }
-
-            /* Drop packet if non-Modbus TCP detected */
-            if (should_drop_packet) {
-                PBUF_TRACK_FREE(p);
-                pbuf_free(p);
-                pbuf_freed_count++;
-                pbuf_error_count++;
-                /* Mark buffer as free and move to next packet */
-                rx_buffer_used[buf_idx] = false;
-                last_used_idx++;
-                loop_count++;
-                continue;  /* Skip lwIP input - packet dropped */
-            }
 
             /* v2.137: Track before lwIP input call */
             BREADCRUMB(8008);  /* Before lwIP input() */
@@ -5866,7 +5789,7 @@ static int virtio_net_init(void)
 void post_init(void)
 {
     DEBUG("%s: Component started\n", COMPONENT_NAME);
-    DEBUG("%s: NET0 v2.227 (2025-11-01) - Fixed TCP filter: reject SYN/FIN/ACK and malformed TCP\n", COMPONENT_NAME);
+    DEBUG("%s: NET0 v2.219 (2025-11-01) - Fix duplicate close notifications from poll callback\n", COMPONENT_NAME);
     DEBUG("%s: [FIX] MODE: PRODUCTION with fast cleanup (every 100 iterations)\n", COMPONENT_NAME);
     DEBUG_INFO("%s: [OK] FIX 1: Immediate cleanup on tcp_echo_err (v2.145 behavior)\n", COMPONENT_NAME);
     DEBUG_INFO("%s: [OK] FIX 2: Send close notification to Net1 when SCADA closes\n", COMPONENT_NAME);

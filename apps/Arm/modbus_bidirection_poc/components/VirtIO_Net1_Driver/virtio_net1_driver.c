@@ -4019,9 +4019,15 @@ void inbound_ready_handle(void)
              * - If PCB exists: Close it and enqueue cleanup
              * - If PCB is NULL: Connection already closed, still enqueue cleanup
              *   (cleanup queue will handle deduplication via session_id)
+             *
+             * v2.219: CRITICAL FIX - Add pcb_closed guard against duplicate notifications
+             * - Net0 may send duplicate close notifications (poll callback + recv callback)
+             * - Without guard: Each notification calls tcp_close() → allocates FIN pbuf
+             * - Only one cleanup executes → other FIN pbufs leak
+             * - Fix: Check !pcb_closed to prevent duplicate tcp_close() calls
              * ═══════════════════════════════════════════════════════════════
              */
-            if (meta != NULL && meta->pcb != NULL) {
+            if (meta != NULL && meta->pcb != NULL && !meta->pcb_closed) {
                 struct tcp_pcb *pcb = meta->pcb;
 
                 DEBUG("%s:   → Closing PLC connection (session %u, PCB=%p)\n",

@@ -2174,6 +2174,115 @@ static void check_pending_cleanups(void)
     }
 }
 
+/* v2.218: Cleanup CLOSE_WAIT and LAST_ACK connections to prevent PBUF pool exhaustion
+ * ══════════════════════════════════════════════════════════════════════════
+ * Purpose: Automatically close connections stuck in closing states
+ *
+ * CLOSE_WAIT state:
+ *   - Remote side (SCADA) sent FIN (requested close)
+ *   - lwIP acknowledged the FIN and moved connection to CLOSE_WAIT
+ *   - lwIP is waiting for application to call tcp_close()
+ *   - Each connection holds ~27 PBUFs on average
+ *
+ * LAST_ACK state:
+ *   - Application called tcp_close(), lwIP sent FIN
+ *   - Waiting for ACK from remote side
+ *   - If remote doesn't respond, connection stuck forever
+ *   - Still holds PBUFs until final ACK received
+ *
+ * Root Cause of PBUF Leak:
+ *   - 29 CLOSE_WAIT connections × 27 PBUFs = ~800/800 pool exhausted (v2.216)
+ *   - v2.217 fixed CLOSE_WAIT but connections moved to LAST_ACK and got stuck
+ *   - LAST_ACK connections never freed because SCADA doesn't ACK our FIN
+ *   - Pool still exhausts: 6514 freed vs continuous allocations
+ *
+ * Solution (v2.218):
+ *   - Use tcp_abort() instead of tcp_close() for CLOSE_WAIT
+ *     - Immediate cleanup, no waiting for FIN handshake
+ *     - Safe from main loop (NOT from callbacks!)
+ *   - Also cleanup LAST_ACK connections (in case some remain)
+ *     - Abort connections stuck in LAST_ACK state
+ *     - Frees PBUFs immediately
+ *
+ * When to Call:
+ *   - Every 5 seconds from main loop
+ *   - Frequent enough to prevent pool exhaustion
+ *
+ * Safety:
+ *   - tcp_abort() is SAFE from main loop context
+ *   - tcp_abort() is UNSAFE from callbacks (would cause use-after-free)
+ *   - We call it ONLY from main loop, never from callbacks
+ *
+ * Called from: Main loop (periodic cleanup)
+ * ══════════════════════════════════════════════════════════════════════════
+ */
+static void cleanup_close_wait_connections(void)
+{
+    int close_wait_count = 0;
+    int last_ack_count = 0;
+    int aborted_count = 0;
+
+    /* Scan lwIP's active PCB list for connections in closing states
+     * tcp_active_pcbs is the linked list of all active TCP connections */
+    struct tcp_pcb *pcb = tcp_active_pcbs;
+
+    while (pcb != NULL) {
+        struct tcp_pcb *next = pcb->next;  /* Save next pointer before potential abort */
+
+        if (pcb->state == CLOSE_WAIT) {
+            close_wait_count++;
+
+            DEBUG_INFO("%s: [CLOSE_WAIT] Found connection in CLOSE_WAIT state: pcb=%p, "
+                      "local=%u.%u.%u.%u:%u, remote=%u.%u.%u.%u:%u\n",
+                      COMPONENT_NAME, (void*)pcb,
+                      ip4_addr1(&pcb->local_ip), ip4_addr2(&pcb->local_ip),
+                      ip4_addr3(&pcb->local_ip), ip4_addr4(&pcb->local_ip),
+                      pcb->local_port,
+                      ip4_addr1(&pcb->remote_ip), ip4_addr2(&pcb->remote_ip),
+                      ip4_addr3(&pcb->remote_ip), ip4_addr4(&pcb->remote_ip),
+                      pcb->remote_port);
+
+            /* Use tcp_abort() instead of tcp_close()
+             * - Immediately frees all PBUFs (no waiting for FIN handshake)
+             * - SAFE from main loop (UNSAFE from callbacks!)
+             * - Avoids LAST_ACK stuck state (v2.217 problem)
+             */
+            tcp_abort(pcb);
+            DEBUG_INFO("%s:    → tcp_abort() called - PBUFs freed immediately\n",
+                      COMPONENT_NAME);
+            aborted_count++;
+        }
+        else if (pcb->state == LAST_ACK) {
+            last_ack_count++;
+
+            DEBUG_INFO("%s: [LAST_ACK] Found connection stuck in LAST_ACK state: pcb=%p, "
+                      "local=%u.%u.%u.%u:%u, remote=%u.%u.%u.%u:%u\n",
+                      COMPONENT_NAME, (void*)pcb,
+                      ip4_addr1(&pcb->local_ip), ip4_addr2(&pcb->local_ip),
+                      ip4_addr3(&pcb->local_ip), ip4_addr4(&pcb->local_ip),
+                      pcb->local_port,
+                      ip4_addr1(&pcb->remote_ip), ip4_addr2(&pcb->remote_ip),
+                      ip4_addr3(&pcb->remote_ip), ip4_addr4(&pcb->remote_ip),
+                      pcb->remote_port);
+
+            /* Abort stuck LAST_ACK connections
+             * Remote side is not responding to our FIN, so abort immediately */
+            tcp_abort(pcb);
+            DEBUG_INFO("%s:    → tcp_abort() called - freeing stuck connection\n",
+                      COMPONENT_NAME);
+            aborted_count++;
+        }
+
+        pcb = next;  /* Move to next connection */
+    }
+
+    /* Log summary if we found any connections to clean */
+    if (close_wait_count > 0 || last_ack_count > 0) {
+        DEBUG_INFO("%s: [CLEANUP] Summary: CLOSE_WAIT=%d, LAST_ACK=%d, aborted=%d\n",
+                  COMPONENT_NAME, close_wait_count, last_ack_count, aborted_count);
+    }
+}
+
 /*
  * Custom input function for protocol-break architecture WITH metadata preservation
  *
@@ -3888,7 +3997,7 @@ static err_t tcp_echo_poll(void *arg, struct tcp_pcb *pcb)
         /* Send close notification to Net1 BEFORE closing
          * This tells Net1 to close its PLC connection too */
         InboundDataport *in_dp = (InboundDataport *)inbound_dp;
-        if (in_dp != NULL) {
+        if (in_dp != NULL && !meta->close_notified) {
             uint32_t head = in_dp->close_queue.head;
             uint32_t slot = head & CONTROL_QUEUE_MASK;
             volatile struct control_notification *notif = &in_dp->close_queue.notifications[slot];
@@ -3911,6 +4020,7 @@ static err_t tcp_echo_poll(void *arg, struct tcp_pcb *pcb)
             __sync_synchronize();  /* Memory barrier - ensure sentinel visible before signal */
 
             inbound_ready_emit();  /* Signal Net1 to process queue */
+            meta->close_notified = true;  /* v2.219: Mark notification sent to prevent duplicates */
 
             DEBUG("%s:   [OK] Close notification queued for Net1 (session %u)\n",
                    COMPONENT_NAME, meta->session_id);
@@ -5650,14 +5760,15 @@ static int virtio_net_init(void)
 void post_init(void)
 {
     DEBUG("%s: Component started\n", COMPONENT_NAME);
-    DEBUG("%s: NET0 v2.206 (2025-10-27) - Add orphan PCB buffer diagnostics to locate stuck pbufs\n", COMPONENT_NAME);
+    DEBUG("%s: NET0 v2.218 (2025-11-01) - Fix LAST_ACK stuck state (use tcp_abort for immediate cleanup)\n", COMPONENT_NAME);
     DEBUG("%s: [FIX] MODE: PRODUCTION with fast cleanup (every 100 iterations)\n", COMPONENT_NAME);
     DEBUG_INFO("%s: [OK] FIX 1: Immediate cleanup on tcp_echo_err (v2.145 behavior)\n", COMPONENT_NAME);
     DEBUG_INFO("%s: [OK] FIX 2: Send close notification to Net1 when SCADA closes\n", COMPONENT_NAME);
     DEBUG_INFO("%s: [OK] FIX 3: Handle PLC error notification - close SCADA immediately\n", COMPONENT_NAME);
     DEBUG_INFO("%s: [OK] FIX 4: REMOVED PCB state check - prevents crash at offset 0x10!\n", COMPONENT_NAME);
     DEBUG_INFO("%s: [OK] FIX 5: Connection table debugging for troubleshooting\n");
-    DEBUG_INFO("%s: [OK] FIX 6: lwIP manages connection limits (MEMP_NUM_TCP_PCB=100)\n\n", COMPONENT_NAME);
+    DEBUG_INFO("%s: [OK] FIX 6: lwIP manages connection limits (MEMP_NUM_TCP_PCB=100)\n");
+    DEBUG_INFO("%s: [OK] FIX 7: tcp_abort() CLOSE_WAIT+LAST_ACK (every 5s) - immediate PBUF free\n\n", COMPONENT_NAME);
 
     /* Initialize connection tracking table */
     memset(connection_table, 0, sizeof(connection_table));
@@ -5829,6 +5940,7 @@ int run(void)
     /* Note: TCP server is now initialized in RX path after first packet */
     static uint32_t cleanup_counter = 0;
     static uint32_t heartbeat_counter = 0;
+    static uint32_t last_close_wait_cleanup = 0;  /* v2.217: Track CLOSE_WAIT cleanup time */
     while (1) {
         /* v2.104: Lightweight heartbeat - removed table dump (stack overflow risk) */
         if (++heartbeat_counter >= 50000) {
@@ -5912,6 +6024,34 @@ int run(void)
              * ═══════════════════════════════════════════════════════════════════════════
              */
             check_pending_cleanups();
+        }
+
+        /* v2.217: Periodic CLOSE_WAIT cleanup (every 5 seconds)
+         * ═══════════════════════════════════════════════════════════════════════════
+         * Purpose: Prevent PBUF pool exhaustion from CLOSE_WAIT connections
+         *
+         * Root Cause:
+         *   - When SCADA closes connection, lwIP moves it to CLOSE_WAIT
+         *   - Each CLOSE_WAIT connection holds ~27 PBUFs on average
+         *   - 29 CLOSE_WAIT connections × 27 PBUFs = 800/800 pool exhausted
+         *
+         * Solution:
+         *   - Scan lwIP's tcp_active_pcbs list every 5 seconds
+         *   - Call tcp_close() on connections in CLOSE_WAIT state
+         *   - lwIP frees all held PBUFs when connection closes
+         *
+         * Why every 5 seconds:
+         *   - Not too frequent (avoid overhead scanning PCB list)
+         *   - Frequent enough to prevent pool exhaustion
+         *   - Typical SCADA behavior: bursts of connections every few seconds
+         *
+         * Safety: tcp_close() is safe to call from main loop context
+         * ═══════════════════════════════════════════════════════════════════════════
+         */
+        uint32_t now = sys_now();
+        if (now - last_close_wait_cleanup >= 5000) {  /* 5 seconds */
+            cleanup_close_wait_connections();
+            last_close_wait_cleanup = now;
         }
 
         seL4_Yield();

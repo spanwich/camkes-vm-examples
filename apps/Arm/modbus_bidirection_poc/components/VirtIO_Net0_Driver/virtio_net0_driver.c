@@ -4161,6 +4161,25 @@ static err_t tcp_echo_accept(void *arg, struct tcp_pcb *newpcb, err_t err)
         return err != ERR_OK ? err : ERR_VAL;
     }
 
+    /* v2.231: REJECT non-Modbus TCP connections immediately
+     * Problem: Port 62977 and other non-Modbus ports cause pbuf leaks
+     * Solution: Check ports and abort connection before creating metadata
+     * - Prevents pbufs from accumulating in unwanted connections
+     * - lwIP will properly clean up when we call tcp_abort()
+     */
+    uint16_t local_port = newpcb->local_port;
+    uint16_t remote_port = newpcb->remote_port;
+
+    if (local_port != TCP_SERVER_PORT && remote_port != TCP_SERVER_PORT) {
+        DEBUG("%s: [REJECT-TCP] Non-Modbus connection from %u.%u.%u.%u:%u -> local:%u (aborting)\n",
+               COMPONENT_NAME,
+               ip4_addr1(&newpcb->remote_ip), ip4_addr2(&newpcb->remote_ip),
+               ip4_addr3(&newpcb->remote_ip), ip4_addr4(&newpcb->remote_ip),
+               remote_port, local_port);
+        tcp_abort(newpcb);  /* Tell lwIP to abort and clean up */
+        return ERR_ABRT;
+    }
+
     /* v2.100: CRITICAL - Hard connection limit to prevent orphaned connections
      *
      * Problem (earlier versions):

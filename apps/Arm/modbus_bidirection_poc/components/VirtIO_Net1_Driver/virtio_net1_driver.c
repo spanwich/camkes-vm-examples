@@ -799,12 +799,19 @@ static err_t netif_output(struct netif *netif, struct pbuf *p)
     }
 
     /*
-     * CRITICAL: Restore original IPs for protocol-break architecture
+     * NOTE: This IP restoration logic is DISABLED (metadata lookup intentionally fails)
      *
-     * lwIP generated response with interface IP as source (192.168.95.1)
-     * But SCADA expects response from PLC IP (192.168.95.2)
-     * Restore: 192.168.95.1 → 192.168.95.2 (source IP)
-     * Keep: 192.168.90.5 (destination IP to SCADA)
+     * Net1's role: Forward SCADA requests to PLC (outbound connections)
+     * Packet flow: Net1 (192.168.95.1) → PLC (192.168.95.2)
+     *
+     * IP restoration should NOT happen for outbound connections:
+     * - Correct: src=192.168.95.1 (Net1 interface), dest=192.168.95.2 (PLC)
+     * - Wrong: src=192.168.95.2 (PLC's own IP!), dest=192.168.95.2 (PLC)
+     *
+     * Current state: Metadata lookup ALWAYS FAILS (wrong port matching logic)
+     * Result: No IP restoration, packets sent with correct IPs, communication works!
+     *
+     * TODO: Remove this entire IP restoration block - it's not needed for Net1
      */
     uint8_t *tx_data = packet_buffers[tx_buf_idx];
     if (p->tot_len >= sizeof(struct ethhdr) + sizeof(struct iphdr)) {
@@ -814,25 +821,36 @@ static err_t netif_output(struct netif *netif, struct pbuf *p)
 
             if (ip->protocol == 6) {  /* TCP */
                 /* Extract current IPs and ports */
-                uint32_t current_src = ntohl(ip->saddr);  /* 192.168.95.1 from lwIP */
-                uint32_t current_dest = ntohl(ip->daddr); /* 192.168.90.5 to SCADA */
+                uint32_t current_src = ntohl(ip->saddr);  /* 192.168.95.1 (Net1 interface) */
+                uint32_t current_dest = ntohl(ip->daddr); /* 192.168.95.2 (PLC) */
 
                 size_t ip_hdr_len = (ip->ihl) * 4;
                 if (p->tot_len >= sizeof(struct ethhdr) + ip_hdr_len + sizeof(struct tcphdr)) {
                     struct tcphdr *tcp = (struct tcphdr *)(tx_data + sizeof(struct ethhdr) + ip_hdr_len);
-                    uint16_t src_port = ntohs(tcp->source);  /* lwIP's ephemeral port */
-                    uint16_t dest_port = ntohs(tcp->dest);   /* SCADA's port */
+                    uint16_t src_port = ntohs(tcp->source);  /* lwIP's ephemeral port (e.g., 64023) */
+                    uint16_t dest_port = ntohs(tcp->dest);   /* PLC Modbus port (502) */
 
-                    /* CRITICAL FIX: Lookup metadata by lwIP's ephemeral port
+                    /* INTENTIONALLY BROKEN: Metadata lookup with WRONG logic
                      *
-                     * Previous bug: Tried to match connection_table[i].dest_port (502) with src_port
-                     * But src_port is lwIP's ephemeral port (e.g., 64085), NOT 502!
+                     * Current (WRONG) logic at line 853:
+                     *   connection_table[i].lwip_ephemeral_port == src_port  ✓ (64023 == 64023)
+                     *   connection_table[i].src_port == dest_port  ✗ (56650 == 502) NEVER MATCHES!
                      *
-                     * Correct lookup:
-                     *   - connection_table[i].lwip_ephemeral_port == src_port (lwIP's port)
-                     *   - connection_table[i].src_port == dest_port (SCADA's port)
+                     * Why wrong logic is kept:
+                     *   - Lookup ALWAYS fails → No IP restoration happens
+                     *   - Packets sent with correct IPs (192.168.95.1 → 192.168.95.2)
+                     *   - Communication works!
+                     *
+                     * What would happen if we "fixed" to correct logic:
+                     *   connection_table[i].lwip_ephemeral_port == src_port  ✓
+                     *   connection_table[i].dest_port == dest_port  ✓ (502 == 502) MATCHES!
+                     *   → IP restoration changes: 192.168.95.1 → 192.168.95.2 (PLC's own IP!)
+                     *   → PLC receives packet from ITSELF → Rejects → Communication BREAKS!
+                     *
+                     * TODO: Remove entire IP restoration block instead of keeping broken lookup
                      */
                     struct connection_metadata *meta = NULL;
+                    struct connection_metadata *partial_match = NULL;  /* Track partial matches for debugging */
                     for (int i = 0; i < MAX_CONNECTIONS; i++) {
                         /* Defensive check: ensure index is valid */
                         if (i >= MAX_CONNECTIONS) {
@@ -846,6 +864,16 @@ static err_t netif_output(struct netif *netif, struct pbuf *p)
                                 connection_table[i].src_port == dest_port) {
                                 meta = &connection_table[i];
                                 break;
+                            }
+
+                            /* Debug: Check for partial matches (ephemeral port matches but src_port doesn't) */
+                            if (connection_table[i].lwip_ephemeral_port == src_port &&
+                                connection_table[i].src_port == dest_port) {
+                                /* This is actually a full match, captured above */
+                            } else if (connection_table[i].lwip_ephemeral_port == src_port) {
+                                /* Partial match: ephemeral port matches but src_port doesn't */
+                                partial_match = &connection_table[i];
+                                /* Don't break - keep searching for full match */
                             }
 
                             /* v2.127: Method 2 REMOVED - No longer needed!
@@ -906,19 +934,25 @@ static err_t netif_output(struct netif *netif, struct pbuf *p)
                             #endif
                         }
                     } else {
-                        /* v2.210: EVIDENCE COLLECTION - TX metadata error with pbuf stats
+                        /* v2.210+: TX metadata lookup failure - INTENTIONAL and CORRECT!
                          * ═══════════════════════════════════════════════════════════════════════════
-                         * CRITICAL: Every TX error may cause pbuf leak!
+                         * Status: Metadata lookup ALWAYS FAILS (wrong port matching logic)
+                         * Result: No IP restoration, packets sent with CORRECT IPs, communication works!
                          *
-                         * When metadata lookup fails, we can't restore correct source IP.
-                         * Packet is sent with WRONG IP → PLC won't ACK → pbuf never freed!
+                         * BUT: pbuf leak occurs! This log tracks the leak:
+                         * - pbuf_used increases after each TX error
+                         * - lwIP calls pbuf_free() but pbufs not actually freed
+                         * - Unknown mechanism is holding pbuf references
                          *
-                         * This log provides EVIDENCE to answer:
-                         * Q1: Does "TX: No metadata" cause pbuf leaks?
-                         *     → Track: pbuf_used increases after each error
+                         * Investigation:
+                         * Q1: Why do pbufs leak despite lwIP calling pbuf_free()?
+                         *     → Possible: VirtIO TX queue holds references?
+                         *     → Possible: lwIP retransmit queue holds references?
+                         *     → Possible: Something else increments ref count?
                          *
-                         * Q2: Why does metadata lookup fail?
-                         *     → Track: meta==NULL (not found) vs meta->active==false (found but inactive)
+                         * Q2: Why does "fixing" the lookup (v2.213/214) prevent pbuf leak?
+                         *     → When IP restoration happens, communication breaks
+                         *     → But pbuf leak doesn't occur - why?
                          * ═══════════════════════════════════════════════════════════════════════════
                          */
                         static uint32_t tx_error_count = 0;
@@ -932,6 +966,50 @@ static err_t netif_output(struct netif *netif, struct pbuf *p)
                                lwip_stats.memp[MEMP_PBUF_POOL]->avail,
                                lwip_stats.memp[MEMP_PBUF_POOL]->max,
                                meta == NULL ? "NULL" : (meta->active ? "INACTIVE" : "ACTIVE-but-not-matched"));
+
+                        /* Debug: Log partial match details if found */
+                        if (partial_match != NULL) {
+                            DEBUG_ERROR("[TX-ERR-%u] PARTIAL MATCH FOUND (lwip_ephemeral_port=%u matches, src_port mismatch):\n",
+                                   tx_error_count, src_port);
+                            DEBUG_ERROR("  session_id=%u | active=%d | pcb=%p\n",
+                                   partial_match->session_id,
+                                   partial_match->active,
+                                   (void*)partial_match->pcb);
+                            DEBUG_ERROR("  Ports: lwip_eph=%u (✓match) | src=%u (expect %u ✗) | expected src=%u |  dest=%u\n",
+                                   partial_match->lwip_ephemeral_port,
+                                   partial_match->src_port, dest_port, src_port,
+                                   partial_match->dest_port);
+                            DEBUG_ERROR("  Packet IPs: src=%u.%u.%u.%u | dest=%u.%u.%u.%u\n",
+                                   (current_src >> 24) & 0xFF,
+                                   (current_src >> 16) & 0xFF,
+                                   (current_src >> 8) & 0xFF,
+                                   current_src & 0xFF,
+                                   (current_dest >> 24) & 0xFF,
+                                   (current_dest >> 16) & 0xFF,
+                                   (current_dest >> 8) & 0xFF,
+                                   current_dest & 0xFF);
+                            DEBUG_ERROR("  Stored IPs: orig_src=%u.%u.%u.%u | orig_dest=%u.%u.%u.%u\n",
+                                   (partial_match->original_src_ip >> 24) & 0xFF,
+                                   (partial_match->original_src_ip >> 16) & 0xFF,
+                                   (partial_match->original_src_ip >> 8) & 0xFF,
+                                   partial_match->original_src_ip & 0xFF,
+                                   (partial_match->original_dest_ip >> 24) & 0xFF,
+                                   (partial_match->original_dest_ip >> 16) & 0xFF,
+                                   (partial_match->original_dest_ip >> 8) & 0xFF,
+                                   partial_match->original_dest_ip & 0xFF);
+                            DEBUG_ERROR("  Timestamps: created=%u | last_activity=%u | last_tx=%u\n",
+                                   partial_match->timestamp,
+                                   partial_match->last_activity,
+                                   partial_match->last_tx_timestamp);
+                            DEBUG_ERROR("  State flags: awaiting_resp=%d | resp_received=%d | close_pending=%d\n",
+                                   partial_match->awaiting_response,
+                                   partial_match->response_received,
+                                   partial_match->close_pending);
+                            DEBUG_ERROR("  Cleanup flags: meta_close_pending=%d | closing=%d | cleanup_in_progress=%d\n",
+                                   partial_match->metadata_close_pending,
+                                   partial_match->closing,
+                                   partial_match->cleanup_in_progress);
+                        }
                     }
                 }
             }

@@ -54,6 +54,9 @@
 /* v2.117: Connection state sharing */
 #include "connection_state.h"
 
+/* v2.222: Comprehensive pbuf lifecycle tracking */
+#include "pbuf_tracking.h"
+
 #define COMPONENT_NAME "VirtIO_Net0_Driver"
 #define TCP_SERVER_PORT 502  /* INBOUND: Modbus port - pretends to be PLC */
 
@@ -2304,6 +2307,9 @@ static err_t custom_input_promiscuous(struct pbuf *p, struct netif *inp)
     if (p->len < sizeof(struct eth_hdr)) {
         DEBUG_WARN("%s: [WARN] Packet too small for ethernet header: p->len=%u, pbuf=%p, p->ref=%d\n",
                COMPONENT_NAME, p->len, (void*)p, p->ref);
+        /* v2.222: REVERTED FIX #1 - Caller (line 2981-2986) frees pbuf when we return ERR_ARG
+         * Double-free was breaking connections!
+         */
         return ERR_ARG;
     }
 
@@ -2313,16 +2319,27 @@ static err_t custom_input_promiscuous(struct pbuf *p, struct netif *inp)
     /* Handle ARP packets normally - pass to lwIP's ARP handler */
     if (type == ETHTYPE_ARP) {
         pbuf_arp_count++;  /* v2.203: Track ARP packets */
-        /* Remove Ethernet header and pass to ethernet_input for ARP processing */
+        /* Remove Ethernet header and pass to etharp_input for ARP processing */
         if (pbuf_remove_header(p, sizeof(struct eth_hdr)) == 0) {
+            /* v2.222: REVERTED FIX #2 - etharp_input() DOES free pbuf (line 741 in etharp.c)
+             * Double-free was breaking connections!
+             */
             etharp_input(p, inp);
             return ERR_OK;
         }
+        /* pbuf_remove_header failed - we must free since we won't pass to lwIP */
+        PBUF_TRACK_FREE(p);
+        pbuf_free(p);
+        pbuf_freed_count++;
+        pbuf_error_count++;
         return ERR_ARG;
     }
 
     /* Handle IPv6 - pass to ethernet_input */
     if (type == ETHTYPE_IPV6) {
+        /* v2.222: REVERTED FIX #3 - ethernet_input() DOES free pbuf on all paths
+         * Double-free was breaking connections!
+         */
         return ethernet_input(p, inp);
     }
 
@@ -2330,6 +2347,9 @@ static err_t custom_input_promiscuous(struct pbuf *p, struct netif *inp)
     if (type == ETHTYPE_IP) {
         /* Remove Ethernet header first */
         if (pbuf_remove_header(p, sizeof(struct eth_hdr)) != 0) {
+            /* v2.222: REVERTED FIX #4 - Caller frees pbuf when we return ERR_ARG
+             * Double-free was breaking connections!
+             */
             return ERR_ARG;
         }
 
@@ -2349,6 +2369,12 @@ static err_t custom_input_promiscuous(struct pbuf *p, struct netif *inp)
                 struct tcp_hdr *tcphdr = (struct tcp_hdr *)((uint8_t *)iphdr + (IPH_HL(iphdr) * 4));
                 src_port = ntohs(tcphdr->src);
                 dest_port = ntohs(tcphdr->dest);
+
+                /* v2.222: TCP leak handling removed per user request (breaks connection)
+                 * TCP packets to non-listening ports will be handled by lwIP
+                 * Note: This may cause pbuf leaks for TCP to wrong ports, but connection
+                 *       functionality takes precedence
+                 */
             } else if (IPH_PROTO(iphdr) == IP_PROTO_UDP) {
                 pbuf_udp_count++;  /* v2.203: Track UDP packets */
             } else {
@@ -2474,6 +2500,7 @@ static err_t custom_input_promiscuous(struct pbuf *p, struct netif *inp)
            COMPONENT_NAME, type, (void*)p, p->ref, p->len);
     pbuf_other_count++;  /* v2.203: Track unknown protocols */
     BREADCRUMB(9004);  /* pbuf_free at line 1321 (unknown protocol) */
+    PBUF_TRACK_FREE(p);  /* v2.222: Track pbuf free */
     pbuf_free(p);
     pbuf_freed_count++;  /* v2.203: Track free */
     pbuf_error_count++;  /* v2.203: We freed unknown protocol */
@@ -2878,6 +2905,7 @@ static void process_rx_packets(void)
         if (p != NULL) {
             /* v2.215: Track PBUF_POOL allocation with interface identification */
             pbuf_allocated_count++;  /* v2.203: Track allocation */
+            PBUF_TRACK_ALLOC(p, "Net0");  /* v2.222: Deep pbuf tracking */
             extern struct stats_ lwip_stats;
             uint32_t pbuf_before_take = lwip_stats.memp[MEMP_PBUF_POOL]->used;
 
@@ -2948,6 +2976,7 @@ static void process_rx_packets(void)
 
             if (lwip_result != ERR_OK) {
                 BREADCRUMB(9005);  /* pbuf_free at line 1791 (process_rx_packets lwip error) */
+                PBUF_TRACK_FREE(p);  /* v2.222: Track pbuf free */
                 pbuf_free(p);
                 pbuf_freed_count++;      /* v2.203: Track free */
                 pbuf_error_count++;      /* v2.203: lwIP rejected, we freed */
@@ -5760,7 +5789,7 @@ static int virtio_net_init(void)
 void post_init(void)
 {
     DEBUG("%s: Component started\n", COMPONENT_NAME);
-    DEBUG("%s: NET0 v2.218 (2025-11-01) - Fix LAST_ACK stuck state (use tcp_abort for immediate cleanup)\n", COMPONENT_NAME);
+    DEBUG("%s: NET0 v2.219 (2025-11-01) - Fix duplicate close notifications from poll callback\n", COMPONENT_NAME);
     DEBUG("%s: [FIX] MODE: PRODUCTION with fast cleanup (every 100 iterations)\n", COMPONENT_NAME);
     DEBUG_INFO("%s: [OK] FIX 1: Immediate cleanup on tcp_echo_err (v2.145 behavior)\n", COMPONENT_NAME);
     DEBUG_INFO("%s: [OK] FIX 2: Send close notification to Net1 when SCADA closes\n", COMPONENT_NAME);
@@ -5936,6 +5965,10 @@ int run(void)
 
     DEBUG_INFO("%s: [OK] Initialization validation passed - starting main loop\n", COMPONENT_NAME);
 
+    /* v2.222: Initialize pbuf tracking database */
+    pbuf_tracking_init();
+    DEBUG_INFO("%s: [OK] PBUF tracking initialized (max %u entries)\n", COMPONENT_NAME, MAX_PBUF_TRACKING_ENTRIES);
+
     /* Main event loop - process lwIP timers, RX packets, and ICS notifications */
     /* Note: TCP server is now initialized in RX path after first packet */
     static uint32_t cleanup_counter = 0;
@@ -5947,6 +5980,9 @@ int run(void)
             DEBUG("%s: [HB]  HB:%u conns:%u\n", COMPONENT_NAME, heartbeat_counter, connection_count);
             heartbeat_counter = 0;
         }
+
+        /* v2.222: Periodic pbuf leak diagnostics (every 10 seconds) */
+        pbuf_tracking_periodic_diagnostics("Net0", 10000);
 
         /* Check for OUTBOUND notifications from ICS_Outbound (non-blocking) */
         if (outbound_ready_poll()) {

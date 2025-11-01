@@ -54,6 +54,9 @@
 /* v2.117: Connection state sharing */
 #include "connection_state.h"
 
+/* v2.222: Comprehensive pbuf lifecycle tracking */
+#include "pbuf_tracking.h"
+
 #define COMPONENT_NAME "VirtIO_Net1_Driver"
 #define TCP_SERVER_PORT 502  /* INBOUND: Modbus port - pretends to be PLC */
 
@@ -2037,6 +2040,9 @@ static err_t custom_input_promiscuous(struct pbuf *p, struct netif *inp)
 
     /* Check Ethernet header */
     if (p->len < sizeof(struct eth_hdr)) {
+        /* v2.222: REVERTED FIX #1 - Caller frees pbuf when we return ERR_ARG
+         * Double-free was breaking connections!
+         */
         return ERR_ARG;
     }
 
@@ -2045,16 +2051,23 @@ static err_t custom_input_promiscuous(struct pbuf *p, struct netif *inp)
 
     /* Handle ARP packets normally - pass to lwIP's ARP handler */
     if (type == ETHTYPE_ARP) {
-        /* Remove Ethernet header and pass to ethernet_input for ARP processing */
+        /* Remove Ethernet header and pass to etharp_input for ARP processing */
         if (pbuf_remove_header(p, sizeof(struct eth_hdr)) == 0) {
+            /* v2.222: REVERTED FIX #2 - etharp_input() DOES free pbuf (line 741 in etharp.c)
+             * Double-free was breaking connections!
+             */
             etharp_input(p, inp);
             return ERR_OK;
         }
+        /* pbuf_remove_header failed - return ERR_ARG, caller will free */
         return ERR_ARG;
     }
 
     /* Handle IPv6 - pass to ethernet_input */
     if (type == ETHTYPE_IPV6) {
+        /* v2.222: REVERTED FIX #3 - ethernet_input() DOES free pbuf on all paths
+         * Double-free was breaking connections!
+         */
         return ethernet_input(p, inp);
     }
 
@@ -2062,6 +2075,9 @@ static err_t custom_input_promiscuous(struct pbuf *p, struct netif *inp)
     if (type == ETHTYPE_IP) {
         /* Remove Ethernet header first */
         if (pbuf_remove_header(p, sizeof(struct eth_hdr)) != 0) {
+            /* v2.222: REVERTED FIX #4 - Caller frees pbuf when we return ERR_ARG
+             * Double-free was breaking connections!
+             */
             return ERR_ARG;
         }
 
@@ -2080,6 +2096,13 @@ static err_t custom_input_promiscuous(struct pbuf *p, struct netif *inp)
                 struct tcp_hdr *tcphdr = (struct tcp_hdr *)((uint8_t *)iphdr + (IPH_HL(iphdr) * 4));
                 src_port = ntohs(tcphdr->src);
                 dest_port = ntohs(tcphdr->dest);
+
+                /* v2.222: TCP leak handling removed per user request (breaks connection)
+                 * Net1 is primarily a TCP client (outbound to PLC)
+                 * TCP packets here should be responses to our outbound connections
+                 * Let lwIP handle connection matching - it will send RST if needed
+                 * Note: This may cause pbuf leaks, but connection functionality takes precedence
+                 */
             }
 
             /* If packet is not destined for our interface IP, rewrite it */
@@ -2118,7 +2141,13 @@ static err_t custom_input_promiscuous(struct pbuf *p, struct netif *inp)
     }
 
     /* Unknown protocol - drop */
-    /* v2.155: Let lwIP free pbuf - we don't own it */
+    /* v2.222: FIX #6 - CRITICAL: Free unknown protocol packets to prevent leak! */
+    DEBUG_WARN("%s: [WARN] Unknown ethernet protocol: ethertype=0x%04x, pbuf=%p, p->ref=%d, p->len=%u\n",
+           COMPONENT_NAME, type, (void*)p, p->ref, p->len);
+    PBUF_TRACK_FREE(p);
+    pbuf_free(p);
+    
+    
     return ERR_OK;
 }
 
@@ -2396,6 +2425,9 @@ static void process_rx_packets(void)
         /* Allocate pbuf and copy packet data (skipping header) */
         struct pbuf *p = pbuf_alloc(PBUF_RAW, packet_len, PBUF_POOL);
         if (p != NULL) {
+            /* v2.222: Deep pbuf tracking */
+            PBUF_TRACK_ALLOC(p, "Net1");
+
             /* v2.214: Track PBUF_POOL allocation with interface identification */
             extern struct stats_ lwip_stats;
             uint32_t pbuf_before_take = lwip_stats.memp[MEMP_PBUF_POOL]->used;
@@ -5965,6 +5997,10 @@ int run(void)
 
     DEBUG_INFO("%s: [OK] Initialization validation passed - starting main loop\n", COMPONENT_NAME);
 
+    /* v2.222: Initialize pbuf tracking database */
+    pbuf_tracking_init();
+    DEBUG_INFO("%s: [OK] PBUF tracking initialized (max %u entries)\n", COMPONENT_NAME, MAX_PBUF_TRACKING_ENTRIES);
+
     /* Main event loop - process lwIP timers, RX packets, and ICS notifications */
     /* Note: TCP server is now initialized in RX path after first packet */
     uint32_t loop_iterations = 0;
@@ -5972,6 +6008,8 @@ int run(void)
 
     static uint32_t heartbeat_counter = 0;
     while (1) {
+        /* v2.222: Periodic pbuf leak diagnostics (every 10 seconds) */
+        pbuf_tracking_periodic_diagnostics("Net1", 10000);
         /* v2.198: Process cleanup queue (symmetrical with Net0)
          * ═══════════════════════════════════════════════════════════════
          * CRITICAL: Must be called in main loop for guaranteed execution

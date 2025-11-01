@@ -2381,6 +2381,40 @@ static err_t custom_input_promiscuous(struct pbuf *p, struct netif *inp)
                 pbuf_other_count++;  /* v2.203: Track other IP protocols */
             }
 
+            /* v2.224: TCP Port Filtering - ONLY accept Modbus port 502
+             * ════════════════════════════════════════════════════════════════════
+             * Purpose: Prevent PBUF leaks from unwanted TCP services
+             *
+             * Analysis: Port 62977 traffic observed on both Net0 and Net1:
+             *   - Net0: SCADA (192.168.90.5) → System (192.168.96.2:62977)
+             *   - Net1: System (192.168.95.2:62977) → PLC (192.168.95.1)
+             *   - Port 62977 is NOT standard Modbus or OpenPLC protocol
+             *   - This traffic was causing majority of PBUF leaks (17K+ on Net0)
+             *
+             * Solution: Silently drop all TCP except port 502 (Modbus)
+             *   - Prevents leaks from unhandled services
+             *   - Only accept intended ICS traffic
+             *   - Return ERR_OK after freeing (we handled the packet)
+             */
+            if (IPH_PROTO(iphdr) == IP_PROTO_TCP && src_port != 0 && dest_port != 0) {
+                /* Check if destination port is Modbus (502) */
+                if (dest_port != TCP_SERVER_PORT) {
+                    DEBUG_WARN("%s: [REJECT] TCP to non-Modbus port: %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u (dropping)\n",
+                           COMPONENT_NAME,
+                           (pkt_src_ip >> 24) & 0xFF, (pkt_src_ip >> 16) & 0xFF,
+                           (pkt_src_ip >> 8) & 0xFF, pkt_src_ip & 0xFF, src_port,
+                           (pkt_dest_ip >> 24) & 0xFF, (pkt_dest_ip >> 16) & 0xFF,
+                           (pkt_dest_ip >> 8) & 0xFF, pkt_dest_ip & 0xFF, dest_port);
+
+                    /* Free the packet and return ERR_OK (we handled it) */
+                    PBUF_TRACK_FREE(p);
+                    pbuf_free(p);
+                    pbuf_freed_count++;
+                    pbuf_error_count++;  /* Count as error - rejected traffic */
+                    return ERR_OK;
+                }
+            }
+
             /* If packet is not destined for our interface IP, rewrite it */
             /* v2.95: CRITICAL FIX - Create metadata for ALL TCP connections!
              * ═══════════════════════════════════════════════════════════════════

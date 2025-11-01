@@ -550,6 +550,16 @@ static uint32_t packets_received = 0;
 static uint32_t packets_sent = 0;
 static uint32_t dhcp_bound = 0;
 
+/* v2.223: Pbuf leak diagnostics (matching Net0) */
+static uint32_t pbuf_allocated_count = 0;
+static uint32_t pbuf_freed_count = 0;
+static uint32_t pbuf_leaked_to_lwip = 0;  /* Pbufs passed to lwIP successfully */
+static uint32_t pbuf_arp_count = 0;
+static uint32_t pbuf_tcp_count = 0;
+static uint32_t pbuf_udp_count = 0;
+static uint32_t pbuf_other_count = 0;
+static uint32_t pbuf_error_count = 0;  /* Pbufs we had to free due to errors */
+
 /* lwIP time tracking */
 static volatile uint32_t lwip_time_ms = 0;
 
@@ -2051,6 +2061,7 @@ static err_t custom_input_promiscuous(struct pbuf *p, struct netif *inp)
 
     /* Handle ARP packets normally - pass to lwIP's ARP handler */
     if (type == ETHTYPE_ARP) {
+        pbuf_arp_count++;  /* v2.223: Track ARP packets (matching Net0) */
         /* Remove Ethernet header and pass to etharp_input for ARP processing */
         if (pbuf_remove_header(p, sizeof(struct eth_hdr)) == 0) {
             /* v2.222: REVERTED FIX #2 - etharp_input() DOES free pbuf (line 741 in etharp.c)
@@ -2060,6 +2071,7 @@ static err_t custom_input_promiscuous(struct pbuf *p, struct netif *inp)
             return ERR_OK;
         }
         /* pbuf_remove_header failed - return ERR_ARG, caller will free */
+        pbuf_error_count++;  /* v2.223: Track error */
         return ERR_ARG;
     }
 
@@ -2093,9 +2105,41 @@ static err_t custom_input_promiscuous(struct pbuf *p, struct netif *inp)
             /* Extract ports if this is TCP */
             uint16_t src_port = 0, dest_port = 0;
             if (IPH_PROTO(iphdr) == IP_PROTO_TCP && p->len >= 20 + 20) {  /* IP + TCP headers */
+                pbuf_tcp_count++;  /* v2.223: Track TCP packets (matching Net0) */
                 struct tcp_hdr *tcphdr = (struct tcp_hdr *)((uint8_t *)iphdr + (IPH_HL(iphdr) * 4));
                 src_port = ntohs(tcphdr->src);
                 dest_port = ntohs(tcphdr->dest);
+
+                /* v2.224: TCP Port Filtering - ONLY accept Modbus port 502
+                 * ════════════════════════════════════════════════════════════════════
+                 * Purpose: Prevent PBUF leaks from unwanted TCP services
+                 *
+                 * Analysis: Port 62977 traffic observed on both Net0 and Net1:
+                 *   - Net0: SCADA (192.168.90.5) → System (192.168.96.2:62977)
+                 *   - Net1: System (192.168.95.2:62977) → PLC (192.168.95.1)
+                 *   - Port 62977 is NOT standard Modbus or OpenPLC protocol
+                 *   - This traffic was causing majority of PBUF leaks (10K+ on Net1)
+                 *
+                 * Solution: Silently drop all TCP except port 502 (Modbus)
+                 *   - Net1 receives PLC responses (source port should be 502)
+                 *   - Only accept responses from intended ICS service
+                 *   - Return ERR_OK after freeing (we handled the packet)
+                 */
+                if (src_port != TCP_SERVER_PORT) {
+                    DEBUG_WARN("%s: [REJECT] TCP from non-Modbus port: %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u (dropping)\n",
+                           COMPONENT_NAME,
+                           (pkt_src_ip >> 24) & 0xFF, (pkt_src_ip >> 16) & 0xFF,
+                           (pkt_src_ip >> 8) & 0xFF, pkt_src_ip & 0xFF, src_port,
+                           (pkt_dest_ip >> 24) & 0xFF, (pkt_dest_ip >> 16) & 0xFF,
+                           (pkt_dest_ip >> 8) & 0xFF, pkt_dest_ip & 0xFF, dest_port);
+
+                    /* Free the packet and return ERR_OK (we handled it) */
+                    PBUF_TRACK_FREE(p);
+                    pbuf_free(p);
+                    pbuf_freed_count++;  /* v2.223: Track free (matching Net0) */
+                    pbuf_error_count++;  /* v2.223: Count as error - rejected traffic (matching Net0) */
+                    return ERR_OK;
+                }
 
                 /* v2.222: TCP leak handling removed per user request (breaks connection)
                  * Net1 is primarily a TCP client (outbound to PLC)
@@ -2103,6 +2147,10 @@ static err_t custom_input_promiscuous(struct pbuf *p, struct netif *inp)
                  * Let lwIP handle connection matching - it will send RST if needed
                  * Note: This may cause pbuf leaks, but connection functionality takes precedence
                  */
+            } else if (IPH_PROTO(iphdr) == IP_PROTO_UDP) {
+                pbuf_udp_count++;  /* v2.223: Track UDP packets (matching Net0) */
+            } else {
+                pbuf_other_count++;  /* v2.223: Track other IP protocols (matching Net0) */
             }
 
             /* If packet is not destined for our interface IP, rewrite it */
@@ -2144,10 +2192,11 @@ static err_t custom_input_promiscuous(struct pbuf *p, struct netif *inp)
     /* v2.222: FIX #6 - CRITICAL: Free unknown protocol packets to prevent leak! */
     DEBUG_WARN("%s: [WARN] Unknown ethernet protocol: ethertype=0x%04x, pbuf=%p, p->ref=%d, p->len=%u\n",
            COMPONENT_NAME, type, (void*)p, p->ref, p->len);
+    pbuf_other_count++;  /* v2.223: Track unknown protocols (matching Net0) */
     PBUF_TRACK_FREE(p);
     pbuf_free(p);
-    
-    
+    pbuf_freed_count++;  /* v2.223: Track free (matching Net0) */
+    pbuf_error_count++;  /* v2.223: We freed unknown protocol (matching Net0) */
     return ERR_OK;
 }
 
@@ -2425,6 +2474,7 @@ static void process_rx_packets(void)
         /* Allocate pbuf and copy packet data (skipping header) */
         struct pbuf *p = pbuf_alloc(PBUF_RAW, packet_len, PBUF_POOL);
         if (p != NULL) {
+            pbuf_allocated_count++;  /* v2.223: Track allocation (matching Net0) */
             /* v2.222: Deep pbuf tracking */
             PBUF_TRACK_ALLOC(p, "Net1");
 
@@ -2493,9 +2543,14 @@ static void process_rx_packets(void)
                 }
             }
 
-            /* v2.155: Let lwIP free pbuf on error - we don't own it */
+            /* v2.223: Track lwIP acceptance/rejection (matching Net0) */
             if (lwip_result != ERR_OK) {
-                /* lwIP handles pbuf cleanup */
+                PBUF_TRACK_FREE(p);
+                pbuf_free(p);
+                pbuf_freed_count++;      /* v2.223: Track free */
+                pbuf_error_count++;      /* v2.223: lwIP rejected, we freed */
+            } else {
+                pbuf_leaked_to_lwip++;   /* v2.223: lwIP accepted, it owns pbuf now */
             }
         } else {
             /* CRITICAL: pbuf allocation failed - this means lwIP is out of memory */

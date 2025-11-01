@@ -5969,8 +5969,10 @@ int run(void)
 
         /* v2.74: Heartbeat to detect silent hangs */
         if (++heartbeat_counter >= 50000) {
-            DEBUG("%s: [HB]  Heartbeat: %u iterations, %u active connections\n",
-                   COMPONENT_NAME, heartbeat_counter, connection_count);
+            DEBUG("%s: [HB]  Heartbeat: %u iterations, %u active connections | PBUF: %u/%u\n",
+                   COMPONENT_NAME, heartbeat_counter, connection_count,
+                   lwip_stats.memp[MEMP_PBUF_POOL]->used,
+                   lwip_stats.memp[MEMP_PBUF_POOL]->avail);
 
             /* v2.173: Leak detector - triggers at high connection count
              * ═══════════════════════════════════════════════════════════════

@@ -18,7 +18,7 @@
  */
 
 /* v2.207: New industry-standard 5-level debug system */
-#define DEBUG_LEVEL DEBUG_LEVEL_INFO  /* v2.210: INFO level (DEBUG has compilation errors) */
+#define DEBUG_LEVEL DEBUG_LEVEL_DEBUG  /* Enable full debug including DEBUG() macros */
 #include "debug_levels.h"
 
 #include <camkes.h>

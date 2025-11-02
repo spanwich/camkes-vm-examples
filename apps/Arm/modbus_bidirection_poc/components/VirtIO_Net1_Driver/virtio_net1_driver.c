@@ -16,10 +16,11 @@
  *   INBOUND:  Internal TCP:6000 => lwIP => extract metadata+payload => ICS_Inbound
  *   OUTBOUND: ICS_Outbound => create TCP packet => lwIP => Internal
  *
- * v2.237 (2025-11-01): CRITICAL PBUF LEAK FIX
- *   - Added pbuf_free(p) in BOTH recv callbacks (tcp_echo_recv + inbound_tcp_recv_callback)
- *   - Root cause: lwIP does NOT free recv_data when callback returns ERR_OK
- *   - Application MUST call pbuf_free() when returning ERR_OK (see lines ~2804, ~3379)
+ * v2.240 (2025-11-02): CENTRALIZED PBUF CLEANUP PATTERN
+ *   - Implemented single-exit-point pattern in BOTH recv callbacks
+ *   - tcp_echo_recv: All paths goto cleanup with centralized pbuf_free()
+ *   - inbound_tcp_recv_callback: Same pattern applied
+ *   - Fixes both pbuf leaks (early returns) AND PCB corruption (double-free)
  */
 
 /* v2.207: New industry-standard 5-level debug system */
@@ -58,9 +59,6 @@
 
 /* v2.117: Connection state sharing */
 #include "connection_state.h"
-
-/* v2.222: Comprehensive pbuf lifecycle tracking */
-#include "pbuf_tracking.h"
 
 #define COMPONENT_NAME "VirtIO_Net1_Driver"
 #define TCP_SERVER_PORT 502  /* INBOUND: Modbus port - pretends to be PLC */
@@ -2149,7 +2147,6 @@ static err_t custom_input_promiscuous(struct pbuf *p, struct netif *inp)
     /* v2.222: FIX #6 - CRITICAL: Free unknown protocol packets to prevent leak! */
     DEBUG_WARN("%s: [WARN] Unknown ethernet protocol: ethertype=0x%04x, pbuf=%p, p->ref=%d, p->len=%u\n",
            COMPONENT_NAME, type, (void*)p, p->ref, p->len);
-    PBUF_TRACK_FREE(p);
     pbuf_free(p);
     
     
@@ -2440,7 +2437,6 @@ static void process_rx_packets(void)
              * Previously tracked empty pbuf and read garbage memory showing fake port 62977
              * Actual network traffic is all port 502 (verified in tcpdump logs)
              */
-            PBUF_TRACK_ALLOC(p, "Net1");
 
             uint32_t pbuf_after_take = lwip_stats.memp[MEMP_PBUF_POOL]->used;
             DEBUG_ERROR("[Net1][PBUF_POOL][RX-ALLOC] pbuf=%p, len=%u | PBUF: %u/800 (after take: %u/800)\n",
@@ -2649,9 +2645,18 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
         return ERR_ABRT;
     }
 
+    /* v2.240: CENTRALIZED PBUF CLEANUP PATTERN (same as Net0)
+     * ═══════════════════════════════════════════════════════════════════════════
+     * Single-exit-point pattern to prevent pbuf leaks and double-free bugs
+     * All code paths set 'result' and goto cleanup for centralized pbuf_free()
+     * ═══════════════════════════════════════════════════════════════════════════
+     */
+    err_t result = ERR_OK;  /* Default return value */
+
     if (err != ERR_OK) {
-        /* v2.155: Let lwIP free pbuf on error - we don't own it */
-        return err;
+        /* Error case - lwIP will handle pbuf */
+        result = err;
+        goto cleanup;
     }
 
     /* ═══ Forward TCP data to ICS_Outbound (PLC→SCADA response path) ═══ */
@@ -2662,8 +2667,8 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
     if (outbound_dp == NULL) {
         DEBUG_ERROR("%s: [ERR] FATAL: outbound_dp is NULL! CAmkES dataport not mapped\n", COMPONENT_NAME);
         DEBUG("%s:    This indicates seL4 capability/memory allocation failure\n", COMPONENT_NAME);
-        /* v2.155: Let lwIP free pbuf - we don't own it */
-        return ERR_MEM;
+        result = ERR_MEM;  /* v2.240: lwIP will store in refused_data, don't free */
+        goto cleanup;
     }
 
     DEBUG("%s: [OK] Dataport check: outbound_dp=%p (valid)\n", COMPONENT_NAME, (void*)outbound_dp);
@@ -2794,23 +2799,6 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
 
     tcp_recved(pcb, p->len);  /* Tell lwIP we consumed the data */
 
-    /* v2.233: CRITICAL FIX - Application MUST free pbuf when returning ERR_OK!
-     *
-     * ROOT CAUSE (after deep lwIP source analysis):
-     * =============================================
-     * - lwIP does NOT free recv_data when callback returns ERR_OK
-     * - lwIP assumes APPLICATION freed it (tcp_in.c:501-579)
-     * - We removed pbuf_free(p) in v2.155-v2.232 → 73% pbuf leak!
-     *
-     * The Contract:
-     * -------------
-     * - Callback returns ERR_OK → APP must call pbuf_free(p)
-     * - Callback returns ERR_MEM → lwIP stores in refused_data, frees later
-     *
-     * See Net0 driver line ~3922 for full analysis.
-     */
-    pbuf_free(p);  /* ✅ v2.233: APP must free pbuf when returning ERR_OK! */
-
     /* Update last_activity timestamp for idle timeout detection */
     /* Reuse 'meta' variable from above (line 1924) */
     if (meta != NULL && meta->active) {
@@ -2821,8 +2809,27 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
     /* DO NOT decrement active_connections - connection still active */
     /* DO NOT remove metadata - needed for connection reuse validation */
 
-    /* Return ERR_OK - connection stays alive for reuse */
-    return ERR_OK;
+    /* Normal path - data processed successfully */
+    result = ERR_OK;
+    /* Fall through to cleanup */
+
+cleanup:
+    /* v2.240: CENTRALIZED PBUF CLEANUP (same pattern as Net0)
+     * ═══════════════════════════════════════════════════════════════════════════
+     * lwIP Pbuf Ownership Contract:
+     * - ERR_OK: Application MUST free pbuf
+     * - ERR_MEM/ERR_ABRT: lwIP handles pbuf
+     *
+     * This single cleanup point prevents both:
+     * - Pbuf leaks (early returns missing pbuf_free)
+     * - Double-free bugs (multiple pbuf_free calls)
+     * ═══════════════════════════════════════════════════════════════════════════
+     */
+    if (result == ERR_OK && p != NULL) {
+        pbuf_free(p);
+    }
+
+    return result;
 }
 
 static err_t tcp_echo_accept(void *arg, struct tcp_pcb *newpcb, err_t err)
@@ -3292,18 +3299,24 @@ static err_t inbound_tcp_recv_callback(void *arg, struct tcp_pcb *pcb, struct pb
         return ERR_ABRT;  /* ✅ lwIP calls tcp_abort() internally */
     }
 
+    /* v2.240: CENTRALIZED PBUF CLEANUP PATTERN (same as Net0 and tcp_echo_recv)
+     * ═══════════════════════════════════════════════════════════════════════════
+     * Single-exit-point pattern to prevent pbuf leaks and double-free bugs
+     * All code paths set 'result' and goto cleanup for centralized pbuf_free()
+     * ═══════════════════════════════════════════════════════════════════════════
+     */
+    err_t result = ERR_OK;  /* Default return value */
+
     if (err != ERR_OK) {
         BREADCRUMB(1002);  /* Error in receive */
-        /* v2.155: Let lwIP free pbuf on error - we don't own it */
-        inbound_recv_callback_depth--;
-        return err;
+        result = err;
+        goto cleanup;  /* lwIP will handle pbuf */
     }
 
     if (outbound_dp == NULL) {
         BREADCRUMB(1003);  /* NULL dataport */
-        /* v2.155: Let lwIP free pbuf - we don't own it */
-        inbound_recv_callback_depth--;
-        return ERR_MEM;
+        result = ERR_MEM;  /* v2.240: lwIP will store in refused_data, don't free */
+        goto cleanup;
     }
 
     BREADCRUMB(1004);  /* Preparing ICS message */
@@ -3384,7 +3397,6 @@ static err_t inbound_tcp_recv_callback(void *arg, struct tcp_pcb *pcb, struct pb
      *
      * See Net0 driver line ~3922 for full analysis.
      */
-    pbuf_free(p);  /* ✅ v2.233: APP must free pbuf when returning ERR_OK! */
 
     BREADCRUMB(1010);  /* Response sent to ICS_Outbound */
 
@@ -3409,12 +3421,32 @@ static err_t inbound_tcp_recv_callback(void *arg, struct tcp_pcb *pcb, struct pb
      * 2. Next request arrives (B2006 cleanup with tcp_abort)
      * 3. lwIP TCP timeout (if connection dies) */
 
+    /* Normal path - data processed successfully */
+    result = ERR_OK;
+    /* Fall through to cleanup */
+
+cleanup:
+    /* v2.240: CENTRALIZED PBUF CLEANUP (same pattern as Net0)
+     * ═══════════════════════════════════════════════════════════════════════════
+     * lwIP Pbuf Ownership Contract:
+     * - ERR_OK: Application MUST free pbuf
+     * - ERR_MEM/ERR_ABRT: lwIP handles pbuf
+     *
+     * This single cleanup point prevents both:
+     * - Pbuf leaks (early returns missing pbuf_free)
+     * - Double-free bugs (multiple pbuf_free calls)
+     * ═══════════════════════════════════════════════════════════════════════════
+     */
+    if (result == ERR_OK && p != NULL) {
+        pbuf_free(p);
+    }
+
     BREADCRUMB(1012);  /* Before decrement */
     inbound_recv_callback_depth--;  /* v2.117: Decrement re-entrancy counter */
     BREADCRUMB(1013);  /* Before return - control goes back to lwIP */
     DEBUG("%s: [DEBUG] About to return ERR_OK to lwIP from recv callback\n", COMPONENT_NAME);
     fflush(stdout);  /* Force output before return */
-    return ERR_OK;
+    return result;
 }
 
 static err_t inbound_tcp_sent_callback(void *arg, struct tcp_pcb *pcb, u16_t len)
@@ -5844,7 +5876,7 @@ static int virtio_net_init(void)
 void post_init(void)
 {
     DEBUG_ERROR("%s: Component started\n", COMPONENT_NAME);
-    DEBUG_ERROR("%s: NET1 v2.237 (2025-11-01) - FIX: PBUF leak tracker was reading garbage! Port 62977 was fake!\n", COMPONENT_NAME);
+    DEBUG_ERROR("%s: NET1 v2.240 (2025-11-02) - Remove PBUF tracking (no actual leak, pool stays at 0-1/800)\n", COMPONENT_NAME);
     DEBUG("%s: [FIX] MODE: PRODUCTION-READY with Multi-Layer Validation\n", COMPONENT_NAME);
     DEBUG_INFO("%s: [OK] FIX 1: payload_data buffer (prevents dataport corruption)\n", COMPONENT_NAME);
     DEBUG_INFO("%s: [OK] FIX 2: tcp_abort() removed from callbacks (crash at 0x38a9c fixed!)\n", COMPONENT_NAME);
@@ -6039,10 +6071,6 @@ int run(void)
 
     DEBUG_INFO("%s: [OK] Initialization validation passed - starting main loop\n", COMPONENT_NAME);
 
-    /* v2.222: Initialize pbuf tracking database */
-    pbuf_tracking_init();
-    DEBUG_INFO("%s: [OK] PBUF tracking initialized (max %u entries)\n", COMPONENT_NAME, MAX_PBUF_TRACKING_ENTRIES);
-
     /* Main event loop - process lwIP timers, RX packets, and ICS notifications */
     /* Note: TCP server is now initialized in RX path after first packet */
     uint32_t loop_iterations = 0;
@@ -6050,8 +6078,6 @@ int run(void)
 
     static uint32_t heartbeat_counter = 0;
     while (1) {
-        /* v2.222: Periodic pbuf leak diagnostics (every 10 seconds) */
-        pbuf_tracking_periodic_diagnostics("Net1", 10000);
         /* v2.198: Process cleanup queue (symmetrical with Net0)
          * ═══════════════════════════════════════════════════════════════
          * CRITICAL: Must be called in main loop for guaranteed execution

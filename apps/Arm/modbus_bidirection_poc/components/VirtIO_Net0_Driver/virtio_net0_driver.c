@@ -51,6 +51,7 @@
 #include "lwip/prot/tcp.h"
 #include "lwip/prot/udp.h"
 #include "lwip/prot/ip.h"
+#include "lwip/prot/icmp.h"  /* v2.242: ICMP header for proxy replies */
 #include "lwip/priv/tcp_priv.h"  /* v2.205: Access tcp_active_pcbs for ooseq diagnostics */
 #include "netif/ethernet.h"
 
@@ -256,6 +257,75 @@ static int connection_count = 0;
 static uint32_t active_connections = 0;
 static uint32_t total_connections_created = 0;
 static uint32_t total_connections_closed = 0;
+
+/* v2.242: ICMP Metadata for Proxy Replies
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * Purpose: Track ICMP echo requests so we can send replies with correct source IP
+ *
+ * When SCADA pings 192.168.95.2 (PLC):
+ *   RX: Store dest_ip=192.168.95.2, icmp_id, icmp_seq
+ *   lwIP generates ICMP reply (with source=192.168.96.2 - wrong!)
+ *   TX: Lookup metadata by icmp_id/seq, restore source IP to 192.168.95.2
+ * ═══════════════════════════════════════════════════════════════════════════════
+ */
+#define MAX_ICMP_METADATA 16  /* Track up to 16 concurrent pings */
+
+struct icmp_metadata {
+    uint16_t icmp_id;           /* ICMP echo identifier */
+    uint16_t icmp_seq;          /* ICMP echo sequence number */
+    uint32_t original_dest_ip;  /* Original destination IP (what was pinged) */
+    uint32_t timestamp;         /* When request was received (for aging) */
+    bool active;                /* Is this slot in use? */
+};
+
+static struct icmp_metadata icmp_table[MAX_ICMP_METADATA];
+
+/* Helper: Store ICMP request metadata */
+static void icmp_metadata_store(uint32_t dest_ip, uint16_t icmp_id, uint16_t icmp_seq)
+{
+    /* Find existing entry or free slot */
+    for (int i = 0; i < MAX_ICMP_METADATA; i++) {
+        if (!icmp_table[i].active ||
+            (icmp_table[i].icmp_id == icmp_id && icmp_table[i].icmp_seq == icmp_seq)) {
+            icmp_table[i].icmp_id = icmp_id;
+            icmp_table[i].icmp_seq = icmp_seq;
+            icmp_table[i].original_dest_ip = dest_ip;
+            icmp_table[i].timestamp = sys_now();
+            icmp_table[i].active = true;
+            return;
+        }
+    }
+
+    DEBUG_WARN("%s: [WARN] ICMP metadata table full! (id=%u, seq=%u)\n",
+               COMPONENT_NAME, icmp_id, icmp_seq);
+}
+
+/* Helper: Lookup ICMP metadata by id/seq */
+static struct icmp_metadata* icmp_metadata_lookup(uint16_t icmp_id, uint16_t icmp_seq)
+{
+    for (int i = 0; i < MAX_ICMP_METADATA; i++) {
+        if (icmp_table[i].active &&
+            icmp_table[i].icmp_id == icmp_id &&
+            icmp_table[i].icmp_seq == icmp_seq) {
+            /* Mark as consumed (one-time use) */
+            icmp_table[i].active = false;
+            return &icmp_table[i];
+        }
+    }
+    return NULL;
+}
+
+/* Helper: Clean up old ICMP metadata (called periodically) */
+static void icmp_metadata_cleanup(void)
+{
+    uint32_t now = sys_now();
+    for (int i = 0; i < MAX_ICMP_METADATA; i++) {
+        if (icmp_table[i].active && (now - icmp_table[i].timestamp) > 5000) {
+            /* Entry older than 5 seconds - clean it up */
+            icmp_table[i].active = false;
+        }
+    }
+}
 
 /* v2.150: Session ID counter for unique connection identification
  * ══════════════════════════════════════════════════════════════════════════════
@@ -2290,6 +2360,73 @@ static void cleanup_close_wait_connections(void)
 }
 
 /*
+ * v2.242: ARP Proxy - Respond to ARP requests for proxied IPs
+ *
+ * Net0 pretends to be PLC (192.168.95.2) for SCADA health checks
+ * When SCADA sends "Who has 192.168.95.2?", we reply with our MAC address
+ *
+ * Returns: true if ARP proxy handled the request, false to pass to lwIP
+ */
+static bool arp_proxy_check_and_reply(struct pbuf *p, struct netif *inp)
+{
+    struct eth_hdr *ethhdr = (struct eth_hdr *)p->payload;
+
+    /* Need room for Ethernet + ARP headers */
+    if (p->len < sizeof(struct eth_hdr) + sizeof(struct etharp_hdr)) {
+        return false;  /* Not a valid ARP packet */
+    }
+
+    /* Get ARP header (after Ethernet header) */
+    struct etharp_hdr *arphdr = (struct etharp_hdr *)((uint8_t *)p->payload + sizeof(struct eth_hdr));
+
+    /* Only handle ARP requests (opcode = 1) */
+    if (ntohs(arphdr->opcode) != 1) {  /* ARP_REQUEST */
+        return false;  /* Not a request */
+    }
+
+    /* Extract target IP address from ARP request */
+    uint32_t target_ip = (arphdr->dipaddr.addrw[0] << 16) | arphdr->dipaddr.addrw[1];
+    target_ip = ntohl(target_ip);
+
+    /* Check if this is a request for PLC IP (192.168.95.2) */
+    #define PLC_IP 0xC0A85F02  /* 192.168.95.2 in hex */
+    if (target_ip != PLC_IP) {
+        return false;  /* Not for our proxied IP */
+    }
+
+    DEBUG("%s: [ARP-PROXY] Request for 192.168.95.2 (PLC) - replying with our MAC\n",
+           COMPONENT_NAME);
+
+    /* Build ARP reply in the same pbuf (reuse the request packet) */
+    arphdr->opcode = htons(2);  /* ARP_REPLY */
+
+    /* Swap sender and target fields */
+    /* Target becomes the original sender */
+    memcpy(&arphdr->dhwaddr, &arphdr->shwaddr, sizeof(struct eth_addr));
+    arphdr->dipaddr.addrw[0] = arphdr->sipaddr.addrw[0];
+    arphdr->dipaddr.addrw[1] = arphdr->sipaddr.addrw[1];
+
+    /* Sender becomes us (with PLC's IP) */
+    memcpy(&arphdr->shwaddr, &inp->hwaddr, sizeof(struct eth_addr));
+    arphdr->sipaddr.addrw[0] = htons((PLC_IP >> 16) & 0xFFFF);
+    arphdr->sipaddr.addrw[1] = htons(PLC_IP & 0xFFFF);
+
+    /* Fix Ethernet header */
+    memcpy(&ethhdr->dest, &ethhdr->src, sizeof(struct eth_addr));  /* Reply to sender */
+    memcpy(&ethhdr->src, &inp->hwaddr, sizeof(struct eth_addr));   /* From us */
+
+    /* Send the ARP reply directly via low-level output */
+    inp->linkoutput(inp, p);
+
+    DEBUG("%s: [ARP-PROXY] Sent ARP reply: 192.168.95.2 is at %02x:%02x:%02x:%02x:%02x:%02x\n",
+           COMPONENT_NAME,
+           inp->hwaddr[0], inp->hwaddr[1], inp->hwaddr[2],
+           inp->hwaddr[3], inp->hwaddr[4], inp->hwaddr[5]);
+
+    return true;  /* We handled it */
+}
+
+/*
  * Custom input function for protocol-break architecture WITH metadata preservation
  *
  * CRITICAL: Packets arrive with dest IP = 192.168.95.2 (PLC) but interface IP = 192.168.96.2
@@ -2319,9 +2456,18 @@ static err_t custom_input_promiscuous(struct pbuf *p, struct netif *inp)
     ethhdr = (struct eth_hdr *)p->payload;
     type = ntohs(ethhdr->type);
 
-    /* Handle ARP packets normally - pass to lwIP's ARP handler */
+    /* Handle ARP packets - check for proxy first, then pass to lwIP */
     if (type == ETHTYPE_ARP) {
         pbuf_arp_count++;  /* v2.203: Track ARP packets */
+
+        /* v2.242: Check if this is an ARP request for our proxied IP (192.168.95.2) */
+        if (arp_proxy_check_and_reply(p, inp)) {
+            /* We handled it - ARP reply sent */
+            pbuf_free(p);  /* Free the request packet */
+            return ERR_OK;
+        }
+
+        /* Not for proxied IP - pass to lwIP's ARP handler */
         /* Remove Ethernet header and pass to etharp_input for ARP processing */
         if (pbuf_remove_header(p, sizeof(struct eth_hdr)) == 0) {
             /* v2.222: REVERTED FIX #2 - etharp_input() DOES free pbuf (line 741 in etharp.c)

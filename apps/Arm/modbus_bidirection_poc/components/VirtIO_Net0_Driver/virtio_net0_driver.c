@@ -1252,6 +1252,45 @@ static err_t netif_output(struct netif *netif, struct pbuf *p)
                                COMPONENT_NAME, src_port, dest_port, connection_count);
                     }
                 }
+            } else if (ip->protocol == 1) {  /* v2.242: ICMP */
+                /* Extract ICMP header */
+                size_t ip_hdr_len = (ip->ihl) * 4;
+                if (p->tot_len >= sizeof(struct ethhdr) + ip_hdr_len + sizeof(struct icmp_echo_hdr)) {
+                    struct icmp_echo_hdr *icmp = (struct icmp_echo_hdr *)(tx_data + sizeof(struct ethhdr) + ip_hdr_len);
+
+                    /* Only handle ICMP echo replies (type 0) */
+                    if (icmp->type == 0) {  /* ICMP_ECHO_REPLY */
+                        uint16_t icmp_id = ntohs(icmp->id);
+                        uint16_t icmp_seq = ntohs(icmp->seqno);
+
+                        /* Lookup original destination IP from metadata */
+                        struct icmp_metadata *meta = icmp_metadata_lookup(icmp_id, icmp_seq);
+
+                        if (meta != NULL) {
+                            uint32_t current_src = ntohl(ip->saddr);  /* Currently 192.168.96.2 */
+                            uint32_t new_src = meta->original_dest_ip;  /* Should be 192.168.95.2 */
+
+                            DEBUG("%s: [ICMP-TX] Restoring source IP: %u.%u.%u.%u → %u.%u.%u.%u (id=%u, seq=%u)\n",
+                                   COMPONENT_NAME,
+                                   (current_src >> 24) & 0xFF, (current_src >> 16) & 0xFF,
+                                   (current_src >> 8) & 0xFF, current_src & 0xFF,
+                                   (new_src >> 24) & 0xFF, (new_src >> 16) & 0xFF,
+                                   (new_src >> 8) & 0xFF, new_src & 0xFF,
+                                   icmp_id, icmp_seq);
+
+                            /* Restore source IP to original destination (pretend to be PLC) */
+                            ip->saddr = htonl(new_src);
+
+                            /* Recalculate IP checksum using lwIP's inet_chksum */
+                            ip->check = 0;
+                            ip->check = inet_chksum(ip, ip_hdr_len);
+
+                            /* Recalculate ICMP checksum */
+                            icmp->chksum = 0;
+                            icmp->chksum = inet_chksum(icmp, p->tot_len - sizeof(struct ethhdr) - ip_hdr_len);
+                        }
+                    }
+                }
             }
         }
     }
@@ -2536,6 +2575,24 @@ static err_t custom_input_promiscuous(struct pbuf *p, struct netif *inp)
                  */
             } else if (IPH_PROTO(iphdr) == IP_PROTO_UDP) {
                 pbuf_udp_count++;  /* v2.203: Track UDP packets */
+            } else if (IPH_PROTO(iphdr) == IP_PROTO_ICMP && p->len >= 20 + 8) {
+                /* v2.242: ICMP packet - check if it's an echo request */
+                struct icmp_echo_hdr *icmp = (struct icmp_echo_hdr *)((uint8_t *)iphdr + (IPH_HL(iphdr) * 4));
+
+                if (icmp->type == ICMP_ECHO) {  /* Echo request (ping) */
+                    uint16_t icmp_id = ntohs(icmp->id);
+                    uint16_t icmp_seq = ntohs(icmp->seqno);
+
+                    /* Store metadata so TX path can restore source IP */
+                    icmp_metadata_store(pkt_dest_ip, icmp_id, icmp_seq);
+
+                    DEBUG("%s: [ICMP-RX] Ping to %u.%u.%u.%u (id=%u, seq=%u) - metadata stored\n",
+                           COMPONENT_NAME,
+                           (pkt_dest_ip >> 24) & 0xFF, (pkt_dest_ip >> 16) & 0xFF,
+                           (pkt_dest_ip >> 8) & 0xFF, pkt_dest_ip & 0xFF,
+                           icmp_id, icmp_seq);
+                }
+                pbuf_other_count++;  /* v2.203: Track ICMP packets */
             } else {
                 pbuf_other_count++;  /* v2.203: Track other IP protocols */
             }

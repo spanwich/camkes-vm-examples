@@ -16,11 +16,12 @@
  *   INBOUND:  Internal TCP:6000 => lwIP => extract metadata+payload => ICS_Inbound
  *   OUTBOUND: ICS_Outbound => create TCP packet => lwIP => Internal
  *
- * v2.240 (2025-11-02): CENTRALIZED PBUF CLEANUP PATTERN
- *   - Implemented single-exit-point pattern in BOTH recv callbacks
- *   - tcp_echo_recv: All paths goto cleanup with centralized pbuf_free()
- *   - inbound_tcp_recv_callback: Same pattern applied
- *   - Fixes both pbuf leaks (early returns) AND PCB corruption (double-free)
+ * v2.241 (2025-11-02): FIX PCB CORRUPTION - Triple-decrement and double-close bugs
+ *   - Error callback: Set meta->pcb=NULL, enqueue cleanup, remove counter decrement
+ *   - Recv callback (p=NULL): Set meta->pcb=NULL, remove counter decrement
+ *   - Close notification: Set meta->pcb=NULL BEFORE tcp_close/abort
+ *   - Make process_cleanup_queue() the SINGLE source of truth for counter decrements
+ *   - Prevents: "ERROR: active_connections already 0" and PCB corruption crashes
  */
 
 /* v2.207: New industry-standard 5-level debug system */
@@ -2539,6 +2540,8 @@ static uint32_t total_connections_closed = 0;
  */
 static void tcp_echo_err(void *arg, err_t err)
 {
+    struct connection_metadata *meta = (struct connection_metadata *)arg;
+
     const char *err_name;
     switch (err) {
         case ERR_ABRT:     err_name = "ERR_ABRT (Connection aborted)"; break;
@@ -2549,27 +2552,50 @@ static void tcp_echo_err(void *arg, err_t err)
         default:           err_name = "UNKNOWN"; break;
     }
 
-    active_connections--;
-    total_connections_closed++;
+    /* v2.241: REMOVED duplicate counter decrement
+     * ═══════════════════════════════════════════════════════════════════════════
+     * BUG: active_connections was decremented in THREE places:
+     *   1. Here (error callback)
+     *   2. recv callback (when p=NULL)
+     *   3. process_cleanup_queue()
+     *
+     * This caused active_connections to hit 0 before cleanup queue ran,
+     * triggering "ERROR: active_connections already 0" messages.
+     *
+     * FIX: Remove decrement from callbacks, let cleanup queue be single source of truth
+     * ═══════════════════════════════════════════════════════════════════════════
+     */
 
     DEBUG_WARN("%s: [WARN]  TCP connection error - err=%d (%s)\n", COMPONENT_NAME, err, err_name);
-    DEBUG("%s:    → Active connections: %u | Total created: %u | Total closed: %u\n",
-           COMPONENT_NAME, active_connections, total_connections_created, total_connections_closed);
 
-    /* v2.83: CRITICAL FIX - Do NOT call connection_cleanup_stale() from error callback!
+    /* v2.241: CRITICAL FIX - Clear PCB pointer and enqueue cleanup
+     * ═══════════════════════════════════════════════════════════════════════════
+     * BUG: Error callback didn't set meta->pcb = NULL, so close notification
+     * handler tried to close already-freed PCB → PCB corruption!
      *
-     * Bug Analysis (same as Net0 v2.83):
-     * - tcp_echo_err() is called DURING lwIP's error handling
-     * - lwIP may have freed MULTIPLE PCBs in the same batch
-     * - connection_cleanup_stale() iterates ALL connections and accesses pcb->state
-     * - If it accesses a recently-freed PCB → crash at offset 0x10 (state field)
+     * ROOT CAUSE SEQUENCE:
+     *   1. Connection error (RST/timeout) → lwIP frees PCB
+     *   2. lwIP calls tcp_echo_err() → meta->pcb still points to freed PCB
+     *   3. Close notification arrives from Net0
+     *   4. Close handler calls tcp_close(meta->pcb) on FREED PCB
+     *   5. Memory corruption → pcb->next = pcb (circular reference)
+     *   6. Next tcp_input() → ASSERTION FAILURE!
      *
-     * Fix: Let main loop's periodic cleanup handle stale entries
-     * Error callback should ONLY handle its own connection cleanup
-     *
+     * FIX: Set meta->pcb = NULL so close handler knows PCB is already freed
+     * ═══════════════════════════════════════════════════════════════════════════
      * NOTE: PCB is already freed by lwIP when err callback is called - don't access it!
-     * The periodic cleanup in main loop (every 10000 iterations) will clean up stale entries safely.
      */
+    if (meta != NULL) {
+        DEBUG("%s:    → session_id=%u, clearing PCB pointer (already freed by lwIP)\n",
+               COMPONENT_NAME, meta->session_id);
+        meta->pcb = NULL;  /* Mark PCB as freed */
+
+        /* Enqueue cleanup for metadata (counters will be decremented there) */
+        enqueue_cleanup(meta->session_id);
+    } else {
+        DEBUG_WARN("%s: [WARN]  Error callback called with NULL metadata (arg=%p)\n",
+                   COMPONENT_NAME, arg);
+    }
 }
 
 /*
@@ -2582,23 +2608,15 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
          * MUST return ERR_ABRT WITHOUT calling tcp_close()!
          * Same fix as Net0 v2.81 */
 
-        /* v2.82: Only decrement if counter is positive (prevent underflow)
-         * lwIP may call both err callback and recv(p=NULL) for the same connection */
-        if (active_connections > 0) {
-            active_connections--;
-            total_connections_closed++;
-        } else {
-            DEBUG_WARN("%s: [WARN]  BUG: active_connections already 0 in recv, not decrementing\n",
-                   COMPONENT_NAME);
-        }
+        /* v2.241: REMOVED duplicate counter decrement (same fix as error callback)
+         * Counter will be decremented in process_cleanup_queue() - single source of truth
+         */
 
         #if DEBUG_TRAFFIC
         DEBUG("%s: [INIT] TCP connection closed gracefully\n", COMPONENT_NAME);
         DEBUG("%s:    Remote: %u.%u.%u.%u:%u\n", COMPONENT_NAME,
                ip4_addr1(&pcb->remote_ip), ip4_addr2(&pcb->remote_ip),
                ip4_addr3(&pcb->remote_ip), ip4_addr4(&pcb->remote_ip), pcb->remote_port);
-        DEBUG("%s:    → Active connections: %u | Total created: %u | Total closed: %u\n",
-               COMPONENT_NAME, active_connections, total_connections_created, total_connections_closed);
         #endif
 
         /* v2.211: CRITICAL FIX - Use centralized cleanup queue instead of immediate deletion
@@ -2631,6 +2649,8 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
         /* v2.212-phase3: Clean up via centralized queue instead of direct removal */
         struct connection_metadata *meta = connection_lookup_by_pcb(pcb);
         if (meta != NULL) {
+            /* v2.241: Clear PCB pointer - connection is closing */
+            meta->pcb = NULL;
             meta->metadata_close_pending = true;
             meta->close_timestamp = sys_now();
             meta->pcb_closed = true;
@@ -4164,6 +4184,13 @@ void inbound_ready_handle(void)
                 tcp_sent(pcb, NULL);
                 tcp_err(pcb, NULL);   /* Prevent error callback during close */
                 tcp_poll(pcb, NULL, 0);
+
+                /* v2.241: CRITICAL FIX - Clear PCB pointer BEFORE closing
+                 * ═══════════════════════════════════════════════════════════════
+                 * This prevents race conditions if tcp_close() triggers callbacks
+                 * (even though we NULLed them above, better safe than sorry)
+                 */
+                meta->pcb = NULL;
 
                 /* Step 2: v2.212-phase1: Set intent flags instead of direct manipulation
                  * ═══════════════════════════════════════════════════════════════

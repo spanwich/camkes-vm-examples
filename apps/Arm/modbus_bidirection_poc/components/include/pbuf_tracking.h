@@ -37,7 +37,7 @@ extern uint32_t sys_now(void);
  * ═══════════════════════════════════════════════════════════════════════════
  */
 
-#define MAX_PBUF_TRACKING_ENTRIES 512  /* Track up to 512 concurrent pbufs */
+#define MAX_PBUF_TRACKING_ENTRIES 1600  /* Track up to 1600 concurrent pbufs */
 
 /* Detailed pbuf tracking record */
 struct pbuf_track_record {
@@ -68,6 +68,10 @@ struct pbuf_track_record {
     bool freed;                    /* Has been freed? */
     uint32_t free_timestamp;       /* When freed (0 = not freed) */
     uint32_t lifetime_ms;          /* How long allocated (ms) */
+
+    /* v2.237: Reference counting debug */
+    uint16_t alloc_ref_count;      /* p->ref at allocation time */
+    uint16_t current_ref_count;    /* p->ref when checked (for leak detection) */
 };
 
 /* Global tracking database */
@@ -251,6 +255,10 @@ static inline void pbuf_tracking_record_alloc(struct pbuf *p,
     rec->free_timestamp = 0;
     rec->lifetime_ms = 0;
 
+    /* v2.237: Capture reference count at allocation time */
+    rec->alloc_ref_count = p->ref;
+    rec->current_ref_count = p->ref;
+
     /* Inspect packet content */
     pbuf_inspect_ip_header(p, &rec->protocol, &rec->src_ip, &rec->dst_ip,
                           &rec->total_len, &rec->payload_len);
@@ -357,9 +365,15 @@ static inline void pbuf_tracking_report_leaks(const char *component)
             leak_count++;
             uint32_t age_ms = now - rec->alloc_timestamp;
 
-            printf("[%s] LEAK #%u: seq=%u, age=%ums, loc=%s, proto=%s",
+            /* v2.237: Read current ref count from pbuf (if pointer still valid) */
+            rec->current_ref_count = rec->pbuf_ptr->ref;
+
+            printf("[%s] LEAK #%u: seq=%u, age=%ums, loc=%s, p=%p, ref=%u (alloc=%u)",
                    component, leak_count, rec->sequence_num, age_ms,
-                   rec->alloc_location, pbuf_tracking_protocol_name(rec->protocol));
+                   rec->alloc_location, (void*)rec->pbuf_ptr,
+                   rec->current_ref_count, rec->alloc_ref_count);
+
+            printf(", proto=%s", pbuf_tracking_protocol_name(rec->protocol));
 
             if (rec->protocol == IP_PROTO_TCP || rec->protocol == IP_PROTO_UDP) {
                 printf(", ");
@@ -560,6 +574,77 @@ static inline void pbuf_tracking_periodic_diagnostics(const char *component, uin
     /* Full leak analysis */
     pbuf_tracking_report_leaks(component);
     pbuf_tracking_report_leak_patterns(component);
+}
+
+/* Force-free old pbufs from tracking database (age > threshold_ms)
+ * This is a diagnostic/recovery function to test if leaked pbufs can be freed.
+ * Returns number of pbufs freed.
+ */
+static inline uint32_t pbuf_tracking_force_free_old(const char *component, uint32_t threshold_ms)
+{
+    extern u8_t pbuf_free(struct pbuf *p);  /* lwIP pbuf_free function */
+
+    uint32_t now = sys_now();
+    uint32_t freed_count = 0;
+    uint32_t attempted_count = 0;
+
+    printf("\n[%s] ═══ FORCE FREEING OLD PBUFS (age > %u ms) ═══\n", component, threshold_ms);
+
+    for (uint32_t i = 0; i < MAX_PBUF_TRACKING_ENTRIES; i++) {
+        struct pbuf_track_record *rec = &pbuf_tracking_db[i];
+
+        /* Only process entries that are:
+         * 1. Still allocated (pbuf_ptr != NULL)
+         * 2. Not marked as freed (freed == false AND free_timestamp == 0)
+         * 3. Allocated more than threshold_ms ago (now - alloc_timestamp > threshold_ms)
+         */
+        if (rec->pbuf_ptr != NULL && !rec->freed && rec->free_timestamp == 0) {
+            uint32_t age_ms = now - rec->alloc_timestamp;
+
+            if (age_ms > threshold_ms) {
+                attempted_count++;
+
+                /* Read current ref count before freeing */
+                uint16_t current_ref = rec->pbuf_ptr->ref;
+
+                printf("[%s] Attempting to free old pbuf: seq=%u, age=%u ms, p=%p, ref=%u, proto=%s",
+                       component, rec->sequence_num, age_ms, (void*)rec->pbuf_ptr,
+                       current_ref, pbuf_tracking_protocol_name(rec->protocol));
+
+                if (rec->protocol == IP_PROTO_TCP) {
+                    printf(", ");
+                    pbuf_tracking_print_ip(rec->src_ip);
+                    printf(":%u -> ", rec->src_port);
+                    pbuf_tracking_print_ip(rec->dst_ip);
+                    printf(":%u, flags=", rec->dst_port);
+                    pbuf_tracking_print_tcp_flags(rec->tcp_flags);
+                }
+                printf("\n");
+
+                /* Attempt to free the pbuf */
+                u8_t num_freed = pbuf_free(rec->pbuf_ptr);
+
+                if (num_freed > 0) {
+                    printf("[%s]   ✅ Successfully freed %u pbuf(s)\n", component, num_freed);
+                    freed_count += num_freed;
+
+                    /* Mark as freed in tracking DB */
+                    rec->freed = true;
+                    rec->free_timestamp = now;
+                    rec->lifetime_ms = age_ms;
+                    rec->pbuf_ptr = NULL;
+                } else {
+                    printf("[%s]   ⚠️  pbuf_free() returned 0 (ref count may still be > 0)\n", component);
+                }
+            }
+        }
+    }
+
+    printf("[%s] Force-free summary: Attempted=%u, Successfully freed=%u pbufs\n",
+           component, attempted_count, freed_count);
+    printf("[%s] ═══════════════════════════════════════════════════\n\n", component);
+
+    return freed_count;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════

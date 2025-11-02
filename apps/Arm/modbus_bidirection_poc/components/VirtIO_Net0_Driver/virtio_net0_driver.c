@@ -6042,6 +6042,19 @@ int run(void)
         /* v2.222: Periodic pbuf leak diagnostics (every 10 seconds) */
         pbuf_tracking_periodic_diagnostics("Net0", 10000);
 
+        /* v2.238: Force-free old pbufs (age > 30 seconds) to test leak recovery */
+        {
+            static uint32_t last_force_free_time = 0;
+            uint32_t now = sys_now();
+            if (now - last_force_free_time >= 30000) {  /* Every 30 seconds */
+                last_force_free_time = now;
+                uint32_t freed = pbuf_tracking_force_free_old("Net0", 30000);  /* Free pbufs older than 30s */
+                if (freed > 0) {
+                    DEBUG("%s: Force-freed %u old pbufs\n", COMPONENT_NAME, freed);
+                }
+            }
+        }
+
         /* Check for OUTBOUND notifications from ICS_Outbound (non-blocking) */
         if (outbound_ready_poll()) {
             /* CRITICAL: Ensure we see latest dataport writes from ICS_Outbound */

@@ -15,6 +15,11 @@
  * Data Flow:
  *   INBOUND:  External TCP:6000 => lwIP => extract metadata+payload => ICS_Inbound
  *   OUTBOUND: ICS_Outbound => create TCP packet => lwIP => External
+ *
+ * v2.237 (2025-11-01): CRITICAL PBUF LEAK FIX
+ *   - Added pbuf_free(p) in tcp_echo_recv() callback
+ *   - Root cause: lwIP does NOT free recv_data when callback returns ERR_OK
+ *   - Application MUST call pbuf_free() when returning ERR_OK (see line ~3965)
  */
 
 /* v2.207: New industry-standard 5-level debug system */
@@ -2916,11 +2921,16 @@ static void process_rx_packets(void)
         if (p != NULL) {
             /* v2.215: Track PBUF_POOL allocation with interface identification */
             pbuf_allocated_count++;  /* v2.203: Track allocation */
-            PBUF_TRACK_ALLOC(p, "Net0");  /* v2.222: Deep pbuf tracking */
             extern struct stats_ lwip_stats;
             uint32_t pbuf_before_take = lwip_stats.memp[MEMP_PBUF_POOL]->used;
 
             pbuf_take(p, packet_data, packet_len);
+
+            /* v2.237: FIX - Track AFTER pbuf_take() copies data, not before!
+             * Previously tracked empty pbuf and read garbage memory showing fake port 62977
+             * Actual network traffic is all port 502 (verified in tcpdump logs)
+             */
+            PBUF_TRACK_ALLOC(p, "Net0");
 
             uint32_t pbuf_after_take = lwip_stats.memp[MEMP_PBUF_POOL]->used;
             DEBUG_ERROR("[Net0][PBUF_POOL][RX-ALLOC] pbuf=%p, len=%u | PBUF: %u/800 (after take: %u/800)\n",
@@ -3919,43 +3929,52 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
         }
     }
 
-    /* v2.157: lwIP BEST PRACTICE - NEVER call pbuf_free() from recv callback!
+    /* v2.233: CRITICAL FIX - Application MUST free pbuf when returning ERR_OK!
      *
-     * CRITICAL FIX: This was the root cause of pbuf double-free crashes!
+     * ROOT CAUSE ANALYSIS (after deep lwIP source code investigation):
+     * ================================================================
      *
-     * What was wrong (v2.131-v2.156):
+     * What we thought (v2.157-v2.232):
      * --------------------------------
-     * 1. We called pbuf_free(p) here (manually freeing pbuf)
-     * 2. Callback returned ERR_OK to lwIP
-     * 3. lwIP's tcp_input() ALSO called pbuf_free(inseg.p) at line 600
-     * 4. Result: DOUBLE-FREE → Assertion "p != NULL" failed at line 732 in pbuf.c
+     * - "lwIP frees pbuf automatically after recv callback returns"
+     * - So we removed pbuf_free(p) thinking lwIP handled it
+     * - Result: 73% pbuf leak rate! (2700 leaked / 3700 packets)
      *
-     * Why ref count check didn't help:
-     * --------------------------------
-     * - Checking p->ref > 0 before pbuf_free() does NOT prevent double-free
-     * - lwIP ALWAYS frees the pbuf in tcp_input() regardless of ref count
-     * - Application code should NEVER call pbuf_free() on callback pbufs
+     * What lwIP ACTUALLY does (from tcp_in.c:501-579):
+     * -------------------------------------------------
+     * TCP_EVENT_RECV(pcb, recv_data, ERR_OK, err);  // Call our callback
      *
-     * lwIP ownership model (from tcp_in.c:596-600):
-     * ----------------------------------------------
-     * if (inseg.p != NULL) {
-     *     pbuf_free(inseg.p);  ← lwIP owns this, NOT application!
-     *     inseg.p = NULL;
+     * if (err != ERR_OK) {
+     *     pcb->refused_data = recv_data;  // lwIP stores it for retry
+     * } else {
+     *     // err == ERR_OK → Do NOTHING!
+     *     // lwIP assumes APPLICATION already freed recv_data!
      * }
+     * recv_data = NULL;  // Just NULL the pointer, DON'T free!
      *
-     * Correct protocol:
-     * -----------------
-     * - Application processes pbuf data
-     * - Application returns status code (ERR_OK, ERR_ABRT, etc.)
-     * - lwIP handles ALL memory management (allocation AND deallocation)
+     * lwIP's Contract:
+     * ----------------
+     * - If callback returns ERR_OK: APPLICATION must call pbuf_free(p)
+     * - If callback returns ERR_MEM: lwIP stores in refused_data, frees later
+     * - If callback returns ERR_ABRT: lwIP handles cleanup
      *
-     * Fix (v2.157):
-     * -------------
-     * Remove ALL pbuf_free() calls from recv callback. Let lwIP handle it.
+     * Our Bug (v2.157-v2.232):
+     * ------------------------
+     * - We returned ERR_OK without calling pbuf_free(p)
+     * - lwIP set recv_data = NULL (assuming we freed it)
+     * - Pbuf was NEVER freed → massive leak!
+     *
+     * The Fix (v2.233):
+     * ------------------
+     * - Call tcp_recved() to update receive window
+     * - Call pbuf_free(p) to free the pbuf (APPLICATION responsibility!)
+     * - Return ERR_OK to indicate success
      */
-    BREADCRUMB(9003);  /* Recv callback complete - lwIP will free pbuf */
+    BREADCRUMB(9003);  /* Recv callback complete - now free pbuf */
 
-    return ERR_OK;  /* ✅ lwIP frees pbuf automatically in tcp_input() */
+    pbuf_free(p);  /* ✅ v2.233: APPLICATION must free pbuf when returning ERR_OK! */
+
+    return ERR_OK;
 }
 
 /* v2.158: TCP poll callback for deferred connection cleanup
@@ -5827,8 +5846,8 @@ static int virtio_net_init(void)
  */
 void post_init(void)
 {
-    DEBUG("%s: Component started\n", COMPONENT_NAME);
-    DEBUG("%s: NET0 v2.219 (2025-11-01) - Fix duplicate close notifications from poll callback\n", COMPONENT_NAME);
+    DEBUG_ERROR("%s: Component started\n", COMPONENT_NAME);
+    DEBUG_ERROR("%s: NET0 v2.237 (2025-11-01) - FIX: PBUF leak tracker was reading garbage! Port 62977 was fake!\n", COMPONENT_NAME);
     DEBUG("%s: [FIX] MODE: PRODUCTION with fast cleanup (every 100 iterations)\n", COMPONENT_NAME);
     DEBUG_INFO("%s: [OK] FIX 1: Immediate cleanup on tcp_echo_err (v2.145 behavior)\n", COMPONENT_NAME);
     DEBUG_INFO("%s: [OK] FIX 2: Send close notification to Net1 when SCADA closes\n", COMPONENT_NAME);

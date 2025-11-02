@@ -205,7 +205,7 @@ void pre_init(void) {
     memset(&stats, 0, sizeof(stats));
     tcp_messages = udp_messages = arp_messages = other_messages = 0;
     DEBUG("ICS_Inbound: Initializing external→internal validation...\n");
-    DEBUG("ICS_Inbound: 🔖 SOFTWARE VERSION: v2.161 (2025-10-25)\n");
+    DEBUG("ICS_Inbound: 🔖 SOFTWARE VERSION: v2.237 (2025-11-01) - PBUF leak fix\n");
     DEBUG("ICS_Inbound: 🔧 Features: Metadata logging + EverParse validation hooks + close_queue forwarding\n");
     DEBUG("ICS_Inbound: 📊 Protocols: TCP, UDP, ARP detection\n");
     DEBUG("ICS_Inbound: ✅ CRITICAL FIX: Forwards close_queue from Net0 to Net1 (fixes PCB pool exhaustion)\n\n");

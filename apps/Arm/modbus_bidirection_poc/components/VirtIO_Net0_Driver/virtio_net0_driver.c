@@ -258,6 +258,9 @@ static uint32_t active_connections = 0;
 static uint32_t total_connections_created = 0;
 static uint32_t total_connections_closed = 0;
 
+/* v2.242: Forward declaration for sys_now() (defined later, needed by ICMP metadata functions) */
+uint32_t sys_now(void);
+
 /* v2.242: ICMP Metadata for Proxy Replies
  * ═══════════════════════════════════════════════════════════════════════════════
  * Purpose: Track ICMP echo requests so we can send replies with correct source IP

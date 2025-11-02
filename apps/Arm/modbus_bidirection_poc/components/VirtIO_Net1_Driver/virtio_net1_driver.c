@@ -52,6 +52,7 @@
 #include "lwip/prot/tcp.h"
 #include "lwip/prot/udp.h"
 #include "lwip/prot/ip.h"
+#include "lwip/prot/icmp.h"  /* v2.242: ICMP header for proxy replies */
 #include "lwip/priv/tcp_priv.h"  /* v2.173: Access tcp_active_pcbs, tcp_tw_pcbs for leak detection */
 #include "netif/ethernet.h"
 
@@ -206,6 +207,75 @@ struct connection_metadata {
 static struct connection_metadata connection_table[MAX_CONNECTIONS];
 static int connection_count = 0;
 static uint32_t active_connections = 0;  /* v2.143: Track active connections (symmetrical with Net0) */
+
+/* v2.242: ICMP Metadata for Proxy Replies
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * Purpose: Track ICMP echo requests so we can send replies with correct source IP
+ *
+ * When PLC pings 192.168.90.5 (SCADA):
+ *   RX: Store dest_ip=192.168.90.5, icmp_id, icmp_seq
+ *   lwIP generates ICMP reply (with source=192.168.95.1 - wrong!)
+ *   TX: Lookup metadata by icmp_id/seq, restore source IP to 192.168.90.5
+ * ═══════════════════════════════════════════════════════════════════════════════
+ */
+#define MAX_ICMP_METADATA 16  /* Track up to 16 concurrent pings */
+
+struct icmp_metadata {
+    uint16_t icmp_id;           /* ICMP echo identifier */
+    uint16_t icmp_seq;          /* ICMP echo sequence number */
+    uint32_t original_dest_ip;  /* Original destination IP (what was pinged) */
+    uint32_t timestamp;         /* When request was received (for aging) */
+    bool active;                /* Is this slot in use? */
+};
+
+static struct icmp_metadata icmp_table[MAX_ICMP_METADATA];
+
+/* Helper: Store ICMP request metadata */
+static void icmp_metadata_store(uint32_t dest_ip, uint16_t icmp_id, uint16_t icmp_seq)
+{
+    /* Find existing entry or free slot */
+    for (int i = 0; i < MAX_ICMP_METADATA; i++) {
+        if (!icmp_table[i].active ||
+            (icmp_table[i].icmp_id == icmp_id && icmp_table[i].icmp_seq == icmp_seq)) {
+            icmp_table[i].icmp_id = icmp_id;
+            icmp_table[i].icmp_seq = icmp_seq;
+            icmp_table[i].original_dest_ip = dest_ip;
+            icmp_table[i].timestamp = sys_now();
+            icmp_table[i].active = true;
+            return;
+        }
+    }
+
+    DEBUG_WARN("%s: [WARN] ICMP metadata table full! (id=%u, seq=%u)\n",
+               COMPONENT_NAME, icmp_id, icmp_seq);
+}
+
+/* Helper: Lookup ICMP metadata by id/seq */
+static struct icmp_metadata* icmp_metadata_lookup(uint16_t icmp_id, uint16_t icmp_seq)
+{
+    for (int i = 0; i < MAX_ICMP_METADATA; i++) {
+        if (icmp_table[i].active &&
+            icmp_table[i].icmp_id == icmp_id &&
+            icmp_table[i].icmp_seq == icmp_seq) {
+            /* Mark as consumed (one-time use) */
+            icmp_table[i].active = false;
+            return &icmp_table[i];
+        }
+    }
+    return NULL;
+}
+
+/* Helper: Clean up old ICMP metadata (called periodically) */
+static void icmp_metadata_cleanup(void)
+{
+    uint32_t now = sys_now();
+    for (int i = 0; i < MAX_ICMP_METADATA; i++) {
+        if (icmp_table[i].active && (now - icmp_table[i].timestamp) > 5000) {
+            /* Entry older than 5 seconds - clean it up */
+            icmp_table[i].active = false;
+        }
+    }
+}
 
 /* v2.198: Cleanup queue - Single Producer Single Consumer (SPSC) queue
  * ═══════════════════════════════════════════════════════════════════════════
@@ -974,6 +1044,45 @@ static err_t netif_output(struct netif *netif, struct pbuf *p)
                                lwip_stats.memp[MEMP_PBUF_POOL]->avail,
                                lwip_stats.memp[MEMP_PBUF_POOL]->max);
                         #endif
+                    }
+                }
+            } else if (ip->protocol == 1) {  /* v2.242: ICMP */
+                /* Extract ICMP header */
+                size_t ip_hdr_len = (ip->ihl) * 4;
+                if (p->tot_len >= sizeof(struct ethhdr) + ip_hdr_len + sizeof(struct icmp_echo_hdr)) {
+                    struct icmp_echo_hdr *icmp = (struct icmp_echo_hdr *)(tx_data + sizeof(struct ethhdr) + ip_hdr_len);
+
+                    /* Only handle ICMP echo replies (type 0) */
+                    if (icmp->type == 0) {  /* ICMP_ECHO_REPLY */
+                        uint16_t icmp_id = ntohs(icmp->id);
+                        uint16_t icmp_seq = ntohs(icmp->seqno);
+
+                        /* Lookup original destination IP from metadata */
+                        struct icmp_metadata *meta = icmp_metadata_lookup(icmp_id, icmp_seq);
+
+                        if (meta != NULL) {
+                            uint32_t current_src = ntohl(ip->saddr);  /* Currently 192.168.95.1 */
+                            uint32_t new_src = meta->original_dest_ip;  /* Should be 192.168.90.5 */
+
+                            DEBUG("%s: [ICMP-TX] Restoring source IP: %u.%u.%u.%u → %u.%u.%u.%u (id=%u, seq=%u)\n",
+                                   COMPONENT_NAME,
+                                   (current_src >> 24) & 0xFF, (current_src >> 16) & 0xFF,
+                                   (current_src >> 8) & 0xFF, current_src & 0xFF,
+                                   (new_src >> 24) & 0xFF, (new_src >> 16) & 0xFF,
+                                   (new_src >> 8) & 0xFF, new_src & 0xFF,
+                                   icmp_id, icmp_seq);
+
+                            /* Restore source IP to original destination (pretend to be SCADA) */
+                            ip->saddr = htonl(new_src);
+
+                            /* Recalculate IP checksum using lwIP's inet_chksum */
+                            ip->check = 0;
+                            ip->check = inet_chksum(ip, ip_hdr_len);
+
+                            /* Recalculate ICMP checksum */
+                            icmp->chksum = 0;
+                            icmp->chksum = inet_chksum(icmp, p->tot_len - sizeof(struct ethhdr) - ip_hdr_len);
+                        }
                     }
                 }
             }
@@ -2025,6 +2134,77 @@ static void connection_cleanup_stale(void)
     }
 }
 
+/* v2.242: ARP Proxy for SCADA IP (192.168.90.5)
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * Purpose: Respond to ARP requests for SCADA IP (192.168.90.5) with our MAC
+ *
+ * When PLC asks "Who has 192.168.90.5?":
+ *   - We reply with Net1's MAC address
+ *   - PLC sends packets to us (thinking we are SCADA)
+ *   - We forward to real SCADA or handle locally
+ *
+ * This enables PLC health checks (ping) to work even when SCADA is down
+ * ═══════════════════════════════════════════════════════════════════════════════
+ */
+static bool arp_proxy_check_and_reply(struct pbuf *p, struct netif *inp)
+{
+    struct eth_hdr *ethhdr = (struct eth_hdr *)p->payload;
+
+    /* Need room for Ethernet + ARP headers */
+    if (p->len < sizeof(struct eth_hdr) + sizeof(struct etharp_hdr)) {
+        return false;  /* Not a valid ARP packet */
+    }
+
+    /* Get ARP header (after Ethernet header) */
+    struct etharp_hdr *arphdr = (struct etharp_hdr *)((uint8_t *)p->payload + sizeof(struct eth_hdr));
+
+    /* Only handle ARP requests (opcode = 1) */
+    if (ntohs(arphdr->opcode) != 1) {  /* ARP_REQUEST */
+        return false;  /* Not a request */
+    }
+
+    /* Extract target IP address from ARP request */
+    uint32_t target_ip = (arphdr->dipaddr.addrw[0] << 16) | arphdr->dipaddr.addrw[1];
+    target_ip = ntohl(target_ip);
+
+    /* Check if this is a request for SCADA IP (192.168.90.5) */
+    #define SCADA_IP 0xC0A85A05  /* 192.168.90.5 in hex */
+    if (target_ip != SCADA_IP) {
+        return false;  /* Not for our proxied IP */
+    }
+
+    DEBUG("%s: [ARP-PROXY] Request for 192.168.90.5 (SCADA) - replying with our MAC\n",
+           COMPONENT_NAME);
+
+    /* Build ARP reply in the same pbuf (reuse the request packet) */
+    arphdr->opcode = htons(2);  /* ARP_REPLY */
+
+    /* Swap sender and target fields */
+    /* Target becomes the original sender */
+    memcpy(&arphdr->dhwaddr, &arphdr->shwaddr, sizeof(struct eth_addr));
+    arphdr->dipaddr.addrw[0] = arphdr->sipaddr.addrw[0];
+    arphdr->dipaddr.addrw[1] = arphdr->sipaddr.addrw[1];
+
+    /* Sender becomes us (with SCADA's IP) */
+    memcpy(&arphdr->shwaddr, &inp->hwaddr, sizeof(struct eth_addr));
+    arphdr->sipaddr.addrw[0] = htons((SCADA_IP >> 16) & 0xFFFF);
+    arphdr->sipaddr.addrw[1] = htons(SCADA_IP & 0xFFFF);
+
+    /* Fix Ethernet header */
+    memcpy(&ethhdr->dest, &ethhdr->src, sizeof(struct eth_addr));  /* Reply to sender */
+    memcpy(&ethhdr->src, &inp->hwaddr, sizeof(struct eth_addr));   /* From us */
+
+    /* Send the ARP reply directly via low-level output */
+    inp->linkoutput(inp, p);
+
+    DEBUG("%s: [ARP-PROXY] Sent ARP reply: 192.168.90.5 is at %02x:%02x:%02x:%02x:%02x:%02x\n",
+           COMPONENT_NAME,
+           inp->hwaddr[0], inp->hwaddr[1], inp->hwaddr[2],
+           inp->hwaddr[3], inp->hwaddr[4], inp->hwaddr[5]);
+
+    return true;  /* We handled it */
+}
+
 /*
  * Custom input function for protocol-break architecture WITH metadata preservation
  *
@@ -2055,6 +2235,13 @@ static err_t custom_input_promiscuous(struct pbuf *p, struct netif *inp)
 
     /* Handle ARP packets normally - pass to lwIP's ARP handler */
     if (type == ETHTYPE_ARP) {
+        /* v2.242: Check if this is an ARP request for our proxied IP (192.168.90.5) */
+        if (arp_proxy_check_and_reply(p, inp)) {
+            /* We handled it - ARP reply sent */
+            pbuf_free(p);  /* Free the request packet */
+            return ERR_OK;
+        }
+
         /* Remove Ethernet header and pass to etharp_input for ARP processing */
         if (pbuf_remove_header(p, sizeof(struct eth_hdr)) == 0) {
             /* v2.222: REVERTED FIX #2 - etharp_input() DOES free pbuf (line 741 in etharp.c)
@@ -2107,6 +2294,23 @@ static err_t custom_input_promiscuous(struct pbuf *p, struct netif *inp)
                  * Let lwIP handle connection matching - it will send RST if needed
                  * Note: This may cause pbuf leaks, but connection functionality takes precedence
                  */
+            } else if (IPH_PROTO(iphdr) == IP_PROTO_ICMP && p->len >= 20 + 8) {
+                /* v2.242: ICMP packet - check if it's an echo request */
+                struct icmp_echo_hdr *icmp = (struct icmp_echo_hdr *)((uint8_t *)iphdr + (IPH_HL(iphdr) * 4));
+
+                if (icmp->type == ICMP_ECHO) {  /* Echo request (ping) */
+                    uint16_t icmp_id = ntohs(icmp->id);
+                    uint16_t icmp_seq = ntohs(icmp->seqno);
+
+                    /* Store metadata so TX path can restore source IP */
+                    icmp_metadata_store(pkt_dest_ip, icmp_id, icmp_seq);
+
+                    DEBUG("%s: [ICMP-RX] Ping to %u.%u.%u.%u (id=%u, seq=%u) - metadata stored\n",
+                           COMPONENT_NAME,
+                           (pkt_dest_ip >> 24) & 0xFF, (pkt_dest_ip >> 16) & 0xFF,
+                           (pkt_dest_ip >> 8) & 0xFF, pkt_dest_ip & 0xFF,
+                           icmp_id, icmp_seq);
+                }
             }
 
             /* If packet is not destined for our interface IP, rewrite it */

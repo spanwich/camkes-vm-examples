@@ -1,21 +1,20 @@
-/*
- * ICS_Inbound - External to Internal Validation Component
- *
- * Validates traffic from external network (VirtIO_Net0_Driver) before
- * forwarding to internal network (VirtIO_Net1_Driver).
- *
- * Architecture:
- * - Receives metadata + payload from NET0
- * - Validates frame integrity and protocol
- * - Forwards close_queue notifications from NET0 to NET1
- * - Performs EverParse validation (future: add policy rules)
- *
- * Stable since v2.240 (2025-11-02)
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
+/* v2.240: Industry-standard 5-level debug system */
 #define DEBUG_LEVEL DEBUG_LEVEL_INFO
 #include "debug_levels.h"
+
+/*
+ * ICS_Outbound - Internal to External Validation Component
+ *
+ * Validates traffic from internal network (VirtIO_Net1_Driver) before
+ * forwarding to external network (VirtIO_Net0_Driver).
+ *
+ * Current: Pass-through with metadata forwarding and error queue propagation
+ * Future: Add policy rules, EverParse validation, rate limiting
+ *
+ * Status: Stable since v2.240 (2025-11-02)
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
 
 #include <camkes.h>
 #include <stdio.h>
@@ -40,7 +39,7 @@ static uint64_t other_messages = 0;
  * Print frame metadata for debugging
  */
 static void print_frame_metadata(const FrameMetadata *meta) {
-    DEBUG("ICS_Inbound: Frame Metadata:\n");
+    DEBUG("ICS_Outbound: Frame Metadata:\n");
     DEBUG("  EtherType: 0x%04X\n", meta->ethertype);
     DEBUG("  Src MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
            meta->src_mac[0], meta->src_mac[1], meta->src_mac[2],
@@ -82,13 +81,13 @@ static bool validate_message(const ICS_Message *msg) {
 
     /* Basic validation */
     if (msg->payload_length > MAX_PAYLOAD_SIZE) {
-        DEBUG_ERROR("ICS_Inbound: REJECT - Payload too large (%u > %u)\n",
+        DEBUG_ERROR("ICS_Outbound: REJECT - Payload too large (%u > %u)\n",
                     msg->payload_length, MAX_PAYLOAD_SIZE);
         return false;
     }
 
     if (msg->payload_length != meta->payload_length) {
-        DEBUG_ERROR("ICS_Inbound: REJECT - Payload length mismatch (msg=%u, meta=%u)\n",
+        DEBUG_ERROR("ICS_Outbound: REJECT - Payload length mismatch (msg=%u, meta=%u)\n",
                     msg->payload_length, meta->payload_length);
         return false;
     }
@@ -96,7 +95,7 @@ static bool validate_message(const ICS_Message *msg) {
     /* EverParse validation hook */
     if (msg->payload_length > 0) {
         if (!everparse_validate(msg->payload, msg->payload_length)) {
-            DEBUG_ERROR("ICS_Inbound: REJECT - EverParse validation failed\n");
+            DEBUG_ERROR("ICS_Outbound: REJECT - EverParse validation failed\n");
             return false;
         }
     }
@@ -114,12 +113,12 @@ static bool validate_message(const ICS_Message *msg) {
  * Process one message from input dataport
  */
 static bool process_message(void) {
-    InboundDataport *in_dataport = (InboundDataport *)in_dp;
-    ICS_Message *in_msg = &in_dataport->request_msg;
+    OutboundDataport *in_dataport = (OutboundDataport *)in_dp;
+    ICS_Message *in_msg = &in_dataport->response_msg;
 
     /* Basic bounds check */
     if (!basic_bounds_check(in_msg, sizeof(Buf))) {
-        DEBUG_ERROR("ICS_Inbound: ERROR - Bounds check failed\n");
+        DEBUG_ERROR("ICS_Outbound: ERROR - Bounds check failed\n");
         stats.messages_dropped++;
         return false;
     }
@@ -136,33 +135,30 @@ static bool process_message(void) {
     }
 
     /* Forward to output dataport */
-    InboundDataport *out_dataport = (InboundDataport *)out_dp;
-    ICS_Message *out_msg = &out_dataport->request_msg;
+    OutboundDataport *out_dataport = (OutboundDataport *)out_dp;
+    ICS_Message *out_msg = &out_dataport->response_msg;
     memcpy(out_msg, in_msg, sizeof(FrameMetadata) + sizeof(uint16_t) + in_msg->payload_length);
 
-    /*
-     * Forward close_queue from Net0 to Net1
-     * Net0 writes close notifications to in_dp->close_queue
-     * Net1 reads close notifications from out_dp->close_queue
-     * Memory barrier ensures Net1 sees updated close_queue.head
-     */
-    memcpy((void*)&out_dataport->close_queue,
-           (void*)&in_dataport->close_queue,
+    /* Forward error_queue from Net1 to Net0 */
+    memcpy((void*)&out_dataport->error_queue,
+           (void*)&in_dataport->error_queue,
            sizeof(struct control_queue));
 
+    /* Memory barrier to ensure data visibility before notification */
     __sync_synchronize();
 
-    /* Signal VirtIO_Net1_Driver */
+    /* Signal VirtIO_Net0_Driver */
     out_ntfy_emit();
 
     stats.messages_forwarded++;
     stats.bytes_processed += sizeof(FrameMetadata) + sizeof(uint16_t) + in_msg->payload_length;
 
+    DEBUG("ICS_Outbound: Forwarded message to external network\n");
     return true;
 }
 
 /*
- * Notification handler - called when VirtIO_Net0_Driver has data
+ * Notification handler - called when VirtIO_Net1_Driver has data
  */
 void in_ntfy_handle(void) {
     stats.last_activity_time = get_timestamp();
@@ -171,12 +167,12 @@ void in_ntfy_handle(void) {
         /* Print periodic stats */
         static uint32_t stats_counter = 0;
         if (++stats_counter % 10 == 0) {
-            DEBUG("\n=== ICS_Inbound Statistics ===\n");
+            DEBUG("\n=== ICS_Outbound Statistics ===\n");
             DEBUG("Received: %llu, Forwarded: %llu, Dropped: %llu\n",
                    stats.messages_received, stats.messages_forwarded, stats.messages_dropped);
             DEBUG("TCP: %llu, UDP: %llu, ARP: %llu, Other: %llu\n",
                    tcp_messages, udp_messages, arp_messages, other_messages);
-            DEBUG("==============================\n\n");
+            DEBUG("===============================\n\n");
         }
     }
 }
@@ -187,12 +183,11 @@ void in_ntfy_handle(void) {
 void pre_init(void) {
     memset(&stats, 0, sizeof(stats));
     tcp_messages = udp_messages = arp_messages = other_messages = 0;
-    DEBUG_INFO("ICS_Inbound: v2.240 (2025-11-02) - Stable external→internal validation\n");
-    DEBUG_INFO("ICS_Inbound: Features: Metadata logging, EverParse hooks, close_queue forwarding\n");
+    DEBUG_INFO("ICS_Outbound: v2.240 (2025-11-02) - Stable internal→external validation\n");
 }
 
 int run(void) {
-    DEBUG_INFO("ICS_Inbound: Ready to validate external→internal traffic\n");
+    DEBUG_INFO("ICS_Outbound: Ready to validate internal→external traffic\n");
 
     /* Main event loop */
     while (1) {

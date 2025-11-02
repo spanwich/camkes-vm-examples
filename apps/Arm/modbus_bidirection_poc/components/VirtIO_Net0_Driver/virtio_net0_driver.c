@@ -24,7 +24,7 @@
  */
 
 /* v2.207: New industry-standard 5-level debug system */
-#define DEBUG_LEVEL DEBUG_LEVEL_INFO  /* v2.210: INFO level (DEBUG has compilation errors) */
+#define DEBUG_LEVEL DEBUG_LEVEL_NONE  /* v2.210: INFO level (DEBUG has compilation errors) */
 #include "debug_levels.h"
 
 #include <camkes.h>
@@ -64,28 +64,6 @@
 #define COMPONENT_NAME "VirtIO_Net0_Driver"
 #define TCP_SERVER_PORT 502  /* INBOUND: Modbus port - pretends to be PLC */
 
-/* ═══════════════════════════════════════════════════════════════ */
-/* OLD DEBUG SYSTEM (v2.206 and earlier) - DEPRECATED               */
-/* v2.207: Replaced with industry-standard 5-level system           */
-/* See debug_levels.h for new system (ERROR/WARN/INFO/DEBUG)        */
-/* ═══════════════════════════════════════════════════════════════ */
-/* OLD:
-#define DEBUG_LEVEL_SILENT   1
-#define DEBUG_LEVEL_QUIET    0
-#define DEBUG_LEVEL_NORMAL   0
-#define DEBUG_LEVEL_VERBOSE  0
-...
-(Old conditional blocks removed - see debug_levels.h for new mappings)
-*/
-
-/* Connection tracking for metadata preservation */
-/* v2.86: Increased from 64 to 256 to prevent table exhaustion
- * User insight: "increase active connections and let lwIP clear it naturally"
- * - SCADA keeps connections alive, accumulates over time
- * - Can't safely call tcp_abort() from main loop (v2.85 lesson)
- * - Solution: Increase limit, let lwIP's TCP timeouts handle cleanup
- * - Memory cost: ~12KB (256 * ~48 bytes) - negligible
- * - Benefit: System won't deadlock when table fills */
 #define MAX_CONNECTIONS 150  /* v2.182: Reverted to prevent PLC crash during leak testing */
 
 struct connection_metadata {
@@ -101,150 +79,22 @@ struct connection_metadata {
     uint32_t timestamp;            /* Creation time - for metadata consistency with Net1 */
     /* v2.92: Response lifecycle tracking */
     bool awaiting_response;        /* True if we're waiting for PLC response (don't cleanup yet!) */
-    /* v2.189: Response arrival tracking (fix race condition)
-     * ══════════════════════════════════════════════════════════════════════════
-     * Problem: tcp_echo_recv(p=NULL) sets awaiting_response=true when SCADA closes,
-     *          even if response already arrived and was processed.
-     *
-     * Solution: Track when response arrives separately from awaiting state
-     *   1. outbound_ready_handle(): response_received = true (response arrived)
-     *   2. tcp_echo_recv(p=NULL): check response_received before setting awaiting_response
-     *   3. If response_received=true: proceed with normal close (don't wait)
-     * ══════════════════════════════════════════════════════════════════════════
-     */
+
     bool response_received;        /* True if PLC response arrived (even if not sent yet) */
 
-    /* v2.158: Deferred connection close (lwIP best practice)
-     * ══════════════════════════════════════════════════════════════════════════
-     * Problem: Can't call tcp_close() from recv callback (Rule 5 violation)
-     *
-     * Solution: Deferred close via close_pending flag + poll callback
-     *   1. After sending response: recv callback sets close_pending = true
-     *   2. Poll callback (tcp_echo_poll) detects flag
-     *   3. Poll callback sends close notification to Net1
-     *   4. Poll callback returns ERR_ABRT → lwIP handles tcp_abort() internally
-     *
-     * This follows lwIP Rule 6 Solution A: close_pending flag pattern
-     * ══════════════════════════════════════════════════════════════════════════
-     */
     bool close_pending;            /* True if connection should close (poll handles) */
 
-    /* v2.180: Deferred metadata cleanup (fix metadata/lwIP packet race)
-     * ══════════════════════════════════════════════════════════════════════════
-     * Problem: Poll callback removed metadata but lwIP still had PCB closing
-     *   1. Poll callback: connection_cleanup_atomic() → metadata removed
-     *   2. Poll callback: return ERR_ABRT
-     *   3. lwIP: tcp_abort() internally → sends RST packet
-     *   4. TX callback: looks up metadata → NOT FOUND!
-     *   5. TX callback: sends packet with WRONG source IP (192.168.96.2)
-     *   6. SCADA: ignores packet (expected 192.168.95.2)
-     *   7. Result: 1,170 metadata failures, retransmissions, PCB leak
-     *
-     * Solution: Keep metadata alive until lwIP frees PCB
-     *   1. Poll callback: tcp_close() + mark closing=true (DON'T cleanup!)
-     *   2. lwIP: completes close handshake (FIN/ACK exchange)
-     *   3. lwIP: frees PCB → error callback fires
-     *   4. Error callback: connection_cleanup_atomic() (NOW safe!)
-     *   5. Result: Metadata available for ALL lwIP packets during close
-     *
-     * Benefits:
-     *   - Fixes 1,170 metadata lookup failures
-     *   - All packets sent with correct source IP (192.168.95.2)
-     *   - No SCADA retransmissions
-     *   - No duplicate connection detection
-     *   - No PCB leaks
-     * ══════════════════════════════════════════════════════════════════════════
-     */
     bool closing;                  /* True if close initiated, waiting for PCB free */
     /* NOTE: close_timestamp moved to v2.209 section below (reused for metadata_close_pending) */
 
-    /* v2.111: Pending outbound data (fix for pbuf ref count bug)
-     * ══════════════════════════════════════════════════════════════════════════
-     * FIX: Don't call tcp_write() from main loop (outbound_ready_handle)
-     *      Instead, queue data here and send from tcp_sent() callback.
-     *
-     * REASON: Calling tcp_write() from main loop causes race with lwIP timers:
-     *   - Main loop: tcp_write() creates pbuf (ref=1)
-     *   - Timer fires: lwIP increments ref for retransmission (ref=2)
-     *   - tcp_output(): Asserts p->ref == 1 → FAILS → abort() → Net0 DEAD!
-     *
-     * SOLUTION: Only call tcp_write() from lwIP callback (proper threading model)
-     * ══════════════════════════════════════════════════════════════════════════
-     */
     uint8_t *pending_outbound_data;  /* Queued outbound data awaiting send */
     uint16_t pending_outbound_len;   /* Length of queued data */
     bool has_pending_outbound;       /* True if data needs to be sent */
 
-    /* v2.143: Guard flag to prevent double-cleanup/double-decrement
-     * ══════════════════════════════════════════════════════════════════════════
-     * TICKING TIME BOMB FIX: Prevent double-decrement of active_connections
-     *
-     * Problem (v2.142):
-     *   - tcp_close() called from main loop (ERROR notification path)
-     *   - Main loop decrements active_connections
-     *   - tcp_close() triggers recv(p=NULL) callback
-     *   - Callback ALSO decrements active_connections
-     *   - Result: Counter underflows to 0, unlimited connections accepted!
-     *
-     * Solution: Guard flag ensures cleanup logic runs exactly ONCE
-     * ══════════════════════════════════════════════════════════════════════════
-     */
     bool cleanup_in_progress;        /* Guard: prevents double-cleanup */
 
-    /* v2.153: Deduplication flags for control message queue
-     * ══════════════════════════════════════════════════════════════════════════
-     * SECURITY: Prevent RST flood attacks by deduplicating control messages
-     *
-     * Problem without deduplication:
-     *   - Attacker sends 1000 RST packets for same connection
-     *   - Each RST triggers error notification enqueue
-     *   - Queue fills up with duplicates
-     *   - Legitimate notifications get dropped
-     *
-     * Solution: Only enqueue ONCE per connection
-     *   - Set flag when first notification queued
-     *   - Ignore subsequent notifications for same connection
-     *   - Clear flag when connection cleaned up
-     * ══════════════════════════════════════════════════════════════════════════
-     */
     bool close_notified;             /* True if close notification already queued (Net0 → Net1) */
 
-    /* v2.209: Delayed metadata cleanup (fix pbuf leak race condition)
-     * ══════════════════════════════════════════════════════════════════════════
-     * Problem (v2.208): Metadata deleted immediately when SCADA closes
-     *   T+92.979 ms: PLC response arrives at Net0 (packet on wire)
-     *   T+141.610 ms: SCADA closes (FIN) → tcp_echo_recv(p=NULL)
-     *                 → connection_cleanup_atomic() → metadata.active = FALSE
-     *   T+145.000 ms: TX path executes (processing delay)
-     *                 → find_connection_by_port() → metadata NOT FOUND!
-     *                 → Sends with WRONG source IP (192.168.96.2 vs 192.168.95.2)
-     *                 → SCADA rejects → no ACK → pbuf LEAKED!
-     *
-     *   Result: 939 TX failures (78%), 1192 pbuf leaks (99%)
-     *
-     * Solution (v2.209): Delay metadata cleanup until TX completes
-     *   T+141.610 ms: SCADA closes → metadata_close_pending = TRUE
-     *                 (DON'T delete metadata yet!)
-     *   T+145.000 ms: TX path executes
-     *                 → find_connection_by_port() → FOUND! ✅
-     *                 → Sends with CORRECT source IP (192.168.95.2)
-     *                 → last_tx_timestamp updated
-     *   T+1145.000 ms: check_pending_cleanups() runs (main loop)
-     *                  → tx_idle = now - last_tx_timestamp = 1000 ms
-     *                  → Fast-track cleanup (tx_idle > 1000 ms)
-     *                  → connection_cleanup_atomic() (NOW safe!)
-     *
-     * Two-tier cleanup:
-     *   1. Fast-track: Cleanup after 1 second of TX idle (normal case)
-     *   2. Grace period: Cleanup after 5 seconds max (safety net)
-     *
-     * Benefits:
-     *   - 0% TX failures (metadata persists until TX completes)
-     *   - 0% pbuf leaks (correct IP → SCADA accepts → ACK → pbuf freed)
-     *   - No connection pool exhaustion (1s cleanup keeps usage at 19.5%)
-     *   - 103× safety margin (5s grace / 48ms race window)
-     * ══════════════════════════════════════════════════════════════════════════
-     */
     bool metadata_close_pending;     /* True if SCADA closed but metadata persists for TX */
     uint32_t close_timestamp;        /* When metadata_close_pending was set (for grace period) */
     uint32_t last_tx_timestamp;      /* Last TX path activity (for fast-track cleanup) */
@@ -253,24 +103,12 @@ struct connection_metadata {
 static struct connection_metadata connection_table[MAX_CONNECTIONS];
 static int connection_count = 0;
 
-/* v2.143: Connection tracking counters (moved here for connection_cleanup_atomic()) */
 static uint32_t active_connections = 0;
 static uint32_t total_connections_created = 0;
 static uint32_t total_connections_closed = 0;
 
-/* v2.242: Forward declaration for sys_now() (defined later, needed by ICMP metadata functions) */
 uint32_t sys_now(void);
 
-/* v2.242: ICMP Metadata for Proxy Replies
- * ═══════════════════════════════════════════════════════════════════════════════
- * Purpose: Track ICMP echo requests so we can send replies with correct source IP
- *
- * When SCADA pings 192.168.95.2 (PLC):
- *   RX: Store dest_ip=192.168.95.2, icmp_id, icmp_seq
- *   lwIP generates ICMP reply (with source=192.168.96.2 - wrong!)
- *   TX: Lookup metadata by icmp_id/seq, restore source IP to 192.168.95.2
- * ═══════════════════════════════════════════════════════════════════════════════
- */
 #define MAX_ICMP_METADATA 16  /* Track up to 16 concurrent pings */
 
 struct icmp_metadata {
@@ -330,44 +168,11 @@ static void icmp_metadata_cleanup(void)
     }
 }
 
-/* v2.150: Session ID counter for unique connection identification
- * ══════════════════════════════════════════════════════════════════════════════
- * Purpose: Provide unique, persistent identifier for each SCADA connection
- * - Counter starts at 1 (0 means unassigned)
- * - Monotonically increasing (never reused)
- * - Wraps at UINT32_MAX (4 billion connections)
- * - Assigned in Net0 (SCADA side), passed to Net1 via shared dataport
- * - Enables reliable SCADA ↔ PLC connection mapping across components
- * ══════════════════════════════════════════════════════════════════════════════
- */
 static uint32_t next_session_id = 1;
 
-/* v2.117: Connection state sharing via dataports */
 static volatile struct connection_state_table *own_state = NULL;   /* Our state (exposed to Net1) */
 static volatile struct connection_state_table *peer_state = NULL;  /* Net1's state (read-only) */
 
-/* v2.193: Queue-based cleanup architecture
- * ══════════════════════════════════════════════════════════════════════════════
- * Problem with direct cleanup calls (v2.192):
- * - Multiple callbacks (recv, poll, err) all call connection_cleanup_atomic()
- * - Guard flag (cleanup_in_progress) blocks duplicate calls
- * - But guard NEVER cleared → blocks ALL subsequent cleanups → CONNECTION LEAK!
- *
- * Queue-based solution:
- * - Callbacks enqueue cleanup requests (never blocks)
- * - Main loop processes queue (guaranteed to run)
- * - Natural deduplication: check meta->active flag
- * - No guard blocking issues
- * - Single cleanup enforcement point
- *
- * Benefits:
- * ✅ No more guard blocking
- * ✅ Reliable cleanup (main loop always runs)
- * ✅ Simple deduplication (active flag)
- * ✅ Easy debugging (single processing point)
- * ✅ Clean architecture (producer/consumer pattern)
- * ══════════════════════════════════════════════════════════════════════════════
- */
 #define CLEANUP_QUEUE_SIZE 512  /* Must be power of 2 */
 #define CLEANUP_QUEUE_MASK (CLEANUP_QUEUE_SIZE - 1)
 
@@ -396,18 +201,7 @@ static struct {
     uint32_t overflows;       /* Queue full events */
 } cleanup_stats = {0};
 
-/*
- * VLAN-BASED DEPLOYMENT CONFIGURATION
- *
- * Net0 uses PRIVATE network (10.2.0.0/24) connected to tap0
- * - Listens on 10.2.0.2:502
- * - Receives traffic from eth0 (192.168.95.2) via iptables DNAT
- * - Forwards validated traffic to Net1 (10.3.0.2)
- *
- * Host iptables translates:
- *   eth0 (192.168.95.2:502) ←→ tap0 (10.2.0.2:502)
- */
-#define OUTBOUND_FORWARD_IP "10.3.0.2"        /* Forward to Net1 (private network) */
+#define OUTBOUND_FORWARD_IP "192.168.95.2"        /* Forward to Net1 (private network) */
 #define OUTBOUND_FORWARD_PORT 502              /* Modbus TCP port */
 #define INBOUND_FORWARD_PORT 502               /* Unused - Net1 handles inbound */
 
@@ -792,9 +586,6 @@ typedef struct {
     uint32_t unsent_pbufs;            /* Pbufs in unsent queue */
 } orphan_pcb_diag_t;
 
-/* v2.205: Check for metadata/PCB mismatches
- * Identifies orphaned connections (metadata without PCB or PCB without metadata)
- */
 static void get_connection_match_stats(connection_match_stats_t *stats)
 {
     struct tcp_pcb *pcb;
@@ -940,10 +731,6 @@ uint32_t sys_now(void)
 }
 
 /* Forward declarations */
-
-/* ═══════════════════════════════════════════════════════════
- * Network Traffic Logging Helpers
- * ═══════════════════════════════════════════════════════════ */
 
 /* Ethernet header structure */
 struct ethhdr {
@@ -1406,25 +1193,6 @@ static uint16_t tcp_checksum(struct iphdr *ip, struct tcphdr *tcp, uint16_t tcp_
     return (uint16_t)~sum;
 }
 
-/*
- * ═══════════════════════════════════════════════════════════════
- * CONNECTION TRACKING FOR METADATA PRESERVATION
- * ═══════════════════════════════════════════════════════════════
- *
- * Problem: ICS validation needs original source/dest IPs
- * - Packets arrive: 192.168.90.5 (SCADA) → 192.168.95.2 (PLC)
- * - We rewrite: 192.168.90.5 → 192.168.96.2 (for lwIP acceptance)
- * - ICS pipeline needs to know original dest was 192.168.95.2
- * - TCP responses must restore: 192.168.95.2 → 192.168.90.5
- *
- * Solution: Connection tracking table
- * - Store original IPs when packet arrives
- * - Link to TCP PCB when connection established
- * - Lookup metadata when sending responses
- * - Restore original IPs before transmission
- */
-
-/* v2.117: Update shared connection state dataport */
 static void update_shared_connection_state(void)
 {
     if (!own_state) return;
@@ -1485,68 +1253,18 @@ static struct connection_metadata* connection_add(uint32_t orig_src, uint32_t or
             connection_table[i].awaiting_response = false;
             connection_table[i].response_received = false;  /* v2.189: Response arrival tracking */
             connection_table[i].close_pending = false;
-            connection_table[i].closing = false;  /* v2.180: Deferred metadata cleanup */
+            connection_table[i].closing = false;
 
-            /* v2.149: Reset guard flag for new connection
-             * Note: This allows stale callbacks to pass guard check if slot is reused quickly
-             * But the meta->active check above will catch stale callbacks before reuse
-             */
             connection_table[i].cleanup_in_progress = false;
 
-            /* v2.200: CRITICAL FIX - Initialize close_notified for new/reused slots
-             * ═══════════════════════════════════════════════════════════════════════════
-             * BUG: Slot lifecycle - close_notified persists when slot is reused
-             *
-             * Problem: When slot is reused by new session, close_notified flag inherits
-             * value from previous session, causing new session to skip notifications.
-             *
-             * Evidence from v2.199 test:
-             *   - Net0 created 150 connections, sent only 25 close notifications
-             *   - Net1 has 125 orphan connections (never notified)
-             *   - 125 sessions inherited close_notified=true from previous sessions
-             *   - Result: Net1 pool exhaustion, communication failure
-             *
-             * Fix: Initialize to false for every new connection (new or reused slot)
-             * ═══════════════════════════════════════════════════════════════════════════
-             */
             connection_table[i].close_notified = false;
 
-            /* v2.209: Initialize delayed metadata cleanup fields (fix pbuf leak)
-             * ═══════════════════════════════════════════════════════════════════════════
-             * Purpose: Support two-tier cleanup strategy to prevent "TX: No metadata"
-             *
-             * Fields:
-             *   - metadata_close_pending: False initially, set when SCADA closes
-             *   - close_timestamp: 0 initially, set when metadata_close_pending=true
-             *   - last_tx_timestamp: Current time (connection creation time)
-             *
-             * Why initialize last_tx_timestamp to sys_now():
-             *   - Prevents premature fast-track cleanup for new connections
-             *   - Gives new connection at least 1 second to complete TX
-             *   - After first TX, this gets updated to actual TX completion time
-             * ═══════════════════════════════════════════════════════════════════════════
-             */
             connection_table[i].metadata_close_pending = false;
             connection_table[i].close_timestamp = 0;
             connection_table[i].last_tx_timestamp = sys_now();
 
             connection_count++;
 
-            /* v2.193: Log connection creation for debugging */
-            DEBUG("%s: [COUNT++] %u → %u | connection_add() session=%u port=%u→%u\n",
-                   COMPONENT_NAME, connection_count - 1, connection_count,
-                   connection_table[i].session_id, sport, dport);
-
-            #if DEBUG_METADATA
-            DEBUG("%s: 📝 Stored metadata [%d]: %u.%u.%u.%u:%u → %u.%u.%u.%u:%u\n",
-                   COMPONENT_NAME, i,
-                   (orig_src >> 24) & 0xFF, (orig_src >> 16) & 0xFF,
-                   (orig_src >> 8) & 0xFF, orig_src & 0xFF, sport,
-                   (orig_dest >> 24) & 0xFF, (orig_dest >> 16) & 0xFF,
-                   (orig_dest >> 8) & 0xFF, orig_dest & 0xFF, dport);
-            #endif
-
-            /* v2.117: Update shared connection state */
             update_shared_connection_state();
 
             return &connection_table[i];
@@ -1565,7 +1283,7 @@ static void connection_link_pcb(struct tcp_pcb *pcb, uint16_t sport, uint16_t dp
             connection_table[i].dest_port == dport &&
             connection_table[i].pcb == NULL) {
             connection_table[i].pcb = pcb;
-            /* v2.50: Store validation metadata for consistency with Net1 */
+
             connection_table[i].tcp_seq_num = pcb->snd_nxt;
             connection_table[i].timestamp = sys_now();
             #if DEBUG_METADATA
@@ -1596,18 +1314,6 @@ static struct connection_metadata* connection_lookup_by_session_id(uint32_t sess
 {
     if (session_id == 0) return NULL;  /* 0 = unassigned/cleaned */
 
-    /* v2.197: REMOVED active flag check for cleanup queue compatibility
-     * ═══════════════════════════════════════════════════════════════════════════
-     * Old behavior: Only return if active==true
-     * Problem: Pool exhaustion handler sets active=false BEFORE enqueueing cleanup
-     * Result: Cleanup queue can't find connection → counter never decremented!
-     *
-     * New behavior: Match by session_id only, ignore active flag
-     * - If found: Return metadata (cleanup queue will handle it)
-     * - If not found: Return NULL (already cleaned or invalid)
-     * - Idempotency: After cleanup, session_id set to 0 → future lookups fail
-     * ═══════════════════════════════════════════════════════════════════════════
-     */
     for (int i = 0; i < MAX_CONNECTIONS; i++) {
         if (connection_table[i].session_id == session_id) {
             return &connection_table[i];
@@ -1620,30 +1326,12 @@ static struct connection_metadata* connection_lookup_by_session_id(uint32_t sess
 static struct connection_metadata* connection_lookup_by_tuple(uint32_t src_ip, uint32_t dest_ip,
                                                                uint16_t sport, uint16_t dport)
 {
-    /* v2.193: DON'T check active flag to prevent duplicate creation during cleanup!
-     * ═══════════════════════════════════════════════════════════════════════════
-     * Race condition (v2.193 initial):
-     * 1. SYN arrives → connection_add(port=X) → active=true, session=678
-     * 2. Close notification → enqueue_cleanup(678)
-     * 3. process_cleanup_queue() → active=false (marks inactive immediately!)
-     * 4. SYN retransmit arrives (SCADA retrying)
-     * 5. connection_lookup_by_tuple() checks active → returns NULL!
-     * 6. connection_add() creates NEW metadata (session=679, 680...)
-     * 7. Only session 678 gets cleanup → 679, 680 LEAKED!
-     *
-     * Fix: Match by port tuple regardless of active status
-     * - Prevents duplicate metadata during cleanup window
-     * - Reuses metadata slot even if being cleaned
-     * - Connection count stays accurate
-     * ═══════════════════════════════════════════════════════════════════════════
-     */
     for (int i = 0; i < MAX_CONNECTIONS; i++) {
-        /* v2.193: Check port tuple ONLY - don't check active! */
+
         if (connection_table[i].original_src_ip == src_ip &&
             connection_table[i].src_port == sport &&
             connection_table[i].dest_port == dport) {
 
-            /* v2.193: Debug - show if we're reusing a being-cleaned connection */
             if (!connection_table[i].active) {
                 DEBUG("%s: [FIND] Reusing slot %d for port %u→%u (was being cleaned, active=false)\n",
                        COMPONENT_NAME, i, sport, dport);
@@ -1686,25 +1374,6 @@ static void connection_remove(struct tcp_pcb *pcb)
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * v2.193: Queue-based cleanup functions
- * ═══════════════════════════════════════════════════════════════════════════
- */
-
-/**
- * enqueue_cleanup() - Producer: Enqueue cleanup request (called from callbacks)
- *
- * This function is called from lwIP callbacks (recv, poll, err) to request
- * cleanup of a connection. Requests are placed in a lock-free queue and
- * processed by the main loop.
- *
- * Benefits:
- * - Natural deduplication (duplicate requests just update timestamp)
- * - No blocking (if queue is full, we drop request - cleanup will retry)
- * - Single producer, single consumer (SPSC) pattern
- *
- * @param session_id Session ID of connection to cleanup
- */
 static inline void enqueue_cleanup(uint32_t session_id)
 {
     if (session_id == 0) {
@@ -1747,22 +1416,6 @@ static inline void enqueue_cleanup(uint32_t session_id)
            COMPONENT_NAME, session_id, depth);
 }
 
-/**
- * process_cleanup_queue() - Consumer: Process cleanup requests (called from main loop)
- *
- * This function runs in the main loop (guaranteed execution) and processes
- * all pending cleanup requests from the queue.
- *
- * v2.197: Natural deduplication using session_id:
- * - First request for session_id X: Lookup succeeds → cleanup, set session_id=0
- * - Duplicate requests: Lookup fails (session_id=0) → skip (already done)
- *
- * No guard flag or active flag needed:
- * - session_id=0 after cleanup provides idempotency
- * - Works even if active=false was set before enqueue (pool exhaustion case)
- * - No blocking or race conditions
- * - Simple and robust
- */
 static void process_cleanup_queue(void)
 {
     uint32_t tail = cleanup_queue.tail;
@@ -1798,15 +1451,6 @@ static void process_cleanup_queue(void)
         } else {
             /* Perform cleanup */
 
-            /* v2.195: ORPHAN DETECTION - Check if Net1 also has this connection
-             * ═══════════════════════════════════════════════════════════════════════════
-             * Purpose: Detect asymmetric cleanup (Net0 has connection, Net1 doesn't)
-             * This helps identify:
-             * 1. Orphan connections (Net1 never created connection)
-             * 2. Timing issues (Net1 cleaned up first)
-             * 3. Forwarding failures (request never reached Net1)
-             * ═══════════════════════════════════════════════════════════════════════════
-             */
             bool found_on_net1 = false;
 
             if (peer_state != NULL) {
@@ -1866,26 +1510,6 @@ static void process_cleanup_queue(void)
                        COMPONENT_NAME, req->session_id);
             }
 
-            /* v2.209 Complete: CRITICAL FIX - Defer cleanup if metadata_close_pending is set
-             * ═══════════════════════════════════════════════════════════════════════════
-             * BUG FIX: Prevent immediate cleanup when transmission may still be pending
-             *
-             * Root cause of "TX: No metadata" errors:
-             * - When SCADA FIN arrives with response_received=true, enqueue_cleanup() was called
-             * - But response_received just means tcp_write() was called, NOT transmission complete
-             * - process_cleanup_queue() would immediately set active=false
-             * - Then netif_output() can't find metadata → "TX: No metadata" error
-             *
-             * Fix: Check metadata_close_pending flag before cleanup
-             * - If set: TX may still be pending, defer cleanup
-             * - Let check_pending_cleanups() handle it after TX idle >1s (fast-track)
-             * - Or after 5s grace period (safety net)
-             * - Or at 80% pool usage (emergency cleanup)
-             *
-             * This prevents the bypass where enqueue_cleanup() would cause immediate cleanup
-             * before transmission completed, eliminating the "TX: No metadata" errors.
-             * ═══════════════════════════════════════════════════════════════════════════
-             */
             if (meta->metadata_close_pending) {
                 DEBUG("%s: [v2.209] DEFERRED cleanup: session=%u has metadata_close_pending=true\n",
                        COMPONENT_NAME, req->session_id);
@@ -1912,29 +1536,9 @@ static void process_cleanup_queue(void)
             meta->response_received = false;
             meta->close_pending = false;
 
-            /* v2.200: CRITICAL FIX - Reset slot lifecycle flags for reuse
-             * ═══════════════════════════════════════════════════════════════════════════
-             * BUG: When slot is freed, session-specific flags must be reset
-             *
-             * Missing resets cause slot reuse bugs:
-             * - close_notified: Next session inherits "already notified" state
-             * - cleanup_in_progress: Next session might skip cleanup (guard triggered)
-             *
-             * Rule: When session_id becomes 0 (slot freed), ALL session-specific state
-             * must be reset so next session starts with clean slate.
-             * ═══════════════════════════════════════════════════════════════════════════
-             */
             meta->close_notified = false;
             meta->cleanup_in_progress = false;
 
-            /* v2.197: Set session_id=0 for idempotency
-             * ═══════════════════════════════════════════════════════════════════════════
-             * CRITICAL: Prevents double-cleanup if enqueued multiple times
-             * - Next cleanup attempt: lookup fails (session_id=0) → skip
-             * - Works even without active flag check
-             * - Simpler and more robust than guard flags
-             * ═══════════════════════════════════════════════════════════════════════════
-             */
             meta->session_id = 0;
 
             /* Update shared connection state */
@@ -1950,31 +1554,6 @@ static void process_cleanup_queue(void)
     }
 }
 
-/* v2.143: Atomic cleanup function - SINGLE source of truth for counter decrements
- * ═══════════════════════════════════════════════════════════════════════════
- * CRITICAL: This is the ONLY place where active_connections is decremented!
- *
- * Problem Solved:
- *   v2.142 had multiple cleanup paths that each decremented counters:
- *   - tcp_echo_recv(p=NULL) callback
- *   - tcp_echo_err() callback
- *   - ERROR notification handler in main loop
- *
- *   This caused double-decrement when:
- *   1. Main loop called tcp_close() and decremented counter
- *   2. tcp_close() triggered recv(p=NULL) callback
- *   3. Callback tried to decrement AGAIN
- *   Result: Counter underflowed to 0, unlimited connections accepted!
- *
- * Solution:
- *   - Guard flag (cleanup_in_progress) prevents double-cleanup
- *   - All cleanup code paths call this function
- *   - Counters only decremented once (here!)
- *
- * Usage:
- *   connection_cleanup_atomic(&connection_table[i]);
- * ═══════════════════════════════════════════════════════════════════════════
- */
 static void connection_cleanup_atomic(struct connection_metadata *meta)
 {
     if (meta == NULL) {
@@ -2007,17 +1586,14 @@ static void connection_cleanup_atomic(struct connection_metadata *meta)
     /* Decrement counters - ONLY place this happens! */
     if (connection_count > 0) {
         connection_count--;
-        BREADCRUMB(9303);  /* connection_count decremented */
+        /* connection_count decremented */
     }
 
     if (active_connections > 0) {
         active_connections--;
-        BREADCRUMB(9304);  /* active_connections decremented */
-        DEBUG("%s: active_connections decremented: %u → %u\n",
-               COMPONENT_NAME, active_connections + 1, active_connections);
     } else {
-        BREADCRUMB(9305);  /* ERROR: active_connections already 0! */
-        DEBUG("%s: ERROR: active_connections already 0 (prevented underflow)!\n",
+        /* ERROR: active_connections already 0! */
+        DEBUG_ERROR("%s: ERROR: active_connections already 0 (prevented underflow)!\n",
                COMPONENT_NAME);
     }
 
@@ -2028,29 +1604,6 @@ static void connection_cleanup_atomic(struct connection_metadata *meta)
     meta->pending_outbound_len = 0;
     meta->awaiting_response = false;
     meta->response_received = false;  /* v2.189: Reset response tracking */
-
-    /* v2.147: DO NOT clear guard flag!
-     * ═══════════════════════════════════════════════════════════════════════
-     * Problem in v2.146:
-     * 1. tcp_echo_err() calls connection_cleanup_atomic()
-     * 2. cleanup_in_progress = true → cleanup happens → cleanup_in_progress = false
-     * 3. Then recv(p=NULL) is ALSO called for same connection
-     * 4. Guard check passes (flag is false now!) → cleanup AGAIN
-     * 5. Result: active_connections underflow (0 → -1, prevented by guard in decrement)
-     *
-     * Root Cause:
-     * - lwIP can call BOTH tcp_echo_err() AND recv(p=NULL) for same connection
-     * - Clearing guard flag allows second cleanup
-     *
-     * Fix: Keep guard flag SET forever
-     * - Once cleanup_in_progress = true, it stays true
-     * - Any future cleanup attempts will be blocked
-     * - Metadata entry will be reused for new connection anyway (active=false)
-     * - New connection will reset cleanup_in_progress = false during initialization
-     * ═══════════════════════════════════════════════════════════════════════
-     */
-    /* REMOVED (v2.147): meta->cleanup_in_progress = false; */
-    BREADCRUMB(9306);  /* Cleanup complete (guard flag stays set) */
 
     /* v2.117: Update shared connection state */
     update_shared_connection_state();
@@ -2065,7 +1618,6 @@ static void connection_cleanup_atomic(struct connection_metadata *meta)
  */
 static void connection_print_stats(void)
 {
-    /* v2.83: CRITICAL FIX - Do NOT access pcb->state (can crash on freed PCB) */
     int active = 0;
     int pcb_linked = 0;
     int stale = 0;
@@ -2083,11 +1635,6 @@ static void connection_print_stats(void)
     }
 
     int available = MAX_CONNECTIONS - active;
-
-    #if DEBUG_METADATA
-    DEBUG("%s: [STATS] Connection table: %d active (%d PCB-linked, %d stale), %d available\n",
-           COMPONENT_NAME, active, pcb_linked, stale, available);
-    #endif
 }
 
 /* Cleanup stale connections from the connection table
@@ -2100,19 +1647,6 @@ static void connection_print_stats(void)
  */
 static void connection_cleanup_stale(void)
 {
-    /* v2.92: CRITICAL FIX - Don't cleanup if awaiting_response!
-     *
-     * Lifecycle:
-     * 1. SCADA connects, sends request → metadata created
-     * 2. Request forwarded to PLC → awaiting_response = true
-     * 3. SCADA closes connection → pcb = NULL (but metadata kept!)
-     * 4. PLC response arrives → response sent → awaiting_response = false, metadata removed
-     *
-     * Bug (v2.90): connection_cleanup_stale() removed metadata at step 3
-     * Result: Step 4 fails with "No metadata found"
-     *
-     * Fix: Only cleanup if pcb == NULL AND awaiting_response == false
-     */
     int cleaned = 0;
 
     for (int i = 0; i < MAX_CONNECTIONS; i++) {
@@ -2128,29 +1662,6 @@ static void connection_cleanup_stale(void)
             DEBUG("%s: [CLEAN] Cleanup stale connection [%d]: PCB is NULL and no response pending\n", COMPONENT_NAME, i);
             #endif
             connection_table[i].active = false;
-
-            /* v2.122: CRITICAL FIX - Do NOT decrement counter here!
-             * ═══════════════════════════════════════════════════════════════════
-             * Problem: Both error callback AND periodic cleanup decrement counter
-             * Result: Double-decrement → counter underflow
-             *
-             * Root Cause:
-             * - When connection error occurs, lwIP calls tcp_echo_err()
-             * - Error callback decrements connection_count-- (line 1850)
-             * - Later, periodic cleanup finds pcb==NULL and decrements AGAIN!
-             *
-             * Fix: Let error callback be authoritative for counter decrement
-             * Periodic cleanup only marks metadata inactive (no counter change)
-             *
-             * Why This Works:
-             * - Error callback is called by lwIP when connection fails
-             * - It decrements counter immediately (authoritative cleanup)
-             * - Periodic cleanup only marks metadata->active=false (lazy cleanup)
-             * - No double-decrement, accurate counting
-             * ═══════════════════════════════════════════════════════════════════
-             */
-
-            /* REMOVED (v2.122): connection_count--; */
 
             cleaned++;
         }
@@ -2168,35 +1679,6 @@ static void connection_cleanup_stale(void)
     }
 }
 
-/* v2.209: Check and cleanup connections with metadata_close_pending
- * ══════════════════════════════════════════════════════════════════════════
- * Purpose: Process delayed metadata cleanups (fix pbuf leak race condition)
- *
- * This function implements two-tier cleanup strategy:
- *
- * Tier 1: Fast-track cleanup (normal case, ~99% of connections)
- *   - Wait for TX path to finish (1 second of TX inactivity)
- *   - Typical cleanup time: ~1 second after SCADA close
- *   - Pool usage: 19.5% at 100 conn/sec
- *
- * Tier 2: Grace period cleanup (safety net, ~1% of connections)
- *   - Wait maximum 5 seconds after close_pending flag set
- *   - Handles edge cases where TX timestamp doesn't update
- *   - Pool usage: 97.7% at 100 conn/sec (triggers emergency cleanup)
- *
- * Emergency Protection:
- *   - Force cleanup at 80% pool threshold (410 connections)
- *   - Prevents pool exhaustion even if everything goes wrong
- *
- * Why This Works:
- *   - Metadata persists until TX definitely completes (no more "TX: No metadata")
- *   - Fast-track keeps normal cleanup delay at 1 second (not 5 seconds!)
- *   - Grace period provides 103× safety margin (5000ms / 48ms race window)
- *   - Emergency cleanup prevents pool exhaustion
- *
- * Called from: Main loop (periodic check)
- * ══════════════════════════════════════════════════════════════════════════
- */
 static void check_pending_cleanups(void)
 {
     uint32_t now = sys_now();
@@ -2214,8 +1696,6 @@ static void check_pending_cleanups(void)
         }
     }
 
-    /* Emergency cleanup if pool filling up
-     * Trigger at 80% threshold (410 out of 512 connections) */
     float pool_usage = (float)active_count / MAX_CONNECTIONS;
     if (pool_usage > 0.8) {
         DEBUG_WARN("%s: [WARN] Connection pool at %.1f%% (%d/%d), forcing emergency cleanup\n",
@@ -2250,15 +1730,9 @@ static void check_pending_cleanups(void)
         uint32_t grace_elapsed = now - meta->close_timestamp;
         uint32_t tx_idle = now - meta->last_tx_timestamp;
 
-        /* Tier 1: Fast-track cleanup after 1 second TX idle (normal case)
-         * This handles 99% of connections:
-         *   - TX completes quickly (50-100ms typical)
-         *   - Wait 1 second after last TX activity
-         *   - Metadata stays in pool for ~1 second total
-         */
         if (tx_idle > 1000) {
             #if DEBUG_METADATA
-            DEBUG("%s: [CLEAN] Fast-track cleanup: session_id=%u (tx_idle=%u ms)\n",
+            DEBUG_WARN("%s: [WARN] Fast-track cleanup: session_id=%u (tx_idle=%u ms)\n",
                   COMPONENT_NAME, meta->session_id, (unsigned int)tx_idle);
             #endif
             connection_cleanup_atomic(meta);
@@ -2266,12 +1740,6 @@ static void check_pending_cleanups(void)
             continue;
         }
 
-        /* Tier 2: Grace period cleanup after 5 seconds max (safety net)
-         * This handles edge cases:
-         *   - TX timestamp not updated (bug)
-         *   - TX keeps running >1 second (impossible for Modbus)
-         *   - Provides 103× safety margin (5000ms / 48ms race window)
-         */
         if (grace_elapsed > 5000) {
             DEBUG_WARN("%s: [WARN] Grace period cleanup: session_id=%u (grace_elapsed=%u ms, tx_idle=%u ms)\n",
                        COMPONENT_NAME, meta->session_id,
@@ -2292,48 +1760,6 @@ static void check_pending_cleanups(void)
     }
 }
 
-/* v2.218: Cleanup CLOSE_WAIT and LAST_ACK connections to prevent PBUF pool exhaustion
- * ══════════════════════════════════════════════════════════════════════════
- * Purpose: Automatically close connections stuck in closing states
- *
- * CLOSE_WAIT state:
- *   - Remote side (SCADA) sent FIN (requested close)
- *   - lwIP acknowledged the FIN and moved connection to CLOSE_WAIT
- *   - lwIP is waiting for application to call tcp_close()
- *   - Each connection holds ~27 PBUFs on average
- *
- * LAST_ACK state:
- *   - Application called tcp_close(), lwIP sent FIN
- *   - Waiting for ACK from remote side
- *   - If remote doesn't respond, connection stuck forever
- *   - Still holds PBUFs until final ACK received
- *
- * Root Cause of PBUF Leak:
- *   - 29 CLOSE_WAIT connections × 27 PBUFs = ~800/800 pool exhausted (v2.216)
- *   - v2.217 fixed CLOSE_WAIT but connections moved to LAST_ACK and got stuck
- *   - LAST_ACK connections never freed because SCADA doesn't ACK our FIN
- *   - Pool still exhausts: 6514 freed vs continuous allocations
- *
- * Solution (v2.218):
- *   - Use tcp_abort() instead of tcp_close() for CLOSE_WAIT
- *     - Immediate cleanup, no waiting for FIN handshake
- *     - Safe from main loop (NOT from callbacks!)
- *   - Also cleanup LAST_ACK connections (in case some remain)
- *     - Abort connections stuck in LAST_ACK state
- *     - Frees PBUFs immediately
- *
- * When to Call:
- *   - Every 5 seconds from main loop
- *   - Frequent enough to prevent pool exhaustion
- *
- * Safety:
- *   - tcp_abort() is SAFE from main loop context
- *   - tcp_abort() is UNSAFE from callbacks (would cause use-after-free)
- *   - We call it ONLY from main loop, never from callbacks
- *
- * Called from: Main loop (periodic cleanup)
- * ══════════════════════════════════════════════════════════════════════════
- */
 static void cleanup_close_wait_connections(void)
 {
     int close_wait_count = 0;
@@ -2401,14 +1827,6 @@ static void cleanup_close_wait_connections(void)
     }
 }
 
-/*
- * v2.242: ARP Proxy - Respond to ARP requests for proxied IPs
- *
- * Net0 pretends to be PLC (192.168.95.2) for SCADA health checks
- * When SCADA sends "Who has 192.168.95.2?", we reply with our MAC address
- *
- * Returns: true if ARP proxy handled the request, false to pass to lwIP
- */
 static bool arp_proxy_check_and_reply(struct pbuf *p, struct netif *inp)
 {
     struct eth_hdr *ethhdr = (struct eth_hdr *)p->payload;
@@ -2560,22 +1978,6 @@ static err_t custom_input_promiscuous(struct pbuf *p, struct netif *inp)
                 src_port = ntohs(tcphdr->src);
                 dest_port = ntohs(tcphdr->dest);
 
-                /* v2.231: DEBUG - Track where port 62977 packets go */
-                if (dest_port == 62977 || src_port == 62977) {
-                    DEBUG("%s: [DEBUG-62977] custom_input_promiscuous: %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u, pbuf=%p, will pass to ip_input\n",
-                          COMPONENT_NAME,
-                          (pkt_src_ip >> 24) & 0xFF, (pkt_src_ip >> 16) & 0xFF,
-                          (pkt_src_ip >> 8) & 0xFF, pkt_src_ip & 0xFF, src_port,
-                          (pkt_dest_ip >> 24) & 0xFF, (pkt_dest_ip >> 16) & 0xFF,
-                          (pkt_dest_ip >> 8) & 0xFF, pkt_dest_ip & 0xFF, dest_port,
-                          (void*)p);
-                }
-
-                /* v2.222: TCP leak handling removed per user request (breaks connection)
-                 * TCP packets to non-listening ports will be handled by lwIP
-                 * Note: This may cause pbuf leaks for TCP to wrong ports, but connection
-                 *       functionality takes precedence
-                 */
             } else if (IPH_PROTO(iphdr) == IP_PROTO_UDP) {
                 pbuf_udp_count++;  /* v2.203: Track UDP packets */
             } else if (IPH_PROTO(iphdr) == IP_PROTO_ICMP && p->len >= 20 + 8) {
@@ -2588,28 +1990,12 @@ static err_t custom_input_promiscuous(struct pbuf *p, struct netif *inp)
 
                     /* Store metadata so TX path can restore source IP */
                     icmp_metadata_store(pkt_dest_ip, icmp_id, icmp_seq);
-
-                    DEBUG("%s: [ICMP-RX] Ping to %u.%u.%u.%u (id=%u, seq=%u) - metadata stored\n",
-                           COMPONENT_NAME,
-                           (pkt_dest_ip >> 24) & 0xFF, (pkt_dest_ip >> 16) & 0xFF,
-                           (pkt_dest_ip >> 8) & 0xFF, pkt_dest_ip & 0xFF,
-                           icmp_id, icmp_seq);
                 }
                 pbuf_other_count++;  /* v2.203: Track ICMP packets */
             } else {
                 pbuf_other_count++;  /* v2.203: Track other IP protocols */
             }
 
-            /* If packet is not destined for our interface IP, rewrite it */
-            /* v2.95: CRITICAL FIX - Create metadata for ALL TCP connections!
-             * ═══════════════════════════════════════════════════════════════════
-             * BUG: Original code only created metadata if pkt_dest_ip != interface_ip
-             * Problem: When SCADA connects directly to interface IP (192.168.96.2:502),
-             * no metadata is created → responses can't find SCADA connection!
-             *
-             * Fix: Create metadata for ALL TCP connections, regardless of dest IP
-             * This ensures we can route responses back to SCADA even for direct connections
-             */
             if (IPH_PROTO(iphdr) == IP_PROTO_TCP && src_port != 0 && dest_port != 0) {
                 /* Check if we already have metadata for this connection */
                 struct connection_metadata *meta = connection_lookup_by_tuple(
@@ -2617,36 +2003,8 @@ static err_t custom_input_promiscuous(struct pbuf *p, struct netif *inp)
 
                 if (!meta) {
                     /* New connection - store metadata */
-                    #if DEBUG_METADATA
-                    DEBUG("%s: 📝 RX: Storing NEW metadata: src=%u.%u.%u.%u:%u dest=%u.%u.%u.%u:%u\n",
-                           COMPONENT_NAME,
-                           (pkt_src_ip >> 24) & 0xFF, (pkt_src_ip >> 16) & 0xFF,
-                           (pkt_src_ip >> 8) & 0xFF, pkt_src_ip & 0xFF, src_port,
-                           (pkt_dest_ip >> 24) & 0xFF, (pkt_dest_ip >> 16) & 0xFF,
-                           (pkt_dest_ip >> 8) & 0xFF, pkt_dest_ip & 0xFF, dest_port);
-                    #endif
                     connection_add(pkt_src_ip, pkt_dest_ip, src_port, dest_port);
                 } else if (!meta->active) {
-                    /* v2.196: CRITICAL FIX - Don't increment connection_count on resurrection!
-                     * ═══════════════════════════════════════════════════════════════════════════
-                     * Root Cause (v2.195 analysis):
-                     * - Resurrection reuses existing slot, not a "new" connection
-                     * - tcp_accept() won't be called again (lwIP already processed original SYN)
-                     * - Result: resurrected connection stuck with pcb=NULL, no callbacks
-                     * - No cleanup path exists → LEAK!
-                     *
-                     * Evidence from v2.195 logs:
-                     * - 772 [COUNT++] operations (299 connection_add + 473 RESURRECT)
-                     * - 270 [COUNT--] operations (only from connection_add path!)
-                     * - 502 connections leaked (exactly matches 772 - 270!)
-                     *
-                     * Fix: DON'T increment connection_count on resurrection
-                     * - Resurrection reuses slot (connection already counted by connection_add)
-                     * - Only connection_add() should increment count
-                     * - Cleanup only happens for connection_add() connections
-                     * - This prevents leak: only count connections with cleanup path
-                     * ═══════════════════════════════════════════════════════════════════════════
-                     */
                     DEBUG("%s: [RESURRECT] Reactivating slot for port %u→%u (old session=%u)\n",
                            COMPONENT_NAME, src_port, dest_port, meta->session_id);
 
@@ -2670,10 +2028,6 @@ static err_t custom_input_promiscuous(struct pbuf *p, struct netif *inp)
                     meta->pending_outbound_len = 0;
                     meta->has_pending_outbound = false;
 
-                    /* v2.196: DO NOT increment connection_count on resurrection!
-                     * Resurrection reuses existing slot - connection already counted.
-                     * Only connection_add() creates new connections and has cleanup path.
-                     */
                     DEBUG("%s: [RESURRECT] session=%u port=%u→%u (count unchanged: %u, slot reused)\n",
                            COMPONENT_NAME, meta->session_id, src_port, dest_port,
                            connection_count);
@@ -2941,8 +2295,6 @@ static void process_rx_packets(void)
          * With memory barrier fix, invalid lengths should be VERY rare (real hardware corruption)
          */
         if (len < VIRTIO_NET_HDR_SIZE || len > (1514 + VIRTIO_NET_HDR_SIZE)) {
-            DEBUG_WARN("%s: [WARN]  INVALID packet length: %u bytes (expected %u-%u)\n",
-                   COMPONENT_NAME, len, VIRTIO_NET_HDR_SIZE, 1514 + VIRTIO_NET_HDR_SIZE);
             DEBUG("%s:     desc_idx=%u, used_ring_idx=%u, last_used_idx=%u, current_used_idx=%u\n",
                    COMPONENT_NAME, desc_idx, used_ring_idx, last_used_idx, current_used_idx);
 
@@ -3323,14 +2675,6 @@ static void process_rx_packets(void)
         last_used_idx++;
     }
 
-    /* v2.204: Pbuf statistics moved INSIDE packet loop (see line 2315) */
-
-    refill_rx_queue();
-
-    /* v2.137: Track function exit (after processing all packets) */
-    BREADCRUMB(8011);  /* process_rx_packets exit */
-
-    /* v2.138: Clear reentrancy guard before returning */
     in_rx_processing = false;
 }
 
@@ -3350,30 +2694,6 @@ static void tcp_echo_err(void *arg, err_t err)
         default:           err_name = "UNKNOWN"; break;
     }
 
-    /* v2.146: CRITICAL FIX - Send close notification to Net1 from error callback!
-     * ═══════════════════════════════════════════════════════════════════════════
-     * ROOT CAUSE OF NET1 PCB POOL EXHAUSTION:
-     *
-     * Problem (v2.143-v2.145):
-     * - tcp_echo_err() did NOTHING, just printed "will be cleaned by recv(p=NULL)"
-     * - recv(p=NULL) is NEVER called by lwIP after tcp_abort()
-     * - NO close notifications sent to Net1
-     * - Net1's PCB pool stays full → "Failed to create TCP PCB" after ~100 connections
-     *
-     * Evidence from logs:
-     * - 0 close notifications sent
-     * - Net0 active_connections goes to 0 (Net0 cleans up)
-     * - But Net1 PCB pool exhausted (Net1 never cleans up)
-     *
-     * Fix: tcp_echo_err() MUST send close notification
-     * - tcp_arg now passes metadata (line 2699)
-     * - Error callback can access connection info
-     * - Send close notification to Net1 (same as recv callback)
-     * - Call connection_cleanup_atomic to clean up Net0
-     * - Net1 receives notification and cleans up its PCB ✓
-     * ═══════════════════════════════════════════════════════════════════════════
-     */
-
     struct connection_metadata *meta = (struct connection_metadata *)arg;
 
     DEBUG_WARN("%s: [WARN]  TCP connection error - err=%d (%s)\n", COMPONENT_NAME, err, err_name);
@@ -3384,21 +2704,6 @@ static void tcp_echo_err(void *arg, err_t err)
         return;
     }
 
-    /* v2.149: CRITICAL - Check if this is a STALE callback for a reused metadata slot!
-     * ═══════════════════════════════════════════════════════════════════════════
-     * Problem: Port reuse causes metadata slot reuse
-     * 1. Old connection closes → cleanup happens → meta->active = false, cleanup_in_progress = true
-     * 2. New connection opens with SAME port → connection_add() reuses slot
-     * 3. connection_add() resets cleanup_in_progress = false (line 1026)
-     * 4. Old connection's ERROR CALLBACK finally fires (delayed by lwIP)
-     * 5. Callback passes same metadata pointer → looks like new connection
-     * 6. Cleanup runs AGAIN → active_connections-- for connection that already decremented!
-     *
-     * Solution: If cleanup_in_progress is FALSE but active is FALSE, this is STALE callback
-     * - meta->active = false means connection was already cleaned up
-     * - Old callback should be IGNORED
-     * ═══════════════════════════════════════════════════════════════════════════
-     */
     if (!meta->active) {
         DEBUG("%s: Stale error callback for already-cleaned connection (ignoring)\n",
                COMPONENT_NAME);
@@ -3414,54 +2719,20 @@ static void tcp_echo_err(void *arg, err_t err)
         meta->awaiting_response = false;
     }
 
-    /* v2.192: Error callback now only handles actual errors
-     * ═══════════════════════════════════════════════════════════════════════════
-     * Simplified from v2.180-v2.191:
-     * - Old: Error callback handled deferred cleanup (meta->closing=true path)
-     * - New: Poll callback cleans up immediately, error callback just for errors
-     *
-     * This callback fires when:
-     * - SCADA sends RST (connection aborted)
-     * - Connection times out
-     * - lwIP internal error
-     *
-     * NOT called anymore for:
-     * - Normal close (poll callback handles it now)
-     * ═══════════════════════════════════════════════════════════════════════════
-     */
     DEBUG("%s:    → SCADA connection error (session %u, err=%d) - cleaning up\n",
            COMPONENT_NAME, meta->session_id, err);
 
-    /* STEP 1: Check for guard flag (prevent double-cleanup) */
     if (meta->cleanup_in_progress) {
-        BREADCRUMB(9320);  /* Error callback blocked by guard */
         DEBUG("%s: GUARD: Cleanup already in progress (prevented double-cleanup)\n",
                COMPONENT_NAME);
         return;
     }
 
-    /* STEP 2: Update shared state BEFORE sending notification (v2.144 fix) */
     update_shared_connection_state();
 
-    /* STEP 3: Enqueue close notification to Net1 (v2.153)
-     * ═══════════════════════════════════════════════════════════════════════
-     * Uses control queue instead of overwriting request_msg.
-     * Prevents race where close notification overwrites pending request.
-     *
-     * v2.192: Simplified - poll callback always sends notification before cleanup,
-     * so this path only handles unexpected error cases
-     * ═══════════════════════════════════════════════════════════════════════
-     */
     if (inbound_dp != NULL && !meta->close_notified) {
         InboundDataport *dp = (InboundDataport *)inbound_dp;
 
-        /* Enqueue close notification with error code
-         * v2.175: Pass ERR_RST vs ERR_CLSD to enable symmetrical close behavior
-         * - If SCADA sent RST (err == ERR_RST): Net1 should send RST to PLC (tcp_abort)
-         * - If SCADA sent FIN (err == ERR_CLSD): Net1 should send FIN to PLC (tcp_close)
-         * This prevents Net1 PCB pool exhaustion in ICS environments where
-         * SCADA sends FIN+RST and PLC network stops responding.
-         */
         bool success = control_queue_enqueue(
             &dp->close_queue,
             meta->session_id,
@@ -3472,10 +2743,6 @@ static void tcp_echo_err(void *arg, err_t err)
         if (success) {
             meta->close_notified = true;  /* Set dedup flag */
 
-            /* v2.188-sentinel: Mark as close-only notification
-             * Error callback means connection terminated, no request data to send
-             * Set sentinel for defensive programming and consistency
-             */
             dp->request_msg.payload_length = 0;  /* Sentinel: close-only, no payload */
             dp->request_msg.metadata.session_id = meta->session_id;
             __sync_synchronize();  /* Memory barrier - ensure sentinel visible before signal */
@@ -3500,86 +2767,21 @@ static void tcp_echo_err(void *arg, err_t err)
                COMPONENT_NAME, meta->session_id);
     }
 
-    /* STEP 4: Enqueue cleanup (will be processed by main loop)
-     * v2.193: Queue-based cleanup - no more direct cleanup calls from callbacks */
     enqueue_cleanup(meta->session_id);
-
-    /* NOTE: PCB is already freed by lwIP - DO NOT access it! */
 }
 
 /*
  * TCP Echo callbacks
  */
 
-/*
- * v2.111: TCP sent callback - Send pending outbound data from lwIP context
- * ══════════════════════════════════════════════════════════════════════════
- * This callback is called by lwIP when data is ACKed by remote peer.
- * We use it to check if there's pending outbound data queued by
- * outbound_ready_handle() and send it from safe lwIP callback context.
- *
- * WHY: Prevents race condition between tcp_write() and lwIP timers
- * ══════════════════════════════════════════════════════════════════════════
- */
 static err_t tcp_echo_sent(void *arg, struct tcp_pcb *pcb, u16_t len)
 {
-    /* v2.163: REMOVED pending outbound data mechanism
-     * ═══════════════════════════════════════════════════════════════════════════
-     * Old design (v2.111-v2.162): tcp_sent callback sent pending data
-     * - Bug: Callback never fired if SCADA closed before PLC responded
-     * - Result: Response never sent, connection hung
-     *
-     * New design (v2.163): outbound_ready_handle sends immediately
-     * - No pending data mechanism needed
-     * - tcp_sent callback now just returns ERR_OK (lwIP requires it registered)
-     * ═══════════════════════════════════════════════════════════════════════════
-     */
     return ERR_OK;
 }
 
 static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err)
 {
     if (p == NULL) {
-        /* v2.115: CRITICAL FIX - Connection closed by remote peer
-         * ═══════════════════════════════════════════════════════════════════════
-         * CORRECT lwIP protocol for connection close:
-         *
-         * lwIP Documentation (tcp.h:71-82):
-         *   "Only return ERR_ABRT if you have called tcp_abort from within the
-         *    callback function!"
-         *
-         * lwIP Documentation (tcp.c:628-633):
-         *   "When calling this from one of the TCP callbacks, make sure you always
-         *    return ERR_ABRT (and never return ERR_ABRT otherwise or you will risk
-         *    accessing deallocated memory or memory leaks!)"
-         *
-         * Previous Bug (v2.81-v2.114):
-         * - We returned ERR_ABRT WITHOUT calling tcp_abort()
-         * - lwIP assumed we aborted, jumped to cleanup
-         * - But PCB was still in tcp_active_pcbs list!
-         * - Next packet arrived, lwIP tried to cache PCB
-         * - Found PCB in inconsistent state → assertion failed
-         *   "tcp_input: pcb->next != pcb (before cache)"
-         * - With default assert handler: abort() called → Net0 DEAD
-         *
-         * Correct Pattern (from lwIP examples):
-         * 1. Save PCB data BEFORE closing (PCB becomes invalid after tcp_close/abort)
-         * 2. Call tcp_close(pcb) to close gracefully
-         * 3. If tcp_close() fails, call tcp_abort(pcb) and return ERR_ABRT
-         * 4. If tcp_close() succeeds, return ERR_OK (NOT ERR_ABRT!)
-         *
-         * References:
-         * - apps/http/altcp_proxyconnect.c:223-228
-         * - apps/mqtt/mqtt.c:537-552
-         * ═══════════════════════════════════════════════════════════════════════
-         */
-
-        /* v2.115: STEP 1 - Find metadata FIRST (contains all connection info)
-         * CRITICAL: NEVER access PCB fields directly! (See CRITICAL_LESSON_PCB_ACCESS.md)
-         * - Accessing PCB fields can crash if lwIP frees PCB during access
-         * - Metadata already has all connection info (stored during accept)
-         * - Use metadata instead of PCB fields for safety
-         */
         struct connection_metadata *meta = NULL;
         for (int i = 0; i < MAX_CONNECTIONS; i++) {
             if (connection_table[i].active && connection_table[i].pcb == pcb) {
@@ -3601,14 +2803,7 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
             return ERR_OK;
         }
 
-        /* v2.143: Guard flag check - prevent recursive cleanup
-         * ═══════════════════════════════════════════════════════════════════════
-         * If tcp_close() triggers this callback recursively, guard flag will be set
-         * Return early to avoid double-cleanup
-         * ═══════════════════════════════════════════════════════════════════════
-         */
         if (meta->cleanup_in_progress) {
-            BREADCRUMB(9310);  /* Recursive recv(p=NULL) blocked by guard */
             DEBUG("%s: GUARD: recv(p=NULL) called recursively - cleanup already in progress\n",
                    COMPONENT_NAME);
             return ERR_OK;
@@ -3622,105 +2817,8 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
                meta->src_port);
         #endif
 
-        /* v2.143: Design Change - Immediate cleanup instead of delayed cleanup
-         * ═══════════════════════════════════════════════════════════════════════
-         * OLD DESIGN (v2.90-v2.142): "Keep metadata alive"
-         *   - Set pcb=NULL but keep active=true
-         *   - Metadata cleaned up later by connection_cleanup_stale()
-         *   - Goal: Detect responses arriving after SCADA closes
-         *
-         * Problem with old design:
-         *   - Multiple cleanup paths led to double-decrement bugs
-         *   - Counter management became complex and error-prone
-         *   - "Ticking time bomb" in v2.142: counter underflowed to 0
-         *
-         * NEW DESIGN (v2.143): "Immediate atomic cleanup"
-         *   - connection_cleanup_atomic() handles ALL cleanup
-         *   - Guard flag prevents double-cleanup
-         *   - Counters managed in single location
-         *   - If response arrives after close: metadata not found → can't send (connection already closed anyway)
-         *
-         * Trade-off: Slight simplification (responses after close are dropped)
-         * Benefit: Eliminates entire class of double-decrement bugs
-         * ═══════════════════════════════════════════════════════════════════════
-         */
-
-        /* v2.144: STEP 2 - Update shared state BEFORE sending notification
-         * ═══════════════════════════════════════════════════════════════════════
-         * RACE CONDITION FIX: Net1 PCB pool exhaustion
-         *
-         * Problem in v2.143:
-         *   1. Send close notification to Net1
-         *   2. Call connection_cleanup_atomic()
-         *   3. connection_cleanup_atomic() sets meta->active = false
-         *   4. connection_cleanup_atomic() calls update_shared_connection_state()
-         *   5. Connection removed from Net0's peer_state
-         *   6. Net1 receives notification, checks Net0's peer_state
-         *   7. Connection NOT FOUND! Net1 thinks it's stale, ignores it
-         *   8. Net1 PCB never closed → pool exhausted!
-         *
-         * Evidence from v2.143 test:
-         *   - 116 close notifications sent
-         *   - 91 ignored as "stale" (78%!)
-         *   - Result: Net1 PCB pool exhausted (100/100)
-         *
-         * Fix: Update shared state BEFORE sending notification
-         *   1. Call update_shared_connection_state() explicitly (connection visible)
-         *   2. Send close notification to Net1
-         *   3. Net1 receives notification, checks Net0's peer_state
-         *   4. Connection FOUND! Net1 processes notification ✓
-         *   5. Net1 closes its PCB ✓
-         *   6. Later: connection_cleanup_atomic() removes from shared state
-         * ═══════════════════════════════════════════════════════════════════════
-         */
         update_shared_connection_state();  /* Ensure connection visible in peer_state */
 
-        /* v2.153: STEP 3 - Keep BOTH sides alive to await PLC response
-         * ═══════════════════════════════════════════════════════════════════════
-         * CRITICAL FIX: Don't send close notification yet!
-         *
-         * Problem in v2.151-initial:
-         *   1. SCADA closes → Net0 sets awaiting_response=true (keeps connection alive)
-         *   2. But Net0 SENDS close notification to Net1 anyway
-         *   3. Net1 receives notification → calls tcp_abort() → PLC connection closed!
-         *   4. PLC response arrives but connection already closed → DROPPED!
-         *
-         * Solution: Keep BOTH sides alive until response arrives
-         *   1. SCADA closes → set awaiting_response=true
-         *   2. DON'T send close notification to Net1 yet
-         *   3. Net0 keeps SCADA connection in CLOSE_WAIT (can still send)
-         *   4. Net1 keeps PLC connection alive (no notification received)
-         *   5. PLC response arrives → Net0 sends to SCADA
-         *   6. AFTER sending → Net0 sends close notification to Net1
-         *   7. Net1 closes PLC connection
-         *   8. Net0 closes SCADA connection
-         *
-         * Key Insight: Close notification should be DEFERRED until response is sent
-         * - Don't notify Net1 until we're done with the connection
-         * - This keeps PLC connection alive for the response
-         * - After response sent, we send close notification and both sides close
-         *
-         * TCP half-close on Net0:
-         * - SCADA sent FIN → connection in CLOSE_WAIT state
-         * - We can still send data (the PLC response)
-         * - After sending, we call tcp_close() to send our FIN
-         * ═══════════════════════════════════════════════════════════════════════
-         */
-
-        /* v2.189: Check if response already received (fix race condition)
-         * ═══════════════════════════════════════════════════════════════════════
-         * Race condition: SCADA closes AFTER response arrives but BEFORE processing
-         *
-         * Timeline:
-         *   T+0ms: SCADA sends request
-         *   T+55ms: PLC response arrives → response_received=true
-         *   T+100ms: SCADA sends FIN (closes) → tcp_echo_recv(p=NULL) fires
-         *   T+105ms: Check: response_received? YES! → Skip awaiting mode
-         *
-         * If we blindly set awaiting_response=true, we'd keep connection alive
-         * even though response already arrived. This causes pool exhaustion!
-         * ═══════════════════════════════════════════════════════════════════════
-         */
         if (meta->response_received) {
             /* Response already arrived and processed - proceed with normal close */
             DEBUG("%s: SCADA closed AFTER response received - proceeding with normal close (session %u)\n",
@@ -3756,29 +2854,6 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
                        COMPONENT_NAME, meta->session_id);
             }
 
-            /* v2.197: CRITICAL FIX - Close lwIP PCB before cleanup!
-             * ═══════════════════════════════════════════════════════════════════════════
-             * BUG in v2.196: recv(p=NULL) path never called tcp_close(pcb)
-             * - Sent close notification to Net1 ✅
-             * - Enqueued metadata cleanup ✅
-             * - BUT: Never told lwIP to close PCB ❌
-             *
-             * Result: lwIP PCB leaked forever
-             * - Our metadata: cleaned up (connection_count accurate)
-             * - lwIP's PCB: still active, consuming memory
-             * - Symptom: connection_count=23 but lwIP out of pbufs!
-             *
-             * Evidence from v2.196 test:
-             * - Net0: 335 [COUNT++], 311 [COUNT--] (counter accurate!)
-             * - But: lwIP out of memory at packet #2182
-             * - Root cause: Hundreds of unclosed lwIP PCBs
-             *
-             * Fix: Call tcp_close(pcb) like poll callback does (line 3367)
-             * - Graceful close with FIN handshake
-             * - If tcp_close() fails, fallback to tcp_abort()
-             * - lwIP frees PCB and memory properly
-             * ═══════════════════════════════════════════════════════════════════════════
-             */
             err_t close_err = tcp_close(pcb);
             if (close_err != ERR_OK) {
                 DEBUG_WARN("%s:   [WARN] tcp_close failed (err=%d) - using tcp_abort\n",
@@ -3787,31 +2862,6 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
                 /* Note: tcp_abort() doesn't return - PCB freed immediately */
             }
 
-            /* v2.209 COMPLETE: CRITICAL FIX - Don't call enqueue_cleanup()!
-             * ═══════════════════════════════════════════════════════════════════════════
-             * BUG in v2.193-v2.208: Called enqueue_cleanup() when response_received=true
-             *
-             * Problem:
-             *   - response_received=true means tcp_write() was called
-             *   - But tcp_write() only QUEUES data in lwIP, doesn't transmit!
-             *   - enqueue_cleanup() → process_cleanup_queue() → meta->active=FALSE
-             *   - Then netif_output() tries to transmit → "TX: No metadata" ❌
-             *
-             * Timeline of the bug:
-             *   T+20ms: PLC response arrives, tcp_write() queued, response_received=TRUE
-             *   T+21ms: SCADA FIN arrives, this path executes
-             *   T+21ms: enqueue_cleanup() queued ❌ BUG!
-             *   T+22ms: process_cleanup_queue() → meta->active=FALSE ❌
-             *   T+25ms: netif_output() → metadata NOT FOUND ❌
-             *
-             * Fix: Use delayed cleanup instead
-             *   - Set metadata_close_pending = TRUE
-             *   - Let check_pending_cleanups() handle it after TX idle >1s
-             *   - process_cleanup_queue() will see close_pending and skip
-             *
-             * Result: Metadata persists until transmission complete ✅
-             * ═══════════════════════════════════════════════════════════════════════════
-             */
             meta->metadata_close_pending = true;
             meta->close_timestamp = sys_now();
 
@@ -3838,39 +2888,12 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
                COMPONENT_NAME, active_connections);
         #endif
 
-        /* DON'T call connection_cleanup_atomic() - keep metadata alive!
-         * DON'T call tcp_close() - keep PCB alive in CLOSE_WAIT state!
-         * lwIP will keep the connection open so we can send the response */
-
-        /* v2.209: Set delayed cleanup flag (fix pbuf leak)
-         * ═══════════════════════════════════════════════════════════════════════
-         * Mark that SCADA closed but keep metadata alive for TX path
-         * Cleanup will occur in check_pending_cleanups() after TX completes
-         * ═══════════════════════════════════════════════════════════════════════
-         */
         meta->metadata_close_pending = true;
         meta->close_timestamp = sys_now();
 
-        BREADCRUMB(9200);  /* v2.153: awaiting_response mode */
-
-        /* Return ERR_OK to keep connection in CLOSE_WAIT state
-         * Connection stays open for sending response */
         return ERR_OK;
     }
 
-    /* v2.240: CENTRALIZED PBUF CLEANUP PATTERN
-     * ═══════════════════════════════════════════════════════════════════════════
-     * Problem in v2.157-v2.239:
-     * - Multiple return paths: some called pbuf_free(p), some didn't
-     * - Result: pbuf leaks on early returns + PCB corruption from double-free
-     *
-     * Solution (v2.240): Single-exit-point pattern
-     * - All code paths set 'result' and goto cleanup
-     * - Centralized pbuf_free() at cleanup label
-     * - lwIP contract: Application MUST free pbuf when returning ERR_OK
-     *   (See tcp_in.c:1633-1636 - "responsibility of the application")
-     * ═══════════════════════════════════════════════════════════════════════════
-     */
     err_t result = ERR_OK;  /* Default return value */
 
     /* Early error check - pass through to lwIP */
@@ -3880,30 +2903,8 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
         goto cleanup;  /* lwIP will handle pbuf (stores in refused_data) */
     }
 
-    /* v2.131: CRITICAL FIX - Unconditional stale callback check
-     * Problem: lwIP calls tcp_echo_recv TWICE with same pbuf → double-free
-     * Solution: Early metadata lookup + pbuf ref count guard at end */
-
     struct connection_metadata *meta_early = connection_lookup_by_pcb(pcb);
 
-    /* v2.191: CRITICAL FIX - Fallback lookup by port if PCB not linked yet
-     * ═══════════════════════════════════════════════════════════════════════
-     * Race Condition: Data arrives before tcp_echo_accept links PCB
-     *
-     * Scenario:
-     * 1. SYN arrives → netif_input creates metadata (assigns session_id)
-     * 2. SCADA sends data IMMEDIATELY (before tcp_echo_accept is called)
-     * 3. tcp_echo_recv fires
-     * 4. Looks up metadata by PCB → NULL (PCB not linked yet!)
-     * 5. Fallback to session_id=0 → "TX: No metadata" errors
-     * 6. Connection leak
-     *
-     * Fix: If PCB lookup fails, try lookup by port numbers
-     * - netif_input already created metadata with correct session_id
-     * - Just need to find it by (src_port, dest_port) instead of PCB
-     * - This handles the window between netif_input and connection_link_pcb
-     * ═══════════════════════════════════════════════════════════════════════
-     */
     if (meta_early == NULL) {
         /* PCB not linked yet - try lookup by port numbers */
         meta_early = connection_lookup_by_tuple(
@@ -3929,14 +2930,10 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
 
     bool metadata_valid_for_processing = (meta_early != NULL && meta_early->active);
 
-    /* ═══ Forward TCP data to ICS_Inbound (INBOUND path) ═══ */
-
 
     /* CRITICAL: Check if dataport is properly mapped by CAmkES */
     if (inbound_dp == NULL) {
         DEBUG_ERROR("%s: [ERR] FATAL: inbound_dp is NULL! CAmkES dataport not mapped\n", COMPONENT_NAME);
-        DEBUG("%s:    This indicates seL4 capability/memory allocation failure\n", COMPONENT_NAME);
-        BREADCRUMB(9002);  /* Dataport NULL */
         result = ERR_MEM;  /* v2.240: lwIP will store in refused_data, don't free */
         goto cleanup;
     }
@@ -3964,29 +2961,8 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
     /* Extract IP addresses - need ORIGINAL destination IP from connection tracking */
     ics_msg->metadata.src_ip = ntohl(ip4_addr_get_u32(&pcb->remote_ip));
 
-    /* CRITICAL: Look up original destination IP from connection tracking table
-     * pcb->local_ip is the REWRITTEN IP (192.168.96.2) used by lwIP
-     * We need the ORIGINAL PLC IP (e.g., 192.168.95.2) for Net1 to connect to
-     *
-     * v2.131: Use meta_early from above (already looked up at line 2191) */
     struct connection_metadata *meta = meta_early;  /* v2.131: Reuse early lookup */
     if (meta != NULL && meta->active) {
-        /* v2.125: CRITICAL FIX - Check if PCB is closed before processing data
-         * ═══════════════════════════════════════════════════════════════════════
-         * Problem: Race condition between tcp_close() and queued callbacks
-         *
-         * Sequence causing double-free:
-         * 1. tcp_echo_recv(p=NULL) called (SCADA closed)
-         * 2. meta->pcb set to NULL (line 2075)
-         * 3. tcp_close(pcb) called and frees pbufs
-         * 4. THEN tcp_echo_recv(p=DATA) fires with already-freed pbuf
-         * 5. Code processes data and calls pbuf_free(p) at line 2338
-         * 6. CRASH: pbuf->ref already 0 (already freed by tcp_close)
-         *
-         * Solution: Check if meta->pcb is NULL (connection closed)
-         * If closed, the data is stale - free pbuf and return early
-         * ═══════════════════════════════════════════════════════════════════════
-         */
         if (meta->pcb == NULL) {
             DEBUG_WARN("%s: [WARN]  tcp_echo_recv: Connection already closed (meta->pcb=NULL), dropping %u bytes\n",
                    COMPONENT_NAME, p->len);
@@ -4057,10 +3033,6 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
     DEBUG("   Action: Signaling ICS_Inbound component via inbound_ready_emit()\n");
     #endif
 
-    /* v2.92: Mark that we're waiting for a response - don't cleanup metadata yet!
-     * This prevents connection_cleanup_stale() from removing metadata while
-     * the request is in flight and we're waiting for PLC response.
-     * Note: meta was already looked up earlier (line 1938) */
     if (meta != NULL) {
         meta->awaiting_response = true;
     }
@@ -4076,13 +3048,6 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
     /* Tell TCP we've processed the data */
     tcp_recved(pcb, p->len);
 
-    /* v2.111: Check for pending outbound data and send from lwIP callback context
-     * ══════════════════════════════════════════════════════════════════════════
-     * After processing inbound request, check if there's a queued PLC response
-     * that needs to be sent. Since we're in tcp_echo_recv (lwIP callback),
-     * it's SAFE to call tcp_write here (no race with timers).
-     * ══════════════════════════════════════════════════════════════════════════
-     */
     if (meta != NULL && meta->has_pending_outbound && meta->pending_outbound_data != NULL) {
         DEBUG("%s: [CALLBACK] tcp_echo_recv: Found pending outbound (%u bytes), sending NOW\n",
                COMPONENT_NAME, meta->pending_outbound_len);
@@ -4102,10 +3067,6 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
             meta->has_pending_outbound = false;
             meta->awaiting_response = false;
 
-            /* v2.113: CRITICAL - Check PCB is still valid before tcp_output()
-             * Callbacks can fire AFTER connection is closed. If meta->pcb is NULL
-             * or doesn't match callback pcb, the connection was closed and PCB is freed.
-             * Calling tcp_output() on freed PCB → NULL pointer crash! */
             if (meta->pcb == pcb && meta->pcb != NULL) {
                 tcp_output(pcb);
             } else {
@@ -4113,22 +3074,6 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
                        COMPONENT_NAME, meta->pcb, pcb);
             }
 
-            /* v2.158: Set close_pending flag (lwIP best practice - deferred close)
-             * ══════════════════════════════════════════════════════════════════════════
-             * Response has been sent to SCADA. Now we need to close the connection.
-             *
-             * CRITICAL: Cannot call tcp_close() from recv callback (Rule 5 violation!)
-             *
-             * Solution: Set close_pending flag, let poll callback handle it
-             *   1. Set flag here (safe - just setting boolean)
-             *   2. Return ERR_OK from this callback (normal flow)
-             *   3. Poll callback fires later (~2 seconds with interval=4)
-             *   4. Poll callback detects flag → sends close notification → returns ERR_ABRT
-             *   5. lwIP calls tcp_abort() internally → connection closed safely
-             *
-             * This follows lwIP Rule 6 Solution A: close_pending flag pattern
-             * ══════════════════════════════════════════════════════════════════════════
-             */
             meta->close_pending = true;
             meta->close_timestamp = sys_now();  /* v2.181: Record timestamp for latency measurement */
 
@@ -4146,29 +3091,6 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
     /* Fall through to cleanup */
 
 cleanup:
-    /* v2.240: CENTRALIZED PBUF CLEANUP
-     * ═══════════════════════════════════════════════════════════════════════════
-     * lwIP Pbuf Ownership Contract (tcp_in.c:1633-1636):
-     * --------------------------------------------------
-     * "Since this pbuf now is the responsibility of the application,
-     *  we delete our reference to it so that we won't (mistakingly) deallocate it."
-     *
-     * When recv callback is called with pbuf 'p':
-     * - Application OWNS the pbuf (lwIP sets inseg.p = NULL)
-     * - If callback returns ERR_OK: Application MUST call pbuf_free(p)
-     * - If callback returns ERR_MEM: lwIP stores in refused_data (lwIP will free)
-     * - If callback returns ERR_ABRT: lwIP handles cleanup (lwIP will free)
-     *
-     * This cleanup section implements the contract correctly:
-     * - Only free pbuf when returning ERR_OK
-     * - For other error codes, lwIP handles the pbuf
-     *
-     * Why this fixes both bugs:
-     * - v2.157-v2.236: Early returns without pbuf_free() → PBUF LEAK
-     * - v2.237-v2.239: pbuf_free() only at end → early returns still leaked
-     * - v2.240: ALL paths goto cleanup → pbuf freed for ERR_OK, prevents leaks
-     * ═══════════════════════════════════════════════════════════════════════════
-     */
     if (result == ERR_OK && p != NULL) {
         pbuf_free(p);
     }
@@ -4176,22 +3098,6 @@ cleanup:
     return result;
 }
 
-/* v2.158: TCP poll callback for deferred connection cleanup
- * ═══════════════════════════════════════════════════════════════════════════
- * Purpose: Handle close_pending flag set by recv callback after sending response
- *
- * Why we need this:
- * - Cannot call tcp_close() from recv callback (lwIP Rule 5 violation)
- * - Poll callback runs in safe lwIP context
- * - Fires periodically (~2 seconds with interval=4 in tcp_echo_accept)
- *
- * Pattern (lwIP Rule 6, Solution A):
- * 1. Recv callback sends response → sets close_pending = true
- * 2. This poll callback detects flag
- * 3. Sends close notification to Net1 (so Net1 closes PLC connection)
- * 4. Returns ERR_ABRT → lwIP handles tcp_abort() internally
- * ═══════════════════════════════════════════════════════════════════════════
- */
 static err_t tcp_echo_poll(void *arg, struct tcp_pcb *pcb)
 {
     struct connection_metadata *meta = (struct connection_metadata *)arg;
@@ -4201,21 +3107,6 @@ static err_t tcp_echo_poll(void *arg, struct tcp_pcb *pcb)
         return ERR_OK;
     }
 
-    /* v2.166: Flush pending outbound data (deferred from event handler)
-     * ═══════════════════════════════════════════════════════════════════════════
-     * This handles data queued by outbound_ready_handle() (CAmkES event handler).
-     *
-     * Why deferred:
-     * - outbound_ready_handle is interrupt-like (can fire during lwIP processing)
-     * - Calling tcp_output() from event handler causes reentrancy → CRASH
-     * - Solution: Event handler sets flag, poll callback flushes safely
-     *
-     * Safety:
-     * - Poll callback runs in lwIP timer context (no reentrancy)
-     * - tcp_write() already queued data, we just need to flush
-     * - This follows lwIP NO_SYS=1 threading model
-     * ═══════════════════════════════════════════════════════════════════════════
-     */
     if (meta->has_pending_outbound) {
         #if DEBUG_TRAFFIC
         DEBUG("%s: Poll callback flushing pending outbound data (session %u)\n",
@@ -4233,21 +3124,6 @@ static err_t tcp_echo_poll(void *arg, struct tcp_pcb *pcb)
         #endif
     }
 
-    /* v2.180: Deferred metadata cleanup (fix metadata/lwIP packet race)
-     * ═══════════════════════════════════════════════════════════════════════════
-     * Check if close was requested
-     *
-     * KEY CHANGE: We NO LONGER cleanup metadata here!
-     * - Old behavior (v2.179): connection_cleanup_atomic() + return ERR_ABRT
-     * - Problem: lwIP still sends FIN/RST after cleanup → no metadata for TX
-     * - Result: 1,170 metadata failures, packets sent with wrong source IP
-     *
-     * New behavior (v2.180): tcp_close() + mark closing=true
-     * - Keep metadata alive while lwIP completes close handshake
-     * - Metadata available for ALL lwIP packets (FIN, ACK, retransmissions)
-     * - Error callback will cleanup when lwIP frees PCB
-     * ═══════════════════════════════════════════════════════════════════════════
-     */
     if (meta->close_pending) {
         DEBUG("%s: Poll callback detected close_pending (session %u)\n",
                COMPONENT_NAME, meta->session_id);
@@ -4269,10 +3145,6 @@ static err_t tcp_echo_poll(void *arg, struct tcp_pcb *pcb)
             /* Commit to queue */
             in_dp->close_queue.head = head + 1;
 
-            /* v2.188-sentinel: Mark as close-only notification
-             * Set payload_length = 0 to indicate this is NOT a request
-             * ICS_Inbound will forward this, Net1 will see sentinel and skip request processing
-             */
             in_dp->request_msg.payload_length = 0;  /* Sentinel: close-only, no payload */
             in_dp->request_msg.metadata.session_id = meta->session_id;
             __sync_synchronize();  /* Memory barrier - ensure sentinel visible before signal */
@@ -4286,12 +3158,6 @@ static err_t tcp_echo_poll(void *arg, struct tcp_pcb *pcb)
             DEBUG_WARN("%s:   [WARN] inbound_dp NULL - cannot notify Net1\n", COMPONENT_NAME);
         }
 
-        /* v2.180: Initiate close but DON'T cleanup metadata yet!
-         * ═══════════════════════════════════════════════════════════════════════════
-         * Old (v2.179): connection_cleanup_atomic() → metadata gone → TX fails
-         * New (v2.180): tcp_close() → metadata stays → TX succeeds → error callback cleans up
-         * ═══════════════════════════════════════════════════════════════════════════
-         */
         err_t close_err = tcp_close(pcb);
         if (close_err != ERR_OK) {
             DEBUG_WARN("%s:   [WARN] tcp_close failed with err=%d - using tcp_abort as fallback\n",
@@ -4316,35 +3182,6 @@ static err_t tcp_echo_poll(void *arg, struct tcp_pcb *pcb)
             return ERR_ABRT;
         }
 
-        /* v2.192: SIMPLIFIED - Cleanup immediately instead of waiting for error callback
-         * ═══════════════════════════════════════════════════════════════════════════
-         * Old design (v2.180-v2.191): Set closing=true, wait for error callback to cleanup
-         * Problem: Error callback only fires 13.6% of the time (44/323 connections)
-         * Result: 279 leaked connections (never cleaned up)
-         *
-         * Root cause analysis:
-         * - Poll callback fires: 323 times ✅
-         * - tcp_close() succeeds: ~323 times ✅
-         * - Error callback fires: 44 times ❌ (only 13.6%!)
-         * - Missing cleanups: 279 connections leak
-         *
-         * Why error callback doesn't fire:
-         * - lwIP keeps PCB in TIME_WAIT/CLOSE_WAIT
-         * - PCB stuck in retransmission
-         * - PCB never freed → error callback never called
-         *
-         * New design (v2.192): Cleanup immediately after tcp_close()
-         * - Close notification already sent to Net1 ✅
-         * - No more PLC responses coming ✅
-         * - FIN/ACK packets use PCB's IP (no metadata needed) ✅
-         * - Safe to cleanup NOW instead of waiting!
-         *
-         * Benefits:
-         * - 100% cleanup rate (poll callback always fires)
-         * - No connection leaks
-         * - Simpler code (no waiting for callbacks)
-         * ═══════════════════════════════════════════════════════════════════════════
-         */
         meta->close_pending = false;
         meta->pcb = NULL;  /* PCB will be freed by lwIP */
 
@@ -4402,12 +3239,6 @@ static err_t tcp_echo_accept(void *arg, struct tcp_pcb *newpcb, err_t err)
                remote_port, local_port);
     }
 
-    /* v2.231: REJECT non-Modbus TCP connections immediately
-     * Problem: Port 62977 and other non-Modbus ports cause pbuf leaks
-     * Solution: Check ports and abort connection before creating metadata
-     * - Prevents pbufs from accumulating in unwanted connections
-     * - lwIP will properly clean up when we call tcp_abort()
-     */
     if (local_port != TCP_SERVER_PORT && remote_port != TCP_SERVER_PORT) {
         DEBUG("%s: [REJECT-TCP] Non-Modbus connection from %u.%u.%u.%u:%u -> local:%u (aborting)\n",
                COMPONENT_NAME,
@@ -4418,24 +3249,9 @@ static err_t tcp_echo_accept(void *arg, struct tcp_pcb *newpcb, err_t err)
         return ERR_ABRT;
     }
 
-    /* v2.100: CRITICAL - Hard connection limit to prevent orphaned connections
-     *
-     * Problem (earlier versions):
-     * - Net0 accepted unlimited SCADA connections (256 PCBs available)
-     * - Net1 tried to create corresponding PLC connections
-     * - PLC has limited connection capacity
-     * - Result: Orphaned Net0 connections with no PLC connection!
-     *
-     * Solution: Reject SCADA connections if we're at capacity
-     * - Both Net0 and Net1 set MEMP_NUM_TCP_PCB (v2.182: reverted to 100 for leak testing)
-     * - Reject at limit-5 (leave 5-connection buffer for safety)
-     * - Ensures 1:1 mapping between SCADA and PLC connections
-     * - Connection symmetry (v2.117) allows safely scaling
-     */
     #define MAX_SAFE_CONNECTIONS 95  /* v2.182: PCB limit is 100, stay 5 under */
 
     if (active_connections >= MAX_SAFE_CONNECTIONS) {
-        BREADCRUMB(9210);  /* v2.140: Connection limit reached, rejecting */
         DEBUG_ERROR("%s: [ERR] CONNECTION LIMIT REACHED (%u/%u) - REJECTING SCADA connection\n",
                COMPONENT_NAME, active_connections, MAX_SAFE_CONNECTIONS);
         DEBUG("%s:    → This prevents orphaned connections when capacity limit reached\n",
@@ -4447,11 +3263,9 @@ static err_t tcp_echo_accept(void *arg, struct tcp_pcb *newpcb, err_t err)
                newpcb->remote_port);
 
         tcp_abort(newpcb);  /* Send RST to SCADA */
-        BREADCRUMB(9211);  /* v2.140: Rejected connection aborted */
         return ERR_ABRT;
     }
 
-    BREADCRUMB(9212);  /* v2.140: Connection accepted */
     active_connections++;
     total_connections_created++;
 
@@ -4475,8 +3289,6 @@ static err_t tcp_echo_accept(void *arg, struct tcp_pcb *newpcb, err_t err)
      * MUST happen BEFORE tcp_arg so we can look up the metadata */
     connection_link_pcb(newpcb, newpcb->remote_port, newpcb->local_port);
 
-    /* v2.146: Pass metadata to tcp_arg so error callback can send close notifications
-     * Look up metadata after connection_link_pcb has linked the PCB */
     struct connection_metadata *meta = connection_lookup_by_pcb(newpcb);
 
     /* Register callbacks with metadata as argument */
@@ -4485,18 +3297,6 @@ static err_t tcp_echo_accept(void *arg, struct tcp_pcb *newpcb, err_t err)
     tcp_err(newpcb, tcp_echo_err);  /* Register error callback for connection cleanup */
     tcp_sent(newpcb, tcp_echo_sent);  /* v2.111: Register sent callback for pending outbound data */
 
-    /* v2.158: Register poll callback for deferred connection cleanup
-     * ══════════════════════════════════════════════════════════════════════════
-     * Purpose: Handle close_pending flag set by recv callback after sending response
-     *
-     * Interval = 4 means poll fires every 4 × 500ms = 2 seconds
-     * - Frequent enough to close connections promptly after response sent
-     * - Infrequent enough to minimize overhead
-     *
-     * This callback detects meta->close_pending flag and safely closes connection
-     * following lwIP Rule 6 Solution A (deferred close pattern)
-     * ══════════════════════════════════════════════════════════════════════════
-     */
     tcp_poll(newpcb, tcp_echo_poll, 4);
 
     return ERR_OK;
@@ -4692,16 +3492,6 @@ static err_t outbound_tcp_connected_callback(void *arg, struct tcp_pcb *pcb, err
     /* Send the payload */
     uint16_t to_send = (state->payload_len > tcp_sndbuf(pcb)) ? tcp_sndbuf(pcb) : state->payload_len;
 
-    /* v2.102: CRITICAL FIX - Check to_send > 0 before calling tcp_write()
-     * Same issue as Net1 - missing check in OUTBOUND path
-     *
-     * Bug: Connection established but remote window not yet advertised
-     * - tcp_sndbuf(pcb) returns 0, to_send = 0
-     * - tcp_write(pcb, data, 0) creates NULL pbuf
-     * - Later access to pbuf->len causes crash at 0x383e0
-     *
-     * Fix: Only call tcp_write() if to_send > 0
-     */
     if (to_send == 0) {
         /* Send buffer full - defer transmission until sent callback */
         DEBUG_WARN("%s: [WARN]  OUTBOUND: Send buffer full (sndbuf=%u), deferring transmission of %u bytes\n",
@@ -4738,13 +3528,6 @@ static err_t outbound_tcp_connected_callback(void *arg, struct tcp_pcb *pcb, err
  */
 void outbound_ready_handle(void)
 {
-    /* v2.104: Lightweight breadcrumb debugging
-     * BREADCRUMB 3000: Entry - outbound_ready_handle() called by CAmkES
-     * BREADCRUMB 3050: Handler processing complete
-     * If these breadcrumbs appear, CAmkES event delivery is working */
-    BREADCRUMB(3000);  /* Entry: ICS_Outbound notification received */
-
-
     #if DEBUG_TRAFFIC
     DEBUG("%s: ╔═══════════════════════════════════════════════════════════╗\n", COMPONENT_NAME);
     DEBUG("%s: ║  OUTBOUND: Received PLC response from ICS_Outbound       ║\n", COMPONENT_NAME);
@@ -4765,52 +3548,11 @@ void outbound_ready_handle(void)
     DEBUG("%s: [OK] Dataport check: outbound_dp=%p (valid)\n", COMPONENT_NAME, (void*)outbound_dp);
     #endif
 
-    BREADCRUMB(3003);  /* Reading ICS message */
-
-    /* v2.153: Process error notification queue from Net1
-     * ═══════════════════════════════════════════════════════════════════════
-     * PLC errors (RST, timeout, etc.) are queued by Net1 in error_queue.
-     * Process all queued errors and close corresponding SCADA connections.
-     *
-     * This replaces the old single-message error notification (v2.152).
-     * Queue prevents:
-     * - Race condition where error overwrites response data
-     * - RST flood attacks (deduplication at producer side)
-     * - Message loss during bursts (128-slot queue)
-     * ═══════════════════════════════════════════════════════════════════════
-     */
     OutboundDataport *dp = (OutboundDataport *)outbound_dp;
     static uint32_t error_queue_tail = 0;  /* Consumer state (local, never shared) */
 
     uint32_t error_queue_head = dp->error_queue.head;
 
-    /* v2.159: CRITICAL FIX - Memory barrier for cache coherency
-     * ═══════════════════════════════════════════════════════════════════════
-     * Problem: Same as close_queue bug in v2.158 (Net1 side)
-     *
-     * Root Cause: Cache coherency issue with dataport reads
-     * - Net1 writes error_queue.head with memory barrier (in control_queue_enqueue)
-     * - Net0 reads error_queue.head WITHOUT memory barrier
-     * - Net0 CPU cache may have stale value (reads old head value)
-     * - Loop condition may be false when it should be true → missed notifications
-     * - Result: Error notifications not processed, connections not closed on PLC errors
-     *
-     * Solution: Add memory barrier AFTER reading from shared dataport
-     * - Forces CPU to invalidate cache line
-     * - Ensures we read the actual value written by Net1
-     * - Loop condition now correct → processes all error notifications
-     *
-     * Why external barrier at line 4390 is insufficient:
-     * - Barrier is before function call (in main loop)
-     * - Read happens inside function (compiler may reorder)
-     * - Barrier must be immediately after the read for correct ordering
-     * - Function boundary creates race window
-     *
-     * This is symmetric to Net1's write barrier in control_queue_enqueue():
-     *   Net1: write notification → __sync_synchronize() → update head → emit signal
-     *   Net0: wait signal → read head → __sync_synchronize() → process notification
-     * ═══════════════════════════════════════════════════════════════════════
-     */
     __sync_synchronize();  /* Force cache invalidation - read fresh value from Net1 */
 
     /* Check for consumer falling too far behind (queue wraparound) */
@@ -4842,38 +3584,11 @@ void outbound_ready_handle(void)
                 /* Mark as not awaiting response */
                 meta->awaiting_response = false;
 
-                /* v2.178: FIXED - Only mirror PLC's RST, not Net1's internal cleanup
-                 * ═══════════════════════════════════════════════════════════════════════
-                 * CRITICAL BUG FIX (v2.177 → v2.178):
-                 *
-                 * v2.177 BUG: Treated ERR_ABRT as "PLC sent RST" → Excessive RST to SCADA
-                 *
-                 * Error code semantics:
-                 * - ERR_RST (-14): **PLC sent RST packet** → Mirror with RST to SCADA ✅
-                 * - ERR_CLSD (-15): PLC sent FIN packet → Mirror with FIN to SCADA ✅
-                 * - ERR_ABRT (-13): **Net1 called tcp_abort()** (internal cleanup, NOT from PLC!)
-                 *                   → Use graceful close to SCADA ✅
-                 *
-                 * Example scenario that exposed the bug:
-                 * 1. SCADA sends FIN → Net0 sends ERR_CLSD to Net1
-                 * 2. Net1 tries tcp_close() → fails (memory) → fallback tcp_abort()
-                 * 3. tcp_abort() triggers error callback → Net1 sends ERR_ABRT to Net0
-                 * 4. v2.177: Net0 incorrectly thinks "PLC sent RST" → Sends RST to SCADA ❌
-                 * 5. v2.178: Net0 recognizes ERR_ABRT is internal → Graceful close to SCADA ✅
-                 *
-                 * Result: Only send RST to SCADA when PLC **actually** sends RST
-                 * ═══════════════════════════════════════════════════════════════════════
-                 */
-
-                BREADCRUMB(9220);  /* Closing SCADA connection from error queue */
-
                 if (notif->err_code == ERR_RST) {
                     /* PLC sent RST packet → Mirror behavior by sending RST to SCADA */
                     DEBUG("%s:   → PLC sent RST, sending RST to SCADA (tcp_abort)\n",
                            COMPONENT_NAME);
-                    BREADCRUMB(9221);  /* tcp_abort path */
                     tcp_abort(pcb);  /* Sends RST, frees PCB immediately */
-                    BREADCRUMB(9222);  /* tcp_abort completed */
                 } else {
                     /* PLC sent FIN (ERR_CLSD), Net1 cleanup (ERR_ABRT), or unknown → Graceful close */
                     const char *reason = (notif->err_code == ERR_CLSD) ? "PLC sent FIN" :
@@ -4881,7 +3596,6 @@ void outbound_ready_handle(void)
                                        "Unknown error";
                     DEBUG("%s:   → %s, sending FIN to SCADA (tcp_close)\n",
                            COMPONENT_NAME, reason);
-                    BREADCRUMB(9223);  /* tcp_close path */
                     err_t close_err = tcp_close(pcb);
                     if (close_err != ERR_OK) {
                         BREADCRUMB(9224);  /* tcp_close failed */
@@ -4896,7 +3610,6 @@ void outbound_ready_handle(void)
 
                 /* v2.193: Enqueue cleanup */
                 enqueue_cleanup(meta->session_id);
-                BREADCRUMB(9227);  /* Cleanup enqueued */
             } else {
                 DEBUG("%s:   → Connection already closed (session %u)\n",
                        COMPONENT_NAME, notif->session_id);
@@ -4924,22 +3637,6 @@ void outbound_ready_handle(void)
         return;
     }
 
-    BREADCRUMB(3005);  /* Payload size valid */
-
-    /* v2.169: Handle connection pool exhaustion error from Net1
-     * ═══════════════════════════════════════════════════════════════════════════
-     * When Net1 cannot create TCP PCB (pool exhausted), it sends error with:
-     * - payload_length = 0
-     * - payload_offset = 0xFFFF (error marker)
-     * - metadata contains SCADA connection 5-tuple
-     *
-     * Action: Send RST to SCADA immediately (industry best practice)
-     * - SCADA gets ECONNREFUSED (0-100ms) instead of timeout (30-120s)
-     * - Follows industry standard for connection limit handling
-     *
-     * See: research-docs/tcp-connection-exhaustion-industry-practices-research.md
-     * ═══════════════════════════════════════════════════════════════════════════
-     */
     if (ics_msg->payload_length == 0 && ics_msg->metadata.payload_offset == 0xFFFF) {
         DEBUG("%s: [CRITICAL] Net1 connection pool exhausted - rejecting SCADA connection\n", COMPONENT_NAME);
         DEBUG("%s:    → Error notification for session %u (%u.%u.%u.%u:%u → 502)\n",
@@ -4951,21 +3648,6 @@ void outbound_ready_handle(void)
                ics_msg->metadata.src_ip & 0xFF,
                ics_msg->metadata.src_port);
 
-        /* v2.172 CRITICAL FIX: Lookup by session_id instead of IP/port
-         * ═══════════════════════════════════════════════════════════════
-         * Problem with v2.171 IP/port lookup:
-         * - SCADA closes very quickly (normal Modbus: open, request, response, close)
-         * - By time error notification arrives, SCADA metadata already deleted
-         * - Lookup by IP/port fails → can't send close notification to Net1
-         * - Net1's PCB leaks!
-         *
-         * Fix: Use session_id from error notification (Net1 includes it since v2.172)
-         * - session_id is unique per connection
-         * - Even if SCADA closed and metadata gone, we have session_id
-         * - Can send close notification to Net1 using just session_id
-         * - Net1 will close its PCB → no leak!
-         * ═══════════════════════════════════════════════════════════════
-         */
         struct connection_metadata *scada_meta = connection_lookup_by_session_id(
             ics_msg->metadata.session_id
         );
@@ -4976,24 +3658,6 @@ void outbound_ready_handle(void)
             DEBUG("%s:    → Found SCADA PCB=%p (session %u)\n",
                    COMPONENT_NAME, (void*)scada_pcb, scada_meta->session_id);
             DEBUG("%s:    → Sending RST to SCADA (immediate connection rejection)\n", COMPONENT_NAME);
-
-            /* v2.170: CRITICAL FIX - Follow CRITICAL_LESSON Rule 2
-             * ═══════════════════════════════════════════════════════════════
-             * NEVER call tcp_abort() directly from event handler (main thread)!
-             *
-             * Event handlers run in main thread context. lwIP callbacks may be
-             * executing in parallel. Direct tcp_abort() causes race condition:
-             * - Main thread tries to free PCB
-             * - lwIP callback may still be using PCB
-             * - Result: PCB stuck in limbo, leaked from pool
-             *
-             * Correct protocol (CRITICAL_LESSON Rule 2):
-             * 1. NULL all callbacks to prevent spurious firing
-             * 2. Mark metadata inactive
-             * 3. Try tcp_close() first (graceful, safer)
-             * 4. Fallback to tcp_abort() only if tcp_close() fails
-             * ═══════════════════════════════════════════════════════════════
-             */
 
             /* Step 1: NULL all callbacks to prevent spurious firing during close */
             tcp_arg(scada_pcb, NULL);
@@ -5016,29 +3680,10 @@ void outbound_ready_handle(void)
             }
 
             /* Step 4: Send close notification to Net1 (v2.171 CRITICAL FIX)
-             * ═══════════════════════════════════════════════════════════════
-             * BUG FOUND: When pool exhausts, we close SCADA connection but
-             * NEVER notify Net1 to close PLC-side PCB → Net1 PCB LEAKS!
-             *
-             * Evidence from logs:
-             * - 965 "TX: No metadata" warnings (PLC responses with no SCADA)
-             * - 264 pool exhaustion events
-             * - 108 active connections on Net1 (100 limit + 8 leaked)
-             *
-             * Fix: Send close notification to Net1 BEFORE cleanup
-             * ═══════════════════════════════════════════════════════════════
              */
             if (inbound_dp != NULL && !scada_meta->close_notified) {
                 InboundDataport *dp = (InboundDataport *)inbound_dp;
 
-                /* Enqueue close notification (v2.175 FIX)
-             * ═══════════════════════════════════════════════════════════════
-             * CRITICAL: Use ERR_ABRT to signal forced close to Net1
-             * - This is pool exhaustion: Net0 forcibly closing SCADA connection
-             * - Net1 should use tcp_abort() to immediately free PLC-side PCB
-             * - Sending ERR_ABRT (-13) tells Net1: "forced close, free immediately"
-             * ═══════════════════════════════════════════════════════════════
-             */
                 bool success = control_queue_enqueue(
                     &dp->close_queue,
                     scada_meta->session_id,
@@ -5049,10 +3694,6 @@ void outbound_ready_handle(void)
                 if (success) {
                     scada_meta->close_notified = true;  /* Set dedup flag */
 
-                    /* v2.188-sentinel: Mark as close-only notification
-                     * Pool exhaustion means rejecting NEW connection, no request data exists yet
-                     * Set sentinel for defensive programming and consistency
-                     */
                     dp->request_msg.payload_length = 0;  /* Sentinel: close-only, no payload */
                     dp->request_msg.metadata.session_id = scada_meta->session_id;
                     __sync_synchronize();  /* Memory barrier - ensure sentinel visible before signal */
@@ -5075,31 +3716,6 @@ void outbound_ready_handle(void)
 
             DEBUG("%s:    → RST sent, SCADA connection cleanup enqueued (pool exhaustion)\n", COMPONENT_NAME);
         } else {
-            /* v2.187 CRITICAL FIX: Don't send close notification when Net1 never created PCB!
-             * ═══════════════════════════════════════════════════════════════
-             * Root Cause Analysis from v2.186 logs:
-             * - 105,592 "Failed to create TCP PCB" errors (tcp_new() returned NULL)
-             * - Infinite loop: session 721 repeated hundreds of times
-             * - Net0 sending close notifications when Net1 never had a PCB to close!
-             *
-             * Two error cases with payload_offset=0xFFFF marker:
-             * 1. tcp_new() == NULL: Pool exhausted, no PCB created → NOTHING TO CLOSE!
-             * 2. tcp_connect() immediate fail: PCB created but Net1 already cleaned it up
-             *    (see virtio_net1_driver.c:4356-4366 - NULLs callbacks, active=false,
-             *     connection_count--, tcp_close/abort)
-             *
-             * v2.172 Logic Was WRONG:
-             * - Comment claimed "Net1's PCB leaks!" but that's impossible:
-             *   * Case 1: No PCB exists (tcp_new returned NULL)
-             *   * Case 2: PCB already cleaned up by Net1 before error sent
-             * - Sending close notification creates INFINITE LOOP:
-             *   * SCADA retries with same port → same session ID
-             *   * Net0: "connection not found" → sends close → Net1: "already closed"
-             *   * GOTO step 1 (repeat forever)
-             *
-             * Fix: Check for error marker (payload_offset=0xFFFF) and skip close notification
-             * ═══════════════════════════════════════════════════════════════
-             */
             DEBUG("%s:    → SCADA connection not found (session %u) - already closed\n",
                    COMPONENT_NAME, ics_msg->metadata.session_id);
 
@@ -5155,21 +3771,6 @@ void outbound_ready_handle(void)
         ics_msg->metadata.src_port   /* PLC port (502) */
     );
 
-    /* v2.153: Try session_id lookup if port-based lookup fails
-     * ═══════════════════════════════════════════════════════════════════════════
-     * Problem: Port-based lookup fails when SCADA port is reused for new connection
-     * Solution: Use session_id (unique, never reused) to find awaiting_response connections
-     *
-     * Scenario:
-     * 1. SCADA:59046 connects → request sent → SCADA closes → awaiting_response=true
-     * 2. SCADA:59046 connects again (port reused) → new connection → new metadata
-     * 3. PLC responds to first request (session_id=123)
-     * 4. Port lookup finds WRONG connection (new session_id=456)
-     * 5. Session_id lookup finds CORRECT connection (session_id=123, awaiting_response=true)
-     *
-     * This is why session_id mapping is CRITICAL!
-     * ═══════════════════════════════════════════════════════════════════════════
-     */
     if (meta == NULL && ics_msg->metadata.session_id != 0) {
         BREADCRUMB(3006);  /* v2.153: Trying session_id lookup */
 
@@ -5192,38 +3793,7 @@ void outbound_ready_handle(void)
         }
     }
 
-    /* v2.89: CRITICAL FIX - Check meta != NULL BEFORE accessing meta->pcb!
-     * Bug: "meta == NULL || meta->pcb == NULL" crashes if meta is NULL
-     * Cause: Compiler evaluates meta->pcb before meta == NULL check
-     * Result: Crash at address 0x4 (offset of pcb field in struct)
-     * Fix: Separate NULL checks to guarantee safe evaluation order */
-
     if (meta == NULL) {
-        BREADCRUMB(3007);  /* Connection not found */
-
-        /* v2.117: CRITICAL FIX - Check Net1's connection state before dropping response
-         * ═══════════════════════════════════════════════════════════════════════════
-         * Problem: Asymmetric state between Net0 and Net1 causes system hang
-         *
-         * Scenario:
-         * 1. SCADA sends request → Net0 → Net1 → PLC
-         * 2. SCADA closes connection (FIN received by Net0)
-         * 3. Net0 removes metadata (connection_remove called)
-         * 4. Close notification sent to Net1
-         * 5. Net1 IGNORES notification (self-cleaned tracking - correct!)
-         * 6. PLC sends response → Net1 forwards to Net0
-         * 7. Net0 looks up metadata → NOT FOUND (we removed it in step 3!)
-         * 8. Net0 drops response → SYSTEM HANGS
-         *
-         * Root Cause: Net0 removed metadata but Net1 kept connection active
-         *
-         * Solution: Check Net1's connection state via peer_state dataport
-         * - If Net1 still has the connection active, forward response anyway
-         * - Use connection info from ICS message (already validated by ICS_Outbound)
-         * - This solves the asymmetric state problem
-         * ═══════════════════════════════════════════════════════════════════════════
-         */
-
         DEBUG_WARN("%s: [WARN]  OUTBOUND: No local metadata for %u.%u.%u.%u:%u → %u.%u.%u.%u:%u\n",
                COMPONENT_NAME,
                (ics_msg->metadata.dst_ip >> 24) & 0xFF, (ics_msg->metadata.dst_ip >> 16) & 0xFF,
@@ -5273,17 +3843,6 @@ void outbound_ready_handle(void)
             return;
         }
 
-        /* Net1 has it! But we have a problem: SCADA already closed the connection on our side.
-         * We removed metadata because SCADA sent FIN. There's no PCB to send the response to!
-         *
-         * This reveals the TRUE root cause: Net1 kept the connection alive but Net0 already
-         * closed it. The response has nowhere to go because SCADA closed.
-         *
-         * This is actually EXPECTED BEHAVIOR - if SCADA closes before PLC responds, the
-         * response should be dropped. The hang was caused by Net1 waiting indefinitely.
-         *
-         * The real fix is for Net1 to detect this asymmetry and close its side too.
-         */
         DEBUG("%s: [ASYMMETRY DETECTED] Net1 has connection but Net0 doesn't (SCADA closed)\n",
                COMPONENT_NAME);
         DEBUG("%s:    → Cannot forward response - no PCB available (SCADA already closed)\n",
@@ -5313,20 +3872,6 @@ void outbound_ready_handle(void)
         return;
     }
 
-    BREADCRUMB(3008);  /* Connection found */
-
-    /* v2.62: CRITICAL FIX - Check PCB state FIRST before dereferencing other fields
-     *
-     * Problem: Net1 closes idle connections by calling tcp_abort(), which frees PCB.
-     * But Net0 still has metadata with dangling PCB pointer.
-     * Crash: meta->pcb points to freed memory, accessing meta->pcb->snd_nxt = page fault
-     *
-     * Solution: Check PCB state field FIRST. If state is CLOSED/invalid, PCB was freed.
-     * State field is at offset 0, so it's safe to check even if PCB is partially freed.
-     *
-     * This catches dangling pointers before they cause crashes.
-     */
-
     /* VALIDATION LAYER 1: NULL PCB Check (MUST BE FIRST!)
      * Net1 may have freed the PCB - check pointer validity before ANY dereference */
     if (meta->pcb == NULL) {
@@ -5336,30 +3881,9 @@ void outbound_ready_handle(void)
                (ics_msg->metadata.dst_ip >> 24) & 0xFF, (ics_msg->metadata.dst_ip >> 16) & 0xFF,
                (ics_msg->metadata.dst_ip >> 8) & 0xFF, ics_msg->metadata.dst_ip & 0xFF,
                ics_msg->metadata.dst_port);
-        BREADCRUMB(3014);  /* Stale PCB detected */
-
-        /* v2.120: DO NOT mark active=false here! (same fix as line 2936)
-         * Let connection_cleanup_stale() handle metadata removal */
-
-        /* REMOVED (v2.120): meta->active = false; */
 
         return;  /* Silent drop, metadata stays visible */
     }
-
-    /* v2.85: REMOVED VALIDATION LAYER 2 - accessing pcb->state causes crashes!
-     * DO NOT access pcb->state - it's a use-after-free bug if PCB is freed
-     * Rely on tcp_write() to return error if connection is not established */
-
-    /* v2.85: REMOVED VALIDATION LAYER 3 - accessing pcb->snd_nxt is use-after-free!
-     * DO NOT access any PCB fields - only check if pcb != NULL */
-
-    /* v2.85: REMOVED VALIDATION LAYER 4 - accessing pcb->local_port is use-after-free!
-     * DO NOT access any PCB fields before tcp_write() */
-
-    /* v2.85: ONLY validate PCB is non-NULL
-     * tcp_write() will handle all other validation internally and return error if needed */
-
-    BREADCRUMB(3009);  /* Attempting tcp_write */
 
     /* Final NULL check before tcp_write - this is the ONLY safe check we can do */
     if (meta->pcb == NULL) {
@@ -5368,64 +3892,6 @@ void outbound_ready_handle(void)
         meta->active = false;
         return;
     }
-
-    /* v2.95: REMOVED PCB state check - THIS WAS THE CRASH!
-     * ═══════════════════════════════════════════════════════════════════
-     * BUG: Accessing meta->pcb->state (offset ~0x10) causes page fault
-     * if lwIP freed the PCB between NULL check and state access!
-     *
-     * Race condition:
-     * 1. Check meta->pcb != NULL [OK]
-     * 2. lwIP timer fires, frees PCB
-     * 3. Access meta->pcb->state → CRASH at offset 0x10!
-     *
-     * Fix: Don't access ANY PCB fields! Let tcp_write() handle validation.
-     * tcp_write() will return error if PCB is in wrong state.
-     *
-     * This matches v2.85 lesson: "DO NOT access any PCB fields"
-     */
-
-    /* v2.163: CRITICAL FIX - Send response IMMEDIATELY instead of queuing
-     * ═══════════════════════════════════════════════════════════════════════════
-     * Problem (v2.111-v2.162): Queuing mechanism broken for flow control
-     *
-     * Old design (v2.111-v2.162):
-     *   - Store response in pending_outbound_data buffer
-     *   - Wait for recv callback to send it
-     *   - BUG: If SCADA closes before PLC responds → NO MORE RECV CALLBACKS!
-     *   - Response sits in buffer forever
-     *   - close_pending never set to true (only set after sending)
-     *   - Close notification never sent to Net1
-     *   - Net1 keeps PLC connection alive forever → SYSTEM HANG!
-     *
-     * Why old design assumed threading issues:
-     *   - v2.111 comment claimed "race with lwIP timers"
-     *   - v2.112 comment claimed "NULL pointer crash from main loop"
-     *   - BOTH ASSUMPTIONS WRONG for seL4/CAmkES!
-     *
-     * seL4/CAmkES Architecture Reality:
-     *   - Single-threaded component execution (no preemption in userspace)
-     *   - lwIP timers run in SAME thread as CAmkES event handlers
-     *   - outbound_ready_handle() runs in main event loop thread
-     *   - lwIP callbacks ALSO run in main event loop thread
-     *   - NO RACE CONDITIONS POSSIBLE! (single-threaded, non-preemptive)
-     *
-     * New design (v2.163): Bridge pattern
-     *   - We ARE a bridge forwarding packets between networks
-     *   - Response arrives → send immediately (no waiting)
-     *   - Correct mental model: packet reconstruction, not deferred queuing
-     *   - Same thread safety as lwIP callbacks (main event loop)
-     *
-     * Benefits:
-     *   ✅ Zero delay (immediate response)
-     *   ✅ No polling overhead
-     *   ✅ Fixes flow control bug (send even if SCADA closed)
-     *   ✅ Eliminates entire pending_outbound_data mechanism
-     *   ✅ Simple, direct code
-     *
-     * Side effects: NONE for seL4/CAmkES (validated in design review)
-     * ═══════════════════════════════════════════════════════════════════════════
-     */
 
     /* Send response immediately! We're a bridge, not a queue. */
     err_t write_err = tcp_write(meta->pcb, ics_msg->payload, ics_msg->payload_length, TCP_WRITE_FLAG_COPY);
@@ -5442,77 +3908,10 @@ void outbound_ready_handle(void)
         return;
     }
 
-    BREADCRUMB(3011);  /* tcp_write succeeded */
-
-    /* v2.209: Update TX timestamp for delayed metadata cleanup
-     * ═══════════════════════════════════════════════════════════════════════════
-     * Purpose: Track last successful TX activity for fast-track cleanup
-     *
-     * This timestamp enables two-tier cleanup strategy:
-     *   - Fast-track: Cleanup after 1 second TX idle (normal case)
-     *   - Grace period: Cleanup after 5 seconds max (safety net)
-     *
-     * Why update here:
-     *   - tcp_write() succeeded → data queued for transmission
-     *   - This is the last TX activity for this connection
-     *   - check_pending_cleanups() uses this to calculate tx_idle time
-     *
-     * Result: Metadata persists until TX completes, preventing "TX: No metadata"
-     * ═══════════════════════════════════════════════════════════════════════════
-     */
     meta->last_tx_timestamp = sys_now();
 
-    /* v2.189: CRITICAL FIX - Mark response received BEFORE checking awaiting_response
-     * ═══════════════════════════════════════════════════════════════════════════
-     * Problem: Race condition between response arrival and SCADA close
-     *
-     * Scenario:
-     *   1. SCADA sends request
-     *   2. PLC response arrives, queued for processing
-     *   3. SCADA sends FIN (closes connection)
-     *   4. tcp_echo_recv(p=NULL) sets awaiting_response=true
-     *   5. outbound_ready_handle() runs NOW
-     *   6. tcp_write() succeeds (connection still open)
-     *   7. BUG: awaiting_response still true, connection kept alive!
-     *
-     * Fix: Set response_received=true immediately after tcp_write succeeds
-     *   - tcp_echo_recv checks response_received before setting awaiting_response
-     *   - If response_received=true: skip awaiting mode, proceed with normal close
-     * ═══════════════════════════════════════════════════════════════════════════
-     */
     meta->response_received = true;  /* Response arrived and successfully written to TCP */
 
-    /* v2.166: CRITICAL FIX - Defer tcp_output() to poll callback (fix reentrancy)
-     * ═══════════════════════════════════════════════════════════════════════════
-     * BUG: Calling tcp_output() from CAmkES event handler causes reentrancy!
-     *
-     * Problem:
-     * - outbound_ready_handle() is a CAmkES event handler (interrupt-like)
-     * - Can fire while lwIP is already processing (e.g., tcp_slowtmr)
-     * - Calling tcp_output() from event handler violates lwIP NO_SYS=1 model
-     * - Result: Recursive tcp_output() calls → DEPTH=3/DEPTH=4 → CRASH
-     *
-     * Evidence (v2.165 caller tracking):
-     * - DEPTH=1: tcp_output() called by tcp_slowtmr (main loop)
-     * - DEPTH=3: tcp_output() called by outbound_ready_handle (0xd4f0) ← EVENT
-     * - DEPTH=4: tcp_output() called by tcp_input (recursive) → HALT
-     *
-     * Root Cause: Same as v2.139 RX reentrancy (fixed by making RX IRQ-only)
-     * - v2.139 fixed process_rx_packets() reentrancy
-     * - But outbound_ready_handle() reentrancy was never fixed!
-     *
-     * Solution: Defer tcp_output() to poll callback (lwIP best practice)
-     * - tcp_write() already queued data in lwIP buffers (TCP_WRITE_FLAG_COPY)
-     * - Set has_pending_outbound flag
-     * - Poll callback (tcp_echo_poll) calls tcp_output() safely
-     * - Poll runs in lwIP timer context → no reentrancy!
-     *
-     * Benefits:
-     * - Eliminates reentrancy (only lwIP calls tcp_output)
-     * - Follows lwIP NO_SYS=1 threading model
-     * - Consistent with v2.111 deferred output design
-     * ═══════════════════════════════════════════════════════════════════════════
-     */
     meta->has_pending_outbound = true;  /* Signal poll callback to flush */
 
     #if DEBUG_TRAFFIC
@@ -5523,59 +3922,6 @@ void outbound_ready_handle(void)
     #if DEBUG_ENABLED_DEBUG
     DEBUG("   [OK] [MSG #%u] Response sent immediately to SCADA\n\n", msg_id);
     #endif
-
-    /* v2.179: CRITICAL FIX - Only close if SCADA already sent FIN
-     * ═══════════════════════════════════════════════════════════════════════════
-     * BUG in v2.163-v2.178: Unconditional close_pending = true broke connection reuse!
-     *
-     * Problem:
-     *   - Line 3985 (old): ALWAYS set close_pending = true after sending response
-     *   - But Modbus/TCP supports connection reuse (multiple request/response cycles)
-     *   - This caused premature close after EVERY response → Net1 PCB pool exhaustion!
-     *
-     * Evidence from v2.178 logs:
-     *   - awaiting_response set (SCADA closed first):    27 connections
-     *   - Poll callbacks fired (close_pending):         182 connections
-     *   - Difference (response before SCADA close):     155 connections ← LEAKED!
-     *   - Result: Net1 pool exhausted at 150/150
-     *
-     * Root Cause:
-     *   - Comment said "if SCADA already closed" but code had NO if statement!
-     *   - Always closed both sides, even when SCADA connection still open
-     *
-     * The Fix:
-     *   - Check awaiting_response flag BEFORE clearing it
-     *   - Only set close_pending if SCADA actually sent FIN (p=NULL in recv)
-     *
-     * Two Scenarios:
-     *
-     * A) SCADA closes BEFORE response (half-close pattern):
-     *    1. SCADA sends request
-     *    2. SCADA sends FIN (wants response then close)
-     *       └─→ recv(p=NULL) sets awaiting_response=true
-     *    3. PLC responds
-     *    4. outbound_ready_handle sends response
-     *       └─→ scada_closed = true (SCADA sent FIN)
-     *       └─→ close_pending = true ✓ CORRECT - close both sides
-     *
-     * B) PLC responds, SCADA stays open (connection reuse):
-     *    1. SCADA sends request
-     *    2. PLC responds fast
-     *    3. outbound_ready_handle sends response
-     *       └─→ scada_closed = false (no FIN received)
-     *       └─→ close_pending = false ✓ CORRECT - keep both sides open!
-     *    4. SCADA sends ANOTHER request on same connection
-     *       └─→ Connection reuse works! ✓
-     *
-     * lwIP Protocol Guarantee:
-     *   - awaiting_response ONLY set when recv callback sees p=NULL
-     *   - p=NULL means SCADA sent FIN (lwIP already acknowledged it)
-     *   - RST goes to error callback (different path, doesn't set awaiting_response)
-     *   - No race condition (same event loop thread)
-     *
-     * See: /tmp/scada_close_detection.md for full lwIP recv/error callback analysis
-     * ═══════════════════════════════════════════════════════════════════════════
-     */
 
     /* Check if SCADA sent FIN BEFORE clearing the flag */
     bool scada_closed = meta->awaiting_response;
@@ -5609,14 +3955,6 @@ void outbound_ready_handle(void)
 
 /*
  * VirtIO IRQ Handler
- */
-/* v2.167: Flag to signal RX packets pending (set by IRQ, cleared by main loop)
- * ═══════════════════════════════════════════════════════════════════════════
- * This implements correct lwIP NO_SYS=1 pattern:
- * - IRQ does minimal work (sets flag)
- * - Main loop does heavy processing (calls process_rx_packets)
- * - No reentrancy possible (all lwIP calls in main loop)
- * ═══════════════════════════════════════════════════════════════════════════
  */
 static volatile bool rx_packets_pending = false;
 
@@ -5654,58 +3992,6 @@ void virtio_irq_handle(void)
  */
 static int virtio_net_init(void)
 {
-    DEBUG("\n");
-    DEBUG("╔══════════════════════════════════════════════════════════╗\n");
-    DEBUG("║         EthernetDriver Component - Tier 4                ║\n");
-    DEBUG("║      TCP Echo Server with lwIP TCP/IP Stack               ║\n");
-    DEBUG("║              (CAmkES Port of sDDF Driver)                 ║\n");
-    DEBUG("╚══════════════════════════════════════════════════════════╝\n");
-    DEBUG("\n");
-
-    /* ═══════════════════════════════════════════════════════════════ */
-    /* COMPREHENSIVE VIRTIO SLOT SCANNER                                */
-    /* Scan all 32 VirtIO MMIO slots to find which ones have devices   */
-    /* ═══════════════════════════════════════════════════════════════ */
-    DEBUG("\n╔═══════════════════════════════════════════════════════════════╗\n");
-    DEBUG("║  [DISABLED] SCANNING MAPPED VIRTIO MMIO SLOTS FOR ACTIVE DEVICES         ║\n");
-    DEBUG("║  Base: 0x0a000000, Each slot: 0x200 bytes apart               ║\n");
-    DEBUG("║  Scanning slots 24-31 only (one 4KB page mapped)                ║\n");
-    DEBUG("╚═══════════════════════════════════════════════════════════════╝\n\n");
-
-    /* Only scan slots within the mapped 4KB page (8 slots of 0x200 bytes each) */
-//     for (int slot = 24; slot < 32; slot++) {
-//         /* Calculate offset for this slot */
-//         uint32_t offset = slot * 0x200;
-//         volatile uint32_t *slot_base = (volatile uint32_t *)((uintptr_t)virtio_mmio_regs + offset);
-// 
-//         /* Read device identification registers with memory barriers (like VREG_READ) */
-//         DMB();  /* Ensure all prior memory operations complete before reading */
-//         /* Read device identification registers */
-//         uint32_t slot_magic = slot_base[VIRTIO_MMIO_MAGIC_VALUE / 4];
-//         uint32_t slot_version = slot_base[VIRTIO_MMIO_VERSION / 4];
-//         uint32_t slot_device_id = slot_base[VIRTIO_MMIO_DEVICE_ID / 4];
-//         DMB();  /* Ensure reads complete before using values */
-//         uint32_t slot_vendor_id = slot_base[VIRTIO_MMIO_VENDOR_ID / 4];
-// 
-//         /* Only print slots with valid VirtIO magic */
-//         if (slot_magic == 0x74726976) {
-//             DEBUG("Slot %2d @ 0x%08lx (offset +0x%03x): Magic=0x%08x Version=%u DeviceID=%u Vendor=0x%08x",
-//                    slot, 0x0a000000 + offset, offset,
-//                    slot_magic, slot_version, slot_device_id, slot_vendor_id);
-// 
-//             /* Identify device type */
-//             if (slot_device_id == 1) {
-//                 DEBUG(" [NETWORK]\n");
-//             } else if (slot_device_id == 0) {
-//                 DEBUG(" [NO DEVICE]\n");
-//             } else {
-//                 DEBUG(" [UNKNOWN TYPE]\n");
-//             }
-//         }
-//     }
-
-    DEBUG("\n");
-
     /* CRITICAL: Check if CAmkES dataport is properly mapped */
     if (virtio_mmio_regs == NULL) {
         DEBUG_ERROR("%s: [ERR] FATAL: virtio_mmio_regs dataport is NULL!\n", COMPONENT_NAME);
@@ -5744,43 +4030,12 @@ static int virtio_net_init(void)
         DEBUG("╚════════════════════════════════════════════════════════════════╝\n");
         DEBUG("\n");
         DEBUG("%s: VirtIO Version=%u (expected 2 for modern protocol)\n", COMPONENT_NAME, version);
-        DEBUG("\n");
-        DEBUG("VirtIO legacy mode (Version 1) DOES NOT WORK on seL4 ARM32 hypervisor!\n");
-        DEBUG("\n");
-        DEBUG("ROOT CAUSE:\n");
-        DEBUG("  - Legacy VirtIO has MMIO write failures in Stage 2 page tables\n");
-        DEBUG("  - QueueReady/QueueSel registers become unresponsive\n");
-        DEBUG("  - Device initialization will FAIL\n");
-        DEBUG("\n");
-        DEBUG("REQUIRED FIX:\n");
-        DEBUG("  Add this QEMU flag to enable modern VirtIO protocol:\n");
-        DEBUG("\n");
-        DEBUG("  ./simulate --extra-qemu-args=\"-global virtio-mmio.force-legacy=false \\\n");
-        DEBUG("    -netdev user,id=net0,hostfwd=tcp::6000-:6000 \\\n");
-        DEBUG("    -device virtio-net-device,netdev=net0 \\\n");
-        DEBUG("    -netdev user,id=net1,hostfwd=tcp::7000-:7000 \\\n");
-        DEBUG("    -device virtio-net-device,netdev=net1\"\n");
-        DEBUG("\n");
-        DEBUG("WHAT THIS DOES:\n");
-        DEBUG_INFO("  [OK] Enables VirtIO 1.0+ modern protocol (Version 2)\n");
-        DEBUG_INFO("  [OK] Fixes MMIO write issues\n");
-        DEBUG_INFO("  [OK] Allocates devices to slots 6-7 (not 30-31)\n");
-        DEBUG_INFO("  [OK] Makes QueueReady registers writable\n");
-        DEBUG("\n");
-        DEBUG("DOCUMENTATION:\n");
-        DEBUG("  See: research-docs/VIRTIO-FORCE-LEGACY-REQUIREMENT.md\n");
-        DEBUG("\n");
-        DEBUG("╔════════════════════════════════════════════════════════════════╗\n");
-        DEBUG("║  System halted - cannot continue with legacy VirtIO           ║\n");
-        DEBUG("╚════════════════════════════════════════════════════════════════╝\n");
-        DEBUG("\n");
+        
         return -1;
     }
 
     if (device_id != 1) {
         DEBUG("%s: ERROR: DeviceID=%u (expected 1 for network)\n", COMPONENT_NAME, device_id);
-        DEBUG("%s: QEMU may have allocated the device to a different slot.\n", COMPONENT_NAME);
-        DEBUG("%s: With force-legacy=false, devices should be at slots 6-7.\n", COMPONENT_NAME);
         return -1;
     }
 
@@ -5860,14 +4115,6 @@ static int virtio_net_init(void)
      */
     uint32_t queue_num_max = VREG_READ(VIRTIO_MMIO_QUEUE_NUM_MAX);
 
-    /* CRITICAL FIX: Ring size MUST match buffer pool size to prevent accessing
-     * uninitialized descriptors. Previous bug: QEMU offered 256 descriptors but
-     * we only had 32 buffers, causing descriptor index wraparound to hit
-     * uninitialized memory after ~352 packets.
-     *
-     * Solution: Tell QEMU to use exactly MAX_PACKETS descriptors (32).
-     * This ensures QEMU never tries to use descriptors we haven't initialized.
-     */
     rx_virtq.num = MAX_PACKETS;
 
     DEBUG("%s: [FIX] RX Queue: Device offers %u descriptors, using %u (matches buffer pool)\n",
@@ -6047,14 +4294,6 @@ void post_init(void)
 {
     DEBUG_ERROR("%s: Component started\n", COMPONENT_NAME);
     DEBUG_ERROR("%s: NET0 v2.240 (2025-11-02) - Remove PBUF tracking (no actual leak, pool stays at 0-1/800)\n", COMPONENT_NAME);
-    DEBUG("%s: [FIX] MODE: PRODUCTION with fast cleanup (every 100 iterations)\n", COMPONENT_NAME);
-    DEBUG_INFO("%s: [OK] FIX 1: Immediate cleanup on tcp_echo_err (v2.145 behavior)\n", COMPONENT_NAME);
-    DEBUG_INFO("%s: [OK] FIX 2: Send close notification to Net1 when SCADA closes\n", COMPONENT_NAME);
-    DEBUG_INFO("%s: [OK] FIX 3: Handle PLC error notification - close SCADA immediately\n", COMPONENT_NAME);
-    DEBUG_INFO("%s: [OK] FIX 4: REMOVED PCB state check - prevents crash at offset 0x10!\n", COMPONENT_NAME);
-    DEBUG_INFO("%s: [OK] FIX 5: Connection table debugging for troubleshooting\n");
-    DEBUG_INFO("%s: [OK] FIX 6: lwIP manages connection limits (MEMP_NUM_TCP_PCB=100)\n");
-    DEBUG_INFO("%s: [OK] FIX 7: tcp_abort() CLOSE_WAIT+LAST_ACK (every 5s) - immediate PBUF free\n\n", COMPONENT_NAME);
 
     /* Initialize connection tracking table */
     memset(connection_table, 0, sizeof(connection_table));
@@ -6238,45 +4477,19 @@ int run(void)
         if (outbound_ready_poll()) {
             /* CRITICAL: Ensure we see latest dataport writes from ICS_Outbound */
             __sync_synchronize();
-            BREADCRUMB(8000);  /* Before outbound_ready_handle */
             outbound_ready_handle();
-            BREADCRUMB(8001);  /* After outbound_ready_handle */
         }
 
         /* Process lwIP timers and RX packets */
         /* v2.144: Reduced breadcrumb flooding - only print every 10000 iterations */
         static uint32_t loop_counter = 0;
         if (++loop_counter >= 10000) {
-            BREADCRUMB(8002);  /* Periodic main loop heartbeat */
             loop_counter = 0;
         }
         sys_check_timeouts();
 
-        /* v2.193: Process cleanup queue in main loop (guaranteed execution)
-         * ═══════════════════════════════════════════════════════════════════════
-         * This runs EVERY iteration (unlike poll callbacks which depend on lwIP)
-         * - Guaranteed execution: No dependency on TCP state or timers
-         * - Natural deduplication: active flag prevents double-cleanup
-         * - Lock-free SPSC queue: Callbacks enqueue, main loop dequeues
-         * - Single enforcement point: Only place counters are decremented
-         * ═══════════════════════════════════════════════════════════════════════
-         */
         process_cleanup_queue();
 
-        /* v2.167: CORRECT FIX - Process RX packets in main loop (flag-based)
-         * ═══════════════════════════════════════════════════════════════════════
-         * Previous approach (v2.139): IRQ called process_rx_packets() directly
-         * Problem: IRQ can interrupt sys_check_timeouts() → reentrancy!
-         * - Main loop: sys_check_timeouts() → tcp_slowtmr() → tcp_output()
-         * - IRQ fires: process_rx_packets() → tcp_input() → tcp_output()
-         * - Result: DEPTH=4/5 recursion → CRASH
-         *
-         * Correct lwIP NO_SYS=1 pattern:
-         * - IRQ: Just set flag (minimal work, fast return)
-         * - Main loop: Check flag and process packets
-         * - All lwIP processing in single thread (no reentrancy)
-         * ═══════════════════════════════════════════════════════════════════════
-         */
         if (rx_packets_pending) {
             rx_packets_pending = false;
             process_rx_packets();
@@ -6286,54 +4499,12 @@ int run(void)
          * This happens in main loop after processing completes */
         refill_rx_queue();
 
-        /* v2.71: Periodic connection cleanup (every 100 iterations for fast Modbus cycles)
-         * Previous: 10000 iterations was too slow, causing table exhaustion
-         * With ~1 second Modbus cycles, cleanup needs to run frequently */
         if (++cleanup_counter >= 100) {
             cleanup_counter = 0;
             connection_cleanup_stale();
-
-            /* v2.209: Check and cleanup connections with metadata_close_pending
-             * ═══════════════════════════════════════════════════════════════════════════
-             * Purpose: Process delayed metadata cleanups (fix pbuf leak race condition)
-             *
-             * This implements two-tier cleanup:
-             *   1. Fast-track: Cleanup after 1 second TX idle (normal case)
-             *   2. Grace period: Cleanup after 5 seconds max (safety net)
-             *
-             * Why here:
-             *   - Runs periodically with connection_cleanup_stale() (every 100 iterations)
-             *   - Ensures pending cleanups are processed promptly
-             *   - Prevents connection pool exhaustion
-             *
-             * Result: Metadata persists until TX completes, preventing "TX: No metadata"
-             * ═══════════════════════════════════════════════════════════════════════════
-             */
             check_pending_cleanups();
         }
 
-        /* v2.217: Periodic CLOSE_WAIT cleanup (every 5 seconds)
-         * ═══════════════════════════════════════════════════════════════════════════
-         * Purpose: Prevent PBUF pool exhaustion from CLOSE_WAIT connections
-         *
-         * Root Cause:
-         *   - When SCADA closes connection, lwIP moves it to CLOSE_WAIT
-         *   - Each CLOSE_WAIT connection holds ~27 PBUFs on average
-         *   - 29 CLOSE_WAIT connections × 27 PBUFs = 800/800 pool exhausted
-         *
-         * Solution:
-         *   - Scan lwIP's tcp_active_pcbs list every 5 seconds
-         *   - Call tcp_close() on connections in CLOSE_WAIT state
-         *   - lwIP frees all held PBUFs when connection closes
-         *
-         * Why every 5 seconds:
-         *   - Not too frequent (avoid overhead scanning PCB list)
-         *   - Frequent enough to prevent pool exhaustion
-         *   - Typical SCADA behavior: bursts of connections every few seconds
-         *
-         * Safety: tcp_close() is safe to call from main loop context
-         * ═══════════════════════════════════════════════════════════════════════════
-         */
         uint32_t now = sys_now();
         if (now - last_close_wait_cleanup >= 5000) {  /* 5 seconds */
             cleanup_close_wait_connections();
@@ -6341,12 +4512,6 @@ int run(void)
         }
 
         seL4_Yield();
-
-        /* v2.73: Add small delay after yield to allow Net1 to complete operations
-         * This introduces timing delay similar to printf I/O */
-        for (volatile int i = 0; i < 100; i++) {
-            /* Busy wait to introduce delay */
-        }
     }
 
     return 0;

@@ -61,9 +61,6 @@
 /* v2.117: Connection state sharing */
 #include "connection_state.h"
 
-/* v2.244: Synchronization primitives */
-#include "sync_primitives.h"
-
 #define COMPONENT_NAME "VirtIO_Net0_Driver"
 #define TCP_SERVER_PORT 502  /* INBOUND: Modbus port - pretends to be PLC */
 
@@ -104,11 +101,9 @@ struct connection_metadata {
 };
 
 static struct connection_metadata connection_table[MAX_CONNECTIONS];
-static spinlock_t connection_table_lock = SPINLOCK_INIT;  /* v2.244: Spinlock for table access */
-static seqlock_t conn_state_lock = SEQLOCK_INIT;  /* v2.244: Seqlock for shared state */
-static _Atomic uint32_t connection_count = 0;  /* v2.244: Atomic for thread-safe counter */
+static int connection_count = 0;
 
-static _Atomic uint32_t active_connections = 0;  /* v2.244: Atomic for thread-safe counter */
+static uint32_t active_connections = 0;
 static uint32_t total_connections_created = 0;
 static uint32_t total_connections_closed = 0;
 
@@ -186,13 +181,9 @@ struct cleanup_request {
     uint32_t timestamp;  /* For age tracking and debugging */
 };
 
-/* v2.244: Removed volatile - use atomic operations for synchronization
- * volatile only prevents compiler optimization, NOT CPU reordering
- * Proper memory ordering requires __atomic_load_n/__atomic_store_n
- */
 struct cleanup_queue {
-    uint32_t head;  /* Producer writes here (callbacks) - access with atomics */
-    uint32_t tail;  /* Consumer writes here (main loop) - access with atomics */
+    volatile uint32_t head;  /* Producer writes here (callbacks) */
+    volatile uint32_t tail;  /* Consumer reads here (main loop) */
     struct cleanup_request requests[CLEANUP_QUEUE_SIZE];
 };
 
@@ -896,7 +887,7 @@ static void refill_rx_queue(void)
         uint16_t avail_idx = vq->avail->idx % vq->num;
         vq->avail->ring[avail_idx] = desc_idx;
         __sync_synchronize();
-        __atomic_fetch_add(&vq->avail->idx, 1, __ATOMIC_ACQ_REL);  /* v2.244: Atomic RX virtqueue update */
+        vq->avail->idx++;
         buffers_added++;
     }
 
@@ -920,7 +911,7 @@ static void refill_rx_queue(void)
 static err_t netif_output(struct netif *netif, struct pbuf *p)
 {
     struct virtq *vq = &tx_virtq;
-    static _Atomic uint16_t next_tx_desc = 0;  /* v2.244: Atomic for virtqueue protection */
+    static uint16_t next_tx_desc = 0;
     static uint32_t tx_count = 0;
 
     tx_count++;
@@ -935,9 +926,9 @@ static err_t netif_output(struct netif *netif, struct pbuf *p)
 
 
     /* Get TX descriptor pair (header + packet) - need 2 consecutive descriptors */
-    /* v2.244: Atomic fetch-and-add for thread-safe descriptor allocation */
-    uint16_t hdr_desc_idx = __atomic_fetch_add(&next_tx_desc, 2, __ATOMIC_ACQ_REL) % vq->num;
-    uint16_t pkt_desc_idx = (hdr_desc_idx + 1) % vq->num;
+    uint16_t hdr_desc_idx = next_tx_desc;
+    uint16_t pkt_desc_idx = (next_tx_desc + 1) % vq->num;
+    next_tx_desc = (next_tx_desc + 2) % vq->num;  /* Advance by 2 for chaining */
 
     int tx_buf_idx = (hdr_desc_idx + MAX_PACKETS/2) % MAX_PACKETS;
 
@@ -1126,7 +1117,7 @@ static err_t netif_output(struct netif *netif, struct pbuf *p)
     }
     #endif
     __sync_synchronize();
-    __atomic_fetch_add(&vq->avail->idx, 1, __ATOMIC_ACQ_REL);  /* v2.244: Atomic TX virtqueue update */
+    vq->avail->idx++;
 
     /* Notify device */
     VREG_WRITE(VIRTIO_MMIO_QUEUE_NOTIFY, VIRTIO_NET_TX_QUEUE);
@@ -1206,9 +1197,6 @@ static void update_shared_connection_state(void)
 {
     if (!own_state) return;
 
-    /* v2.244: Begin seqlock write - increment to odd (write in progress) */
-    seqlock_write_begin(&conn_state_lock);
-
     /* Update connection count and timestamp */
     ((struct connection_state_table *)own_state)->count = connection_count;
     ((struct connection_state_table *)own_state)->last_update = sys_now();
@@ -1237,9 +1225,6 @@ static void update_shared_connection_state(void)
 
     /* Memory barrier to ensure updates are visible to Net1 */
     __sync_synchronize();
-
-    /* v2.244: End seqlock write - increment to even (write complete) */
-    seqlock_write_end(&conn_state_lock);
 }
 
 /* Store metadata for a new connection */
@@ -1278,7 +1263,7 @@ static struct connection_metadata* connection_add(uint32_t orig_src, uint32_t or
             connection_table[i].close_timestamp = 0;
             connection_table[i].last_tx_timestamp = sys_now();
 
-            __atomic_fetch_add(&connection_count, 1, __ATOMIC_ACQ_REL);  /* v2.244: Atomic increment */
+            connection_count++;
 
             update_shared_connection_state();
 
@@ -1379,13 +1364,7 @@ static void connection_remove(struct tcp_pcb *pcb)
             connection_table[i].pcb = NULL;
             connection_table[i].has_pending_outbound = false;
             connection_table[i].pending_outbound_len = 0;
-
-            /* v2.244: Atomic decrement with underflow protection */
-            uint32_t old = __atomic_fetch_sub(&connection_count, 1, __ATOMIC_ACQ_REL);
-            if (old == 0) {
-                __atomic_fetch_add(&connection_count, 1, __ATOMIC_ACQ_REL);  /* Restore if underflowed */
-                DEBUG_ERROR("%s: connection_count underflow prevented!\n", COMPONENT_NAME);
-            }
+            connection_count--;
 
             /* v2.117: Update shared connection state */
             update_shared_connection_state();
@@ -1395,12 +1374,6 @@ static void connection_remove(struct tcp_pcb *pcb)
     }
 }
 
-/* v2.244: SPSC Queue Producer - Lock-free, safe from IRQ context
- * Memory ordering:
- *   1. Read tail with ACQUIRE (see consumer's updates)
- *   2. Write slot data (plain stores OK - synchronized by release)
- *   3. Update head with RELEASE (publish to consumer)
- */
 static inline void enqueue_cleanup(uint32_t session_id)
 {
     if (session_id == 0) {
@@ -1409,9 +1382,8 @@ static inline void enqueue_cleanup(uint32_t session_id)
         return;
     }
 
-    uint32_t head = cleanup_queue.head;  /* Only producer writes - plain read OK */
-    /* ACQUIRE: Synchronize with consumer's tail updates */
-    uint32_t tail = __atomic_load_n(&cleanup_queue.tail, __ATOMIC_ACQUIRE);
+    uint32_t head = cleanup_queue.head;
+    uint32_t tail = cleanup_queue.tail;
     uint32_t next_head = head + 1;
 
     /* Check if queue is full */
@@ -1422,14 +1394,15 @@ static inline void enqueue_cleanup(uint32_t session_id)
         return;
     }
 
-    /* Write slot data (plain stores - will be synchronized by release below) */
+    /* Enqueue request */
     uint32_t slot = head & CLEANUP_QUEUE_MASK;
     cleanup_queue.requests[slot].session_id = session_id;
     cleanup_queue.requests[slot].timestamp = sys_now();
 
-    /* RELEASE: Ensure slot writes complete before head update (publish to consumer) */
-    __atomic_store_n(&cleanup_queue.head, next_head, __ATOMIC_RELEASE);
+    /* Memory barrier: ensure writes complete before updating head */
+    __sync_synchronize();
 
+    cleanup_queue.head = next_head;
     cleanup_stats.enqueued++;
 
     /* Track max queue depth for debugging */
@@ -1443,32 +1416,23 @@ static inline void enqueue_cleanup(uint32_t session_id)
            COMPONENT_NAME, session_id, depth);
 }
 
-/* v2.244: SPSC Queue Consumer - Process cleanup requests from main loop
- * Memory ordering:
- *   1. Read head with ACQUIRE (see all producer's slot writes)
- *   2. Read slot data (guaranteed fresh due to acquire above)
- *   3. Update tail with RELEASE (allow producer to reuse slot)
- */
 static void process_cleanup_queue(void)
 {
-    uint32_t tail = cleanup_queue.tail;  /* Only consumer writes - plain read OK */
-    /* ACQUIRE: Synchronize with producer's head updates - see all slot writes */
-    uint32_t head = __atomic_load_n(&cleanup_queue.head, __ATOMIC_ACQUIRE);
+    uint32_t tail = cleanup_queue.tail;
+    uint32_t head = cleanup_queue.head;
 
     /* Process all pending requests */
     while (tail != head) {
         uint32_t slot = tail & CLEANUP_QUEUE_MASK;
         struct cleanup_request *req = &cleanup_queue.requests[slot];
 
-        /* Guaranteed to see producer's writes due to ACQUIRE above */
         /* v2.197: Skip if session_id is 0 (invalid/already cleaned) */
         if (req->session_id == 0) {
             DEBUG("%s: [QUEUE] SKIP: session_id=0 (invalid or already cleaned)\n",
                    COMPONENT_NAME);
             cleanup_stats.duplicates++;
             tail++;
-            /* RELEASE: Publish tail update to producer */
-            __atomic_store_n(&cleanup_queue.tail, tail, __ATOMIC_RELEASE);
+            cleanup_queue.tail = tail;
             continue;
         }
 
@@ -1528,22 +1492,21 @@ static void process_cleanup_queue(void)
                 meta->pending_outbound_data = NULL;
             }
 
-            /* v2.244: Atomic decrement counters with underflow protection */
-            uint32_t old_count = __atomic_fetch_sub(&connection_count, 1, __ATOMIC_ACQ_REL);
-            if (old_count == 0) {
-                __atomic_fetch_add(&connection_count, 1, __ATOMIC_ACQ_REL);  /* Restore if underflowed */
-                DEBUG_ERROR("%s: connection_count underflow prevented for session %u!\n",
-                       COMPONENT_NAME, req->session_id);
-            } else {
+            /* Decrement counters */
+            if (connection_count > 0) {
+                connection_count--;
                 DEBUG("%s: [COUNT--] %u → %u | cleanup session=%u (queued %ums ago)\n",
-                       COMPONENT_NAME, old_count, old_count - 1,
+                       COMPONENT_NAME, connection_count + 1, connection_count,
                        req->session_id, sys_now() - req->timestamp);
+            } else {
+                DEBUG("%s: ERROR: connection_count already 0 (prevented underflow for session %u)!\n",
+                       COMPONENT_NAME, req->session_id);
             }
 
-            uint32_t old_active = __atomic_fetch_sub(&active_connections, 1, __ATOMIC_ACQ_REL);
-            if (old_active == 0) {
-                __atomic_fetch_add(&active_connections, 1, __ATOMIC_ACQ_REL);  /* Restore if underflowed */
-                DEBUG_ERROR("%s: active_connections underflow prevented for session %u!\n",
+            if (active_connections > 0) {
+                active_connections--;
+            } else {
+                DEBUG("%s: ERROR: active_connections already 0 (prevented underflow for session %u)!\n",
                        COMPONENT_NAME, req->session_id);
             }
 
@@ -1556,9 +1519,9 @@ static void process_cleanup_queue(void)
                        COMPONENT_NAME);
 
                 /* Advance tail to prevent infinite loop, then skip cleanup */
+                __sync_synchronize();  /* Memory barrier */
                 tail++;
-                /* RELEASE: Publish tail update to producer (allow slot reuse) */
-                __atomic_store_n(&cleanup_queue.tail, tail, __ATOMIC_RELEASE);
+                cleanup_queue.tail = tail;
 
                 /* check_pending_cleanups() will handle this later */
                 continue;
@@ -1584,9 +1547,10 @@ static void process_cleanup_queue(void)
             cleanup_stats.processed++;
         }
 
-        /* Advance tail - RELEASE to publish update to producer */
+        /* Advance tail */
+        __sync_synchronize();  /* Memory barrier */
         tail++;
-        __atomic_store_n(&cleanup_queue.tail, tail, __ATOMIC_RELEASE);
+        cleanup_queue.tail = tail;
     }
 }
 
@@ -1619,17 +1583,18 @@ static void connection_cleanup_atomic(struct connection_metadata *meta)
         meta->pending_outbound_data = NULL;
     }
 
-    /* v2.244: Atomic decrement counters with underflow protection - ONLY place this happens! */
-    uint32_t old_count = __atomic_fetch_sub(&connection_count, 1, __ATOMIC_ACQ_REL);
-    if (old_count == 0) {
-        __atomic_fetch_add(&connection_count, 1, __ATOMIC_ACQ_REL);  /* Restore if underflowed */
-        DEBUG_ERROR("%s: connection_count underflow prevented!\n", COMPONENT_NAME);
+    /* Decrement counters - ONLY place this happens! */
+    if (connection_count > 0) {
+        connection_count--;
+        /* connection_count decremented */
     }
 
-    uint32_t old_active = __atomic_fetch_sub(&active_connections, 1, __ATOMIC_ACQ_REL);
-    if (old_active == 0) {
-        __atomic_fetch_add(&active_connections, 1, __ATOMIC_ACQ_REL);  /* Restore if underflowed */
-        DEBUG_ERROR("%s: active_connections underflow prevented!\n", COMPONENT_NAME);
+    if (active_connections > 0) {
+        active_connections--;
+    } else {
+        /* ERROR: active_connections already 0! */
+        DEBUG_ERROR("%s: ERROR: active_connections already 0 (prevented underflow)!\n",
+               COMPONENT_NAME);
     }
 
     /* Mark metadata as inactive */
@@ -2174,34 +2139,28 @@ static void process_rx_packets(void)
     static uint32_t check_count = 0;
 
     /* v2.138: CRITICAL FIX - Reentrancy guard to prevent deadlock
-     * v2.244: ATOMIC VERSION - Fix race condition in check-then-set
-     *
      * Problem: process_rx_packets() called from BOTH main loop AND IRQ handler
      * - Main loop calls at line 3848 (after B8004)
      * - IRQ handler calls at line 3239 (when VirtIO interrupt fires)
      * Without guard: IRQ can interrupt main loop's call → reentrant execution → deadlock!
      *
-     * Previous bug (v2.138-v2.243): Race between check and set
-     * - Thread 1: if (in_rx_processing) → reads FALSE
-     * - [IRQ fires]
-     * - Thread 2: if (in_rx_processing) → reads FALSE
-     * - Thread 1: in_rx_processing = TRUE
-     * - Thread 2: in_rx_processing = TRUE
-     * - BOTH threads enter critical section! ❌
+     * Evidence from v2.137:
+     * - B8002-B8005 stopped (main loop stuck)
+     * - B8006-B8009 continued (IRQ handler kept calling)
+     * - Main loop never reached B8005 → deadlock
      *
-     * Solution (v2.244): Atomic test-and-set eliminates race window
-     * - __atomic_test_and_set: atomically reads AND sets in single operation
-     * - Returns old value (0=acquired lock, 1=already held)
-     * - __ATOMIC_ACQUIRE ensures subsequent reads see consistent memory state
-     * - No race window between check and set ✅
+     * Solution: Static flag prevents reentrant execution
+     * - If already processing, return immediately (IRQ handler backs off)
+     * - Main loop completes uninterrupted
      */
-    static bool in_rx_processing = false;
+    static volatile bool in_rx_processing = false;
 
-    /* Atomic test-and-set: returns TRUE if lock already held */
-    if (__atomic_test_and_set(&in_rx_processing, __ATOMIC_ACQUIRE)) {
+    if (in_rx_processing) {
         /* Already processing - return immediately to avoid reentrancy */
         return;
     }
+
+    in_rx_processing = true;
 
     check_count++;
 
@@ -2258,7 +2217,7 @@ static void process_rx_packets(void)
             /* v2.137: Track early return (no packets waiting) */
             BREADCRUMB(8007);  /* No packets, early return */
             /* No more packets - exit IRQ handler and let timer handle refill */
-            __atomic_clear(&in_rx_processing, __ATOMIC_RELEASE);  /* v2.244: Atomic clear with release semantics */
+            in_rx_processing = false;  /* v2.138: Clear reentrancy guard */
             return;
         }
 
@@ -2298,7 +2257,7 @@ static void process_rx_packets(void)
                  * Just resync and exit - no packets available right now */
                 last_used_idx = current_used_idx;
                 /* Don't refill here - let timer handle it to avoid IRQ storm */
-                __atomic_clear(&in_rx_processing, __ATOMIC_RELEASE);  /* v2.244: Atomic clear with release semantics */
+                in_rx_processing = false;  /* v2.138: Clear reentrancy guard */
                 return;
             }
 
@@ -2309,7 +2268,7 @@ static void process_rx_packets(void)
                    COMPONENT_NAME, last_used_idx, current_used_idx);
             last_used_idx = current_used_idx;
             /* Don't refill here - let timer handle it to avoid IRQ storm */
-            __atomic_clear(&in_rx_processing, __ATOMIC_RELEASE);  /* v2.244: Atomic clear with release semantics */
+            in_rx_processing = false;  /* v2.138: Clear reentrancy guard */
             return;
         }
 
@@ -2716,8 +2675,7 @@ static void process_rx_packets(void)
         last_used_idx++;
     }
 
-    /* v2.244: Release reentrancy guard with atomic clear */
-    __atomic_clear(&in_rx_processing, __ATOMIC_RELEASE);
+    in_rx_processing = false;
 }
 
 /*

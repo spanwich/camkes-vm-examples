@@ -62,6 +62,9 @@
 /* v2.117: Connection state sharing */
 #include "connection_state.h"
 
+/* v2.244: Synchronization primitives */
+#include "sync_primitives.h"
+
 #define COMPONENT_NAME "VirtIO_Net1_Driver"
 #define TCP_SERVER_PORT 502  /* INBOUND: Modbus port - pretends to be PLC */
 
@@ -110,8 +113,10 @@ struct connection_metadata {
 };
 
 static struct connection_metadata connection_table[MAX_CONNECTIONS];
-static int connection_count = 0;
-static uint32_t active_connections = 0;  
+static spinlock_t connection_table_lock = SPINLOCK_INIT;  /* v2.244: Spinlock for table access */
+static seqlock_t conn_state_lock = SEQLOCK_INIT;  /* v2.244: Seqlock for shared state */
+static _Atomic uint32_t connection_count = 0;  /* v2.244: Atomic for thread-safe counter */
+static _Atomic uint32_t active_connections = 0;  /* v2.244: Atomic for thread-safe counter */  
 uint32_t sys_now(void);
 
 #define MAX_ICMP_METADATA 16  /* Track up to 16 concurrent pings */
@@ -194,6 +199,7 @@ struct cleanup_stats {
     uint32_t enqueued;
     uint32_t processed;
     uint32_t duplicates;
+    uint32_t overflows;  /* v2.244: Track queue overflow events */
 };
 static struct cleanup_stats cleanup_stats = {0};
 
@@ -646,7 +652,7 @@ static void refill_rx_queue(void)
         uint16_t avail_idx = vq->avail->idx % vq->num;
         vq->avail->ring[avail_idx] = desc_idx;
         __sync_synchronize();
-        vq->avail->idx++;
+        __atomic_fetch_add(&vq->avail->idx, 1, __ATOMIC_ACQ_REL);  /* v2.244: Atomic RX virtqueue update */
         buffers_added++;
     }
 
@@ -669,7 +675,7 @@ static void refill_rx_queue(void)
 static err_t netif_output(struct netif *netif, struct pbuf *p)
 {
     struct virtq *vq = &tx_virtq;
-    static uint16_t next_tx_desc = 0;
+    static _Atomic uint16_t next_tx_desc = 0;  /* v2.244: Atomic for virtqueue protection */
     static uint32_t tx_count = 0;
 
     tx_count++;
@@ -693,9 +699,9 @@ static err_t netif_output(struct netif *netif, struct pbuf *p)
     #endif
 
     /* Get TX descriptor pair (header + packet) - need 2 consecutive descriptors */
-    uint16_t hdr_desc_idx = next_tx_desc;
-    uint16_t pkt_desc_idx = (next_tx_desc + 1) % vq->num;
-    next_tx_desc = (next_tx_desc + 2) % vq->num;  /* Advance by 2 for chaining */
+    /* v2.244: Atomic fetch-and-add for thread-safe descriptor allocation */
+    uint16_t hdr_desc_idx = __atomic_fetch_add(&next_tx_desc, 2, __ATOMIC_ACQ_REL) % vq->num;
+    uint16_t pkt_desc_idx = (hdr_desc_idx + 1) % vq->num;
 
     int tx_buf_idx = (hdr_desc_idx + MAX_PACKETS/2) % MAX_PACKETS;
 
@@ -905,7 +911,7 @@ static err_t netif_output(struct netif *netif, struct pbuf *p)
     }
     #endif
     __sync_synchronize();
-    vq->avail->idx++;
+    __atomic_fetch_add(&vq->avail->idx, 1, __ATOMIC_ACQ_REL);  /* v2.244: Atomic TX virtqueue update */
 
     /* Notify device */
     VREG_WRITE(VIRTIO_MMIO_QUEUE_NOTIFY, VIRTIO_NET_TX_QUEUE);
@@ -1003,6 +1009,9 @@ static void update_shared_connection_state(void)
 {
     if (!own_state) return;
 
+    /* v2.244: Begin seqlock write - increment to odd (write in progress) */
+    seqlock_write_begin(&conn_state_lock);
+
     /* Update connection count and timestamp */
     ((struct connection_state_table *)own_state)->count = connection_count;
     ((struct connection_state_table *)own_state)->last_update = sys_now();
@@ -1031,6 +1040,9 @@ static void update_shared_connection_state(void)
 
     /* Memory barrier to ensure updates are visible to Net0 */
     __sync_synchronize();
+
+    /* v2.244: End seqlock write - increment to even (write complete) */
+    seqlock_write_end(&conn_state_lock);
 }
 
 static void process_cleanup_queue(void);
@@ -1117,12 +1129,11 @@ static struct connection_metadata* connection_add(uint32_t session_id,  /* v2.15
             connection_table[i].timestamp = sys_now();
             connection_table[i].last_activity = sys_now();
             connection_table[i].pool_state = pool_state; 
-            connection_table[i].error_notified = false; 
-            connection_table[i].close_pending = false; 
-            uint32_t old_count = connection_count;
-            connection_count++;
+            connection_table[i].error_notified = false;
+            connection_table[i].close_pending = false;
+            uint32_t old_count = __atomic_fetch_add(&connection_count, 1, __ATOMIC_ACQ_REL);  /* v2.244: Atomic increment */
             DEBUG("%s: [COUNT++] %u → %u | connection_add() NEW slot=%d session=%u port=%u→%u\n",
-                   COMPONENT_NAME, old_count, connection_count, i, session_id, sport, dport);
+                   COMPONENT_NAME, old_count, old_count + 1, i, session_id, sport, dport);
 
             #if DEBUG_METADATA
             DEBUG("%s: 📝 Stored metadata [%d]: %u.%u.%u.%u:%u → %u.%u.%u.%u:%u\n",
@@ -1163,10 +1174,9 @@ static struct connection_metadata* connection_add(uint32_t session_id,  /* v2.15
             connection_table[i].error_notified = false;
             connection_table[i].close_pending = false;
 
-            uint32_t old_count = connection_count;
-            connection_count++;
+            uint32_t old_count = __atomic_fetch_add(&connection_count, 1, __ATOMIC_ACQ_REL);  /* v2.244: Atomic increment */
             DEBUG("%s: [COUNT++] %u → %u | connection_add() EMERGENCY slot=%d session=%u port=%u→%u\n",
-                   COMPONENT_NAME, old_count, connection_count, i, session_id, sport, dport);
+                   COMPONENT_NAME, old_count, old_count + 1, i, session_id, sport, dport);
 
             update_shared_connection_state();
 
@@ -1242,6 +1252,7 @@ static struct connection_metadata* connection_lookup_by_tuple(uint32_t src_ip, u
     return NULL;
 }
 
+/* v2.244: SPSC Queue Producer - Lock-free, safe from IRQ context */
 static inline void enqueue_cleanup(uint32_t session_id)
 {
     if (session_id == 0) {
@@ -1250,34 +1261,38 @@ static inline void enqueue_cleanup(uint32_t session_id)
         return;
     }
 
-    uint32_t head = cleanup_queue.head;
-    uint32_t tail = cleanup_queue.tail;
+    uint32_t head = cleanup_queue.head;  /* Only producer writes - plain read OK */
+    /* ACQUIRE: Synchronize with consumer's tail updates */
+    uint32_t tail = __atomic_load_n(&cleanup_queue.tail, __ATOMIC_ACQUIRE);
+    uint32_t next_head = head + 1;
 
     /* Check if queue is full */
-    if (head - tail >= CLEANUP_QUEUE_SIZE) {
+    if ((next_head & CLEANUP_QUEUE_MASK) == (tail & CLEANUP_QUEUE_MASK)) {
+        cleanup_stats.overflows++;
         DEBUG("%s: ERROR: Cleanup queue full! head=%u tail=%u (session %u dropped)\n",
                COMPONENT_NAME, head, tail, session_id);
         return;
     }
 
-    /* Add to queue */
+    /* Write slot data */
     uint32_t slot = head & CLEANUP_QUEUE_MASK;
     cleanup_queue.requests[slot].session_id = session_id;
     cleanup_queue.requests[slot].timestamp = sys_now();
 
-    __sync_synchronize();  /* Memory barrier - ensure request is written before head update */
-
-    cleanup_queue.head = head + 1;
+    /* RELEASE: Publish to consumer */
+    __atomic_store_n(&cleanup_queue.head, next_head, __ATOMIC_RELEASE);
     cleanup_stats.enqueued++;
 
-    DEBUG("%s: [QUEUE] Enqueued cleanup session=%u (queue depth=%u)\n",
-           COMPONENT_NAME, session_id, head + 1 - tail);
+    DEBUG("%s: Cleanup enqueued for session %u (head: %u->%u, tail: %u)\n",
+           COMPONENT_NAME, session_id, head, next_head, tail);
 }
 
+/* v2.244: SPSC Queue Consumer - Lock-free atomic pattern */
 static void process_cleanup_queue(void)
 {
-    uint32_t tail = cleanup_queue.tail;
-    uint32_t head = cleanup_queue.head;
+    uint32_t tail = cleanup_queue.tail;  /* Only consumer writes - plain read OK */
+    /* ACQUIRE: See all producer's slot writes */
+    uint32_t head = __atomic_load_n(&cleanup_queue.head, __ATOMIC_ACQUIRE);
 
     /* Process all pending requests */
     while (tail != head) {
@@ -1290,7 +1305,9 @@ static void process_cleanup_queue(void)
                    COMPONENT_NAME);
             cleanup_stats.duplicates++;
             tail++;
-            cleanup_queue.tail = tail;
+            /* RELEASE: Allow producer to reuse slot */
+            __atomic_store_n(&cleanup_queue.tail, tail, __ATOMIC_RELEASE);
+            cleanup_stats.processed++;
             continue;
         }
 
@@ -1329,9 +1346,9 @@ static void process_cleanup_queue(void)
                            connection_count, MAX_CONNECTIONS);
 
                     /* Advance tail to prevent infinite loop, then skip cleanup */
-                    __sync_synchronize();
                     tail++;
-                    cleanup_queue.tail = tail;
+                    /* RELEASE: Allow producer to reuse slot */
+                    __atomic_store_n(&cleanup_queue.tail, tail, __ATOMIC_RELEASE);
                     continue;
                 }
             }
@@ -1344,21 +1361,22 @@ static void process_cleanup_queue(void)
                 meta->pending_outbound_data = NULL;
             }
 
-            /* Decrement counters */
-            if (connection_count > 0) {
-                connection_count--;
-                DEBUG("%s: [COUNT--] %u → %u | cleanup session=%u (queued %ums ago)\n",
-                       COMPONENT_NAME, connection_count + 1, connection_count,
-                       req->session_id, sys_now() - req->timestamp);
-            } else {
-                DEBUG_ERROR("%s: ERROR: connection_count already 0 (prevented underflow for session %u)!\n",
+            /* v2.244: Atomic decrement counters with underflow protection */
+            uint32_t old_count = __atomic_fetch_sub(&connection_count, 1, __ATOMIC_ACQ_REL);
+            if (old_count == 0) {
+                __atomic_fetch_add(&connection_count, 1, __ATOMIC_ACQ_REL);  /* Restore if underflowed */
+                DEBUG_ERROR("%s: connection_count underflow prevented for session %u!\n",
                        COMPONENT_NAME, req->session_id);
+            } else {
+                DEBUG("%s: [COUNT--] %u → %u | cleanup session=%u (queued %ums ago)\n",
+                       COMPONENT_NAME, old_count, old_count - 1,
+                       req->session_id, sys_now() - req->timestamp);
             }
 
-            if (active_connections > 0) {
-                active_connections--;
-            } else {
-                DEBUG_ERROR("%s: ERROR: active_connections already 0 (prevented underflow for session %u)!\n",
+            uint32_t old_active = __atomic_fetch_sub(&active_connections, 1, __ATOMIC_ACQ_REL);
+            if (old_active == 0) {
+                __atomic_fetch_add(&active_connections, 1, __ATOMIC_ACQ_REL);  /* Restore if underflowed */
+                DEBUG_ERROR("%s: active_connections underflow prevented for session %u!\n",
                        COMPONENT_NAME, req->session_id);
             }
 
@@ -1384,9 +1402,9 @@ static void process_cleanup_queue(void)
         }
 
         /* Advance tail */
-        __sync_synchronize();
         tail++;
-        cleanup_queue.tail = tail;
+        /* RELEASE: Allow producer to reuse slot */
+        __atomic_store_n(&cleanup_queue.tail, tail, __ATOMIC_RELEASE);
     }
 }
 
@@ -1499,12 +1517,16 @@ static void connection_cleanup_stale(void)
             #endif
             connection_table[i].active = false;
 
-            /* v2.182: Track connection count changes for leak debugging */
-            uint32_t old_count = connection_count;
-            connection_count--;
-            DEBUG("%s: [COUNT--] %u → %u | cleanup_stale() slot=%d session=%u (PCB=NULL)\n",
-                   COMPONENT_NAME, old_count, connection_count, i,
-                   connection_table[i].session_id);
+            /* v2.244: Atomic decrement with underflow protection */
+            uint32_t old_count = __atomic_fetch_sub(&connection_count, 1, __ATOMIC_ACQ_REL);
+            if (old_count == 0) {
+                __atomic_fetch_add(&connection_count, 1, __ATOMIC_ACQ_REL);  /* Restore if underflowed */
+                DEBUG_ERROR("%s: connection_count underflow prevented in cleanup_stale!\n", COMPONENT_NAME);
+            } else {
+                DEBUG("%s: [COUNT--] %u → %u | cleanup_stale() slot=%d session=%u (PCB=NULL)\n",
+                       COMPONENT_NAME, old_count, old_count - 1, i,
+                       connection_table[i].session_id);
+            }
 
             cleaned++;
             continue;
@@ -2430,8 +2452,9 @@ struct tcp_inbound_client_state {
     bool active;
 };
 
-#define MAX_INBOUND_CONNECTIONS 1000 
+#define MAX_INBOUND_CONNECTIONS 1000
 static struct tcp_inbound_client_state inbound_connection_pool[MAX_INBOUND_CONNECTIONS];
+static spinlock_t inbound_pool_lock = SPINLOCK_INIT;  /* v2.244: Spinlock for inbound pool */
 
 /* Allocate a free connection state from the pool */
 static struct tcp_inbound_client_state* inbound_alloc_state(void)
@@ -3579,13 +3602,14 @@ cleanup_and_create_new:
 
                         connection_table[i].active = false;
 
-                        /* v2.182: Track connection count changes for leak debugging */
-                        uint32_t old_count = connection_count;
-                        if (connection_count > 0) {
-                            connection_count--;
-                        }
-                        DEBUG("%s: [COUNT--] %u → %u | plc_unreachable() slot=%d session=%u (PCB=NULL)\n",
-                               COMPONENT_NAME, old_count, connection_count, i,
+                        /* v2.244: Atomic decrement with underflow protection */
+                        uint32_t old_count = __atomic_fetch_sub(&connection_count, 1, __ATOMIC_ACQ_REL);
+                        if (old_count == 0) {
+                            __atomic_fetch_add(&connection_count, 1, __ATOMIC_ACQ_REL);  /* Restore if underflowed */
+                            DEBUG_ERROR("%s: connection_count underflow prevented in plc_unreachable!\n", COMPONENT_NAME);
+                        } else {
+                            DEBUG("%s: [COUNT--] %u → %u | plc_unreachable() slot=%d session=%u (PCB=NULL)\n",
+                               COMPONENT_NAME, old_count, old_count - 1, i,
                                connection_table[i].session_id);
 
                         cleaned++;
@@ -3646,8 +3670,12 @@ cleanup_and_create_new:
 
         meta->pcb = NULL;  /* Clear PCB from metadata before close */
         meta->active = false;  /* Mark metadata inactive */
-        if (connection_count > 0) {
-            connection_count--;  /* Decrement counter */
+
+        /* v2.244: Atomic decrement with underflow protection */
+        uint32_t old_count = __atomic_fetch_sub(&connection_count, 1, __ATOMIC_ACQ_REL);
+        if (old_count == 0) {
+            __atomic_fetch_add(&connection_count, 1, __ATOMIC_ACQ_REL);  /* Restore if underflowed */
+            DEBUG_ERROR("%s: connection_count underflow prevented!\n", COMPONENT_NAME);
         }
 
         err_t close_err = tcp_close(pcb);
@@ -3685,6 +3713,7 @@ cleanup_and_create_new:
 
     BREADCRUMB(2020);  /* Exit: inbound_ready_handle complete */
 }
+}  /* v2.244: Missing closing brace for inbound_ready_handle */
 
 /*
  * OUTBOUND notification handler - called when ICS_Outbound has validated data

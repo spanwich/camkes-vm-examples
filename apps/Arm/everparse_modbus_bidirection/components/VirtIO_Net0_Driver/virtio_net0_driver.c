@@ -3155,7 +3155,9 @@ static err_t tcp_echo_poll(void *arg, struct tcp_pcb *pcb)
         }
 
         meta->close_pending = false;
-        meta->pcb = NULL;  /* PCB will be freed by lwIP */
+        /* v2.251: Don't NULL pcb here - lwIP may still call tcp_echo_recv(p=NULL)
+         * when remote sends FIN. Keep pcb valid so lookup succeeds.
+         * The pcb will be set to NULL in tcp_echo_recv(p=NULL) after final cleanup. */
 
         /* Calculate total latency from close_pending to cleanup */
         uint32_t pending_duration = sys_now() - meta->close_timestamp;

@@ -19,9 +19,23 @@
  */
 
 #define ICS_VERSION_MAJOR   2
-#define ICS_VERSION_MINOR   241
-#define ICS_VERSION_STRING  "2.241"
-#define ICS_VERSION_DATE    "2025-11-15"
+#define ICS_VERSION_MINOR   251
+#define ICS_VERSION_STRING  "2.251"
+#define ICS_VERSION_DATE    "2026-01-02"
+
+/*
+ * v2.251 Changes (2026-01-02):
+ * - Fix Flaw 1: Add missing session_id in Net1 response path
+ *   (Net0 can now correlate responses with sessions)
+ * - Fix Flaw 3: Don't set meta->pcb=NULL in tcp_echo_poll() until callbacks complete
+ *   (Fixes "Connection closed but no metadata found" errors)
+ *
+ * v2.250 Changes (2026-01-02):
+ * - EverParse v3 parser with trailing byte attack detection
+ * - InputLength validation: Rejects packets where actual size != declared size
+ * - Prevents CVE-2019-14462 style attacks (MBAP Length under-declaration)
+ * - Reverted sentinel false positive fix for debugging
+ */
 
 /*
  * Feature flags for this version

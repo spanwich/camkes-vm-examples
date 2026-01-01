@@ -2564,6 +2564,7 @@ static err_t inbound_tcp_recv_callback(void *arg, struct tcp_pcb *pcb, struct pb
         BREADCRUMB(1006);  /* Metadata found */
         ics_msg->metadata.dst_ip = meta->original_src_ip;
         ics_msg->metadata.dst_port = meta->src_port;
+        ics_msg->metadata.session_id = meta->session_id;  /* v2.251: Fix missing session_id in response */
     } else {
         BREADCRUMB(1007);  /* Metadata NOT found */
         ics_msg->metadata.dst_ip = ntohl(ip4_addr_get_u32(&pcb->local_ip));

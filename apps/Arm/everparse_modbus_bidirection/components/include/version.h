@@ -19,11 +19,15 @@
  */
 
 #define ICS_VERSION_MAJOR   2
-#define ICS_VERSION_MINOR   252
-#define ICS_VERSION_STRING  "2.252"
+#define ICS_VERSION_MINOR   253
+#define ICS_VERSION_STRING  "2.253"
 #define ICS_VERSION_DATE    "2026-01-02"
 
 /*
+ * v2.253 Changes (2026-01-02):
+ * - Enable DEBUG_LEVEL_DEBUG for all components to trace sentinel issue
+ * - Net0, Net1, ICS_Inbound all set to verbose output
+ *
  * v2.252 Changes (2026-01-02):
  * - Fix Flaw 3 (complete): Don't enqueue cleanup from tcp_echo_poll()
  *   Let tcp_echo_recv(p=NULL) handle cleanup when FIN handshake completes

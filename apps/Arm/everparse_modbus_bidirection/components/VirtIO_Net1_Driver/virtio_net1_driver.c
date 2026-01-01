@@ -25,7 +25,7 @@
  */
 
 /* v2.207: New industry-standard 5-level debug system */
-#define DEBUG_LEVEL DEBUG_LEVEL_WARN  /* v2.250: WARN level for reduced output */
+#define DEBUG_LEVEL DEBUG_LEVEL_DEBUG  /* v2.253: Verbose for debugging sentinel issue */
 #include "debug_levels.h"
 
 #include <camkes.h>

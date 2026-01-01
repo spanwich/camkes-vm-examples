@@ -24,7 +24,7 @@
  */
 
 /* v2.207: New industry-standard 5-level debug system */
-#define DEBUG_LEVEL DEBUG_LEVEL_WARN  /* v2.250: WARN level for reduced output */
+#define DEBUG_LEVEL DEBUG_LEVEL_DEBUG  /* v2.253: Verbose for debugging sentinel issue */
 #include "debug_levels.h"
 
 #include <camkes.h>
@@ -3014,7 +3014,6 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
 
     #if DEBUG_ENABLED_DEBUG
     DEBUG("   [OK] Signal sent to ICS_Inbound - message handoff complete\n");
-    DEBUG("   [MSG #%u now in ICS pipeline - waiting for processing]\n\n", msg_id);
     #endif
 
     /* Tell TCP we've processed the data */
@@ -3596,9 +3595,6 @@ void outbound_ready_handle(void)
         BREADCRUMB(3004);  /* Invalid payload size */
         DEBUG("%s: OUTBOUND: Invalid payload length %u (max %u)\n",
                COMPONENT_NAME, ics_msg->payload_length, MAX_PAYLOAD_SIZE);
-        #if DEBUG_ENABLED_DEBUG
-        DEBUG("   ✗ [MSG #%u] DROPPED - invalid payload size\n\n", msg_id);
-        #endif
         return;
     }
 
@@ -3870,10 +3866,6 @@ void outbound_ready_handle(void)
     /* v2.250: Minimal packet flow logging - sent to SCADA */
     DEBUG_INFO("[N0-TX] session=%u, %u bytes → SCADA\n",
                meta->session_id, ics_msg->payload_length);
-
-    #if DEBUG_ENABLED_DEBUG
-    DEBUG("   [OK] [MSG #%u] Response sent immediately to SCADA\n\n", msg_id);
-    #endif
 
     /* Check if SCADA sent FIN BEFORE clearing the flag */
     bool scada_closed = meta->awaiting_response;

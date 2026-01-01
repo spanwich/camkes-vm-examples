@@ -1,0 +1,286 @@
+/*
+ * ICS One-Way Pipeline with Dual Ethernet NICs
+ *
+ * Architecture:
+ *   netcat1 => [NIC_RX => ICS Pipeline => NIC_TX] => netcat2
+ *
+ * Data Flow:
+ *   1. netcat connects to NIC_RX on port 1234 (virtio-net slot 31)
+ *   2. EthernetDriver_RX receives TCP data, forwards to ExtFrontend via dataport
+ *   3. ICS pipeline: ExtFrontend -> ParserNorm -> PolicyEmit -> IntNicDrv
+ *   4. IntNicDrv forwards approved messages to EthernetDriver_TX via dataport
+ *   5. EthernetDriver_TX transmits via NIC 2 (virtio-net slot 30)
+ *   6. netcat connects to NIC_TX to receive data
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+import <std_connector.camkes>;
+import <global-connectors.camkes>;
+
+/* Packet buffer size - match ICS pipeline dataport size for compatibility */
+#define PACKET_BUFFER_SIZE 65536
+
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* HARDWARE COMPONENTS - Dual VirtIO-Net Devices                            */
+/* ═══════════════════════════════════════════════════════════════════════ */
+
+component virtio_net_rx_hw {
+    hardware;
+    dataport Buf virtio_mmio_regs;
+    emits Interrupt virtio_irq;
+}
+
+component virtio_net_tx_hw {
+    hardware;
+    dataport Buf virtio_mmio_regs;
+    emits Interrupt virtio_irq;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* ETHERNET DRIVER COMPONENTS - RX and TX with lwIP                         */
+/* ═══════════════════════════════════════════════════════════════════════ */
+
+/* EthernetDriver_RX - Receives from NIC 1, TCP server on port 1234 */
+component EthernetDriver_RX {
+    control;
+
+    /* VirtIO hardware access */
+    dataport Buf virtio_mmio_regs;
+    consumes Interrupt virtio_irq;
+
+    /* Output to ICS pipeline (ExtFrontend) */
+    dataport Buf(PACKET_BUFFER_SIZE) tx_packet_buffer;
+    emits Notification tx_packet_ready;
+}
+
+/* EthernetDriver_TX - Transmits to NIC 2, TCP client connection */
+component EthernetDriver_TX {
+    control;
+
+    /* VirtIO hardware access */
+    dataport Buf virtio_mmio_regs;
+    consumes Interrupt virtio_irq;
+
+    /* Input from ICS pipeline (IntNicDrv) */
+    dataport Buf(PACKET_BUFFER_SIZE) rx_packet_buffer;
+    consumes Notification rx_packet_ready;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* ICS PIPELINE COMPONENTS (from ics_oneway_norm_v3)                        */
+/* ═══════════════════════════════════════════════════════════════════════ */
+
+component ExtFrontend {
+    control;
+
+    /* Input from EthernetDriver_RX */
+    dataport Buf(65536) in_dp;
+    consumes Notification in_ntfy;
+
+    /* Output to ParserNorm */
+    dataport Buf(65536) out_dp;
+    emits Notification out_ntfy;
+}
+
+component ParserNorm {
+    control;
+
+    /* Input from ExtFrontend */
+    dataport Buf(65536) in_dp;
+    consumes Notification in_ntfy;
+
+    /* Output to PolicyEmit */
+    dataport Buf(65536) out_dp;
+    emits Notification out_ntfy;
+}
+
+component PolicyEmit {
+    control;
+
+    /* Input from ParserNorm */
+    dataport Buf(65536) in_dp;
+    consumes Notification in_ntfy;
+
+    /* Output to IntNicDrv */
+    dataport Buf(65536) out_dp;
+    emits Notification out_ntfy;
+}
+
+/* IntNicDrv - Now TX-enabled, forwards to EthernetDriver_TX */
+component IntNicDrv {
+    control;
+
+    /* Input from PolicyEmit */
+    dataport Buf(65536) in_dp;
+    consumes Notification in_ntfy;
+
+    /* Output to EthernetDriver_TX */
+    dataport Buf(PACKET_BUFFER_SIZE) out_dp;
+    emits Notification out_ntfy;
+}
+
+assembly {
+    composition {
+        /* ═══ Hardware Instances ═══ */
+        component virtio_net_rx_hw nic_rx_hw;
+        component virtio_net_tx_hw nic_tx_hw;
+
+        /* ═══ Ethernet Driver Instances ═══ */
+        component EthernetDriver_RX eth_rx;
+        component EthernetDriver_TX eth_tx;
+
+        /* ═══ ICS Pipeline Instances ═══ */
+        component ExtFrontend ext_frontend;
+        component ParserNorm parser_norm;
+        component PolicyEmit policy_emit;
+        component IntNicDrv int_nic;
+
+        /* ═══ NIC RX Hardware Connections ═══ */
+        connection seL4HardwareMMIO nic_rx_mmio(
+            from eth_rx.virtio_mmio_regs,
+            to nic_rx_hw.virtio_mmio_regs
+        );
+
+        connection seL4HardwareInterrupt nic_rx_irq(
+            from nic_rx_hw.virtio_irq,
+            to eth_rx.virtio_irq
+        );
+
+        /* ═══ NIC TX Hardware Connections ═══ */
+        connection seL4HardwareMMIO nic_tx_mmio(
+            from eth_tx.virtio_mmio_regs,
+            to nic_tx_hw.virtio_mmio_regs
+        );
+
+        connection seL4HardwareInterrupt nic_tx_irq(
+            from nic_tx_hw.virtio_irq,
+            to eth_tx.virtio_irq
+        );
+
+        /* ═══ Data Path: NIC_RX => ExtFrontend ═══ */
+        connection seL4SharedData rx_to_fe_dp(
+            from eth_rx.tx_packet_buffer,
+            to ext_frontend.in_dp
+        );
+
+        connection seL4Notification rx_to_fe_ntfy(
+            from eth_rx.tx_packet_ready,
+            to ext_frontend.in_ntfy
+        );
+
+        /* ═══ ICS Pipeline Connections (unchanged) ═══ */
+        connection seL4SharedData fe_par_dp(
+            from ext_frontend.out_dp,
+            to parser_norm.in_dp
+        );
+
+        connection seL4SharedData par_pol_dp(
+            from parser_norm.out_dp,
+            to policy_emit.in_dp
+        );
+
+        connection seL4SharedData pol_int_dp(
+            from policy_emit.out_dp,
+            to int_nic.in_dp
+        );
+
+        connection seL4Notification fe_par_ntfy(
+            from ext_frontend.out_ntfy,
+            to parser_norm.in_ntfy
+        );
+
+        connection seL4Notification par_pol_ntfy(
+            from parser_norm.out_ntfy,
+            to policy_emit.in_ntfy
+        );
+
+        connection seL4Notification pol_int_ntfy(
+            from policy_emit.out_ntfy,
+            to int_nic.in_ntfy
+        );
+
+        /* ═══ Data Path: IntNicDrv => NIC_TX ═══ */
+        connection seL4SharedData int_to_tx_dp(
+            from int_nic.out_dp,
+            to eth_tx.rx_packet_buffer
+        );
+
+        connection seL4Notification int_to_tx_ntfy(
+            from int_nic.out_ntfy,
+            to eth_tx.rx_packet_ready
+        );
+    }
+
+    configuration {
+        /* ═══════════════════════════════════════════════════════════════════ */
+        /* NIC RX Hardware Configuration (slot 31 @ 0xa003e00)                 */
+        /* ═══════════════════════════════════════════════════════════════════ */
+        nic_rx_hw.virtio_mmio_regs_paddr = 0xa003000;  /* Page containing slot 31 */
+        nic_rx_hw.virtio_mmio_regs_size = 0x1000;      /* 4KB page */
+        nic_rx_hw.virtio_irq_irq_number = 79;          /* IRQ for slot 31 (SPI 47) */
+
+        /* ═══════════════════════════════════════════════════════════════════ */
+        /* NIC TX Hardware Configuration (slot 30 @ 0xa003c00)                 */
+        /* ═══════════════════════════════════════════════════════════════════ */
+        nic_tx_hw.virtio_mmio_regs_paddr = 0xa003000;  /* Same page, different offset */
+        nic_tx_hw.virtio_mmio_regs_size = 0x1000;      /* 4KB page */
+        nic_tx_hw.virtio_irq_irq_number = 78;          /* IRQ for slot 30 (SPI 46) */
+
+        /* ═══════════════════════════════════════════════════════════════════ */
+        /* EthernetDriver_RX Configuration (TCP Server)                        */
+        /* ═══════════════════════════════════════════════════════════════════ */
+        eth_rx.priority = 101;
+        eth_rx._priority = 101;
+        eth_rx.cnode_size_bits = 18;
+        eth_rx.simple_untyped21_pool = 4;
+        eth_rx.heap_size = 0x100000;  /* 1MB heap for lwIP */
+        eth_rx.dma_pool = 0x40000;    /* 256KB DMA pool for virtqueues */
+
+        /* ═══════════════════════════════════════════════════════════════════ */
+        /* EthernetDriver_TX Configuration (TCP Client)                        */
+        /* ═══════════════════════════════════════════════════════════════════ */
+        eth_tx.priority = 90;
+        eth_tx._priority = 90;
+        eth_tx.cnode_size_bits = 18;
+        eth_tx.simple_untyped21_pool = 4;
+        eth_tx.heap_size = 0x100000;  /* 1MB heap for lwIP */
+        eth_tx.dma_pool = 0x40000;    /* 256KB DMA pool for virtqueues */
+
+        /* ═══════════════════════════════════════════════════════════════════ */
+        /* ICS Pipeline Component Priorities (unchanged)                       */
+        /* ═══════════════════════════════════════════════════════════════════ */
+        ext_frontend.priority = 100;
+        ext_frontend._priority = 100;
+
+        parser_norm.priority = 150;
+        parser_norm._priority = 150;
+
+        policy_emit.priority = 200;
+        policy_emit._priority = 200;
+
+        int_nic.priority = 250;
+        int_nic._priority = 250;
+
+        /* ═══════════════════════════════════════════════════════════════════ */
+        /* Timeslice Configuration (10ms period)                               */
+        /* ═══════════════════════════════════════════════════════════════════ */
+        eth_rx.period = 10000;
+        eth_rx.budget = 2000;
+
+        eth_tx.period = 10000;
+        eth_tx.budget = 2000;
+
+        ext_frontend.period = 10000;
+        ext_frontend.budget = 1000;
+
+        parser_norm.period = 10000;
+        parser_norm.budget = 2000;
+
+        policy_emit.period = 10000;
+        policy_emit.budget = 2000;
+
+        int_nic.period = 10000;
+        int_nic.budget = 1000;
+    }
+}

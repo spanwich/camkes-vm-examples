@@ -1,0 +1,26 @@
+[Unit]
+Description=QEMU ICS Security Gateway - Bridge Network Setup
+After=network-pre.target
+Before=network.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+# Use absolute path to the script
+ExecStart=/home/qemu/phd/camkes-vm-examples/projects/vm-examples/apps/Arm/modbus_bidirection_poc/scripts/setup-bridge-networking.sh
+RemainAfterExit=yes
+# Restart on failure
+Restart=on-failure
+RestartSec=5s
+
+# Cleanup on stop (optional - tears down bridges)
+ExecStop=/usr/bin/bash -c '\
+  ip link set br0 down 2>/dev/null || true; \
+  ip link set br1 down 2>/dev/null || true; \
+  ip link delete br0 2>/dev/null || true; \
+  ip link delete br1 2>/dev/null || true; \
+  ip link delete tap0 2>/dev/null || true; \
+  ip link delete tap1 2>/dev/null || true'
+
+[Install]
+WantedBy=multi-user.target

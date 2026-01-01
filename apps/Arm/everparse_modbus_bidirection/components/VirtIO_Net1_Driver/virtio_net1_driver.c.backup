@@ -1,0 +1,4528 @@
+/*
+ * VirtIO_Net1_Driver - Internal Network (Bidirectional)
+ *
+ * This component manages the internal network interface with bidirectional
+ * data flow and protocol break architecture.
+ *
+ * Architecture:
+ * - VirtIO-net device driver for packet RX/TX
+ * - DHCP client to obtain IP address from QEMU
+ * - TCP server on port 502 (Modbus) for INBOUND connections from PLC
+ * - TCP client for OUTBOUND connections to PLC
+ * - Frame header parsing to extract FrameMetadata
+ *
+ * Data Flow:
+ *   INBOUND:  Internal TCP:502 => lwIP => extract metadata+payload => ICS_Inbound
+ *   OUTBOUND: ICS_Outbound => create TCP packet => lwIP => Internal
+ *
+ * Status: Stable
+ * - CENTRALIZED PBUF CLEANUP: Single-exit-point pattern prevents leaks
+ * - System is stable, no known bugs
+ */
+
+
+/* Industry-standard 5-level debug system */
+#define DEBUG_LEVEL DEBUG_LEVEL_INFO /* INFO level for production */
+#include "debug_levels.h"
+
+#include <camkes.h>
+#include <camkes/dma.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <sel4/sel4.h>
+#include <utils/util.h>
+
+/* lwIP headers */
+#include "lwip/init.h"
+#include "lwip/netif.h"
+#include "lwip/pbuf.h"
+#include "lwip/dhcp.h"
+#include "lwip/tcp.h"
+#include "lwip/udp.h"
+#include "lwip/timeouts.h"
+#include "lwip/etharp.h"
+#include "lwip/stats.h"
+#include "lwip/inet_chksum.h"
+#include "lwip/prot/tcp.h"
+#include "lwip/prot/udp.h"
+#include "lwip/prot/ip.h"
+#include "lwip/prot/icmp.h"
+#include "lwip/priv/tcp_priv.h"
+#include "netif/ethernet.h"
+
+/* ICS common definitions */
+#include "common.h"
+
+#include "connection_state.h"
+
+#define COMPONENT_NAME "VirtIO_Net1_Driver"
+#define TCP_SERVER_PORT 502 /* INBOUND: Modbus port - pretends to be PLC */
+
+/* ═══════════════════════════════════════════════════════════════ */
+/* OLD DEBUG SYSTEM - DEPRECATED */
+/* Replaced with industry-standard 5-level system */
+/* See debug_levels.h for new system (ERROR/WARN/INFO/DEBUG) */
+/* ═══════════════════════════════════════════════════════════════ */
+/* OLD:
+#define DEBUG_LEVEL_SILENT 1
+#define DEBUG_LEVEL_QUIET 0
+#define DEBUG_LEVEL_NORMAL 0
+#define DEBUG_LEVEL_VERBOSE 0
+...
+(Old conditional blocks removed - see debug_levels.h for new mappings)
+*/
+
+/* Connection tracking for metadata preservation */
+/* Increased from 64 to 256 to prevent table exhaustion
+ * User insight: "increase active connections and let lwIP clear it naturally"
+ * - Can't safely call tcp_abort from main loop
+ * - Memory cost: ~12KB (256 * ~48 bytes) - negligible
+ * - Benefit: System won't deadlock when table fills */
+#define MAX_CONNECTIONS 150 /* Reverted to prevent PLC crash during leak testing */
+
+struct connection_metadata {
+ struct tcp_pcb *pcb; /* lwIP connection pointer (SCADA→Net1 connection) */
+ uint32_t session_id;
+ uint32_t original_src_ip; /* Original source IP (e.g., 192.168.90.5 SCADA) */
+ uint32_t original_dest_ip; /* Original destination IP (e.g., 192.168.95.2 PLC) */
+ uint16_t src_port; /* Source port (SCADA's ephemeral port) */
+ uint16_t dest_port; /* Destination port (502) */
+ uint16_t lwip_ephemeral_port; /* lwIP's ephemeral port for outbound connection */
+ bool active; /* Is this slot in use? */
+
+ uint32_t tcp_seq_num; /* Initial TCP sequence number - detects port reuse */
+ uint32_t timestamp; /* Creation time - for metadata consistency with Net0 */
+ uint32_t last_activity; /* Last activity timestamp - for idle timeout */
+
+ struct tcp_inbound_client_state *pool_state; /* Associated pool slot - freed when connection removed */
+
+ /* Deduplication flag for error notification queue */
+ bool error_notified; /* True if error notification already queued (Net1 → Net0) */
+
+ /* lwIP BEST PRACTICE - Safe connection closing from main thread */
+ bool close_pending; /* True if close requested from main thread (poll callback handles) */
+
+ /* Delayed metadata cleanup to prevent TX metadata errors */
+ bool metadata_close_pending; /* True if SCADA closed but metadata persists for TX */
+ uint32_t close_timestamp; /* When metadata_close_pending was set (for grace period) */
+ uint32_t last_tx_timestamp; /* Last TX path activity (for fast-track cleanup) */
+
+ bool awaiting_response; /* True if we're waiting for PLC response */
+ bool response_received; /* True if PLC response arrived */
+
+ bool closing; /* True if close initiated, waiting for PCB free */
+
+ uint8_t *pending_outbound_data; /* Queued outbound data awaiting send */
+ uint16_t pending_outbound_len; /* Length of queued data */
+ bool has_pending_outbound; /* True if data needs to be sent */
+
+ bool cleanup_in_progress; /* Guard: prevents double-cleanup */
+
+ bool close_notified; /* True if close notification already queued */
+
+ /* PCB lifecycle tracking for centralized cleanup */
+ bool pcb_closed; /* True if PCB has been closed/aborted (don't close again) */
+
+};
+
+static struct connection_metadata connection_table[MAX_CONNECTIONS];
+static int connection_count = 0;
+static uint32_t active_connections = 0;
+
+uint32_t sys_now(void);
+
+/* ICMP Metadata for Proxy Replies */
+#define MAX_ICMP_METADATA 16 /* Track up to 16 concurrent pings */
+
+struct icmp_metadata {
+ uint16_t icmp_id; /* ICMP echo identifier */
+ uint16_t icmp_seq; /* ICMP echo sequence number */
+ uint32_t original_dest_ip; /* Original destination IP (what was pinged) */
+ uint32_t timestamp; /* When request was received (for aging) */
+ bool active; /* Is this slot in use? */
+};
+
+static struct icmp_metadata icmp_table[MAX_ICMP_METADATA];
+
+/* Helper: Store ICMP request metadata */
+static void icmp_metadata_store(uint32_t dest_ip, uint16_t icmp_id, uint16_t icmp_seq)
+{
+ /* Find existing entry or free slot */
+ for (int i = 0; i < MAX_ICMP_METADATA; i++) {
+ if (!icmp_table[i].active ||
+ (icmp_table[i].icmp_id == icmp_id && icmp_table[i].icmp_seq == icmp_seq)) {
+ icmp_table[i].icmp_id = icmp_id;
+ icmp_table[i].icmp_seq = icmp_seq;
+ icmp_table[i].original_dest_ip = dest_ip;
+ icmp_table[i].timestamp = sys_now;
+ icmp_table[i].active = true;
+ return;
+ }
+ }
+
+ DEBUG_WARN("%s: [WARN] ICMP metadata table full! (id=%u, seq=%u)\n",
+ COMPONENT_NAME, icmp_id, icmp_seq);
+}
+
+/* Helper: Lookup ICMP metadata by id/seq */
+static struct icmp_metadata* icmp_metadata_lookup(uint16_t icmp_id, uint16_t icmp_seq)
+{
+ for (int i = 0; i < MAX_ICMP_METADATA; i++) {
+ if (icmp_table[i].active &&
+ icmp_table[i].icmp_id == icmp_id &&
+ icmp_table[i].icmp_seq == icmp_seq) {
+ /* Mark as consumed (one-time use) */
+ icmp_table[i].active = false;
+ return &icmp_table[i];
+ }
+ }
+ return NULL;
+}
+
+/* Helper: Clean up old ICMP metadata (called periodically) */
+static void icmp_metadata_cleanup(void)
+{
+ uint32_t now = sys_now;
+ for (int i = 0; i < MAX_ICMP_METADATA; i++) {
+ if (icmp_table[i].active && (now - icmp_table[i].timestamp) > 5000) {
+ /* Entry older than 5 seconds - clean it up */
+ icmp_table[i].active = false;
+ }
+ }
+}
+
+/* Cleanup queue - Single Producer Single Consumer (SPSC) queue */
+#define CLEANUP_QUEUE_SIZE 512
+#define CLEANUP_QUEUE_MASK (CLEANUP_QUEUE_SIZE - 1)
+
+struct cleanup_request {
+ uint32_t session_id;
+ uint32_t timestamp; /* sys_now when enqueued */
+};
+
+struct cleanup_queue {
+ struct cleanup_request requests[CLEANUP_QUEUE_SIZE];
+ volatile uint32_t head; /* Producer writes here */
+ volatile uint32_t tail; /* Consumer reads here */
+};
+
+static struct cleanup_queue cleanup_queue = {0};
+
+/* Cleanup statistics */
+struct cleanup_stats {
+ uint32_t enqueued;
+ uint32_t processed;
+ uint32_t duplicates;
+};
+static struct cleanup_stats cleanup_stats = {0};
+
+static volatile struct connection_state_table *own_state = NULL; /* Our state (exposed to Net0) */
+static volatile struct connection_state_table *peer_state = NULL; /* Net0's state (read-only) */
+
+/* Self-cleaned connection tracking */
+#define MAX_SELF_CLEANED_TRACKING 32 /* Circular buffer size */
+#define SELF_CLEANED_TTL_MS 5000 /* Expire after 5 seconds */
+
+struct self_cleaned_entry {
+ uint32_t src_ip; /* SCADA IP */
+ uint16_t src_port; /* SCADA port */
+ uint16_t dst_port; /* PLC port (502) */
+ uint32_t timestamp; /* When we cleaned it */
+ bool valid; /* Entry is valid */
+};
+
+static struct self_cleaned_entry self_cleaned_connections[MAX_SELF_CLEANED_TRACKING];
+static int self_cleaned_index = 0; /* Circular buffer index */
+
+/*
+ * VLAN-BASED DEPLOYMENT CONFIGURATION
+ * Net1 uses PRIVATE network (10.2.0.0/24) connected to tap0
+ * - Listens on 10.2.0.2:502
+ * - Receives traffic from eth0 (192.168.95.2) via iptables DNAT
+ * - Forwards validated traffic to Net1 (10.3.0.2)
+ * Host iptables translates:
+ * eth0 (192.168.95.2:502) ←→ tap0 (10.2.0.2:502)
+ */
+#define OUTBOUND_FORWARD_IP "10.3.0.2" /* Forward to Net1 (private network) */
+#define OUTBOUND_FORWARD_PORT 502 /* Modbus TCP port */
+#define INBOUND_FORWARD_PORT 502 /* Unused - Net1 handles inbound */
+
+/*
+ * LEGACY DEBUG CONFIGURATION - Now controlled by DEBUG_LEVEL above
+ * Keeping GDB/test flags separate from DEBUG_LEVEL system
+ */
+#define ENABLE_GDB_WAIT 0 /* Enable 60-second GDB wait during init */
+#define ENABLE_PAINT_TEST 0 /* Enable virtqueue memory paint test */
+
+/*
+ * PROTOCOL FILTER CONFIGURATION
+ * Control which protocols to show in debug output
+ * Set to 1 to SHOW protocol, 0 to HIDE protocol
+ */
+#define FILTER_SHOW_ARP 0 /* Show ARP packets (0x0806) */
+#define FILTER_SHOW_IPV6 0 /* Show IPv6 packets (0x86dd) */
+#define FILTER_SHOW_TCP 1 /* Show TCP packets */
+#define FILTER_SHOW_UDP 1 /* Show UDP packets */
+#define FILTER_SHOW_ICMP 1 /* Show ICMP packets */
+#define FILTER_SHOW_OTHER 1 /* Show all other protocols */
+
+/* VirtIO MMIO Register Offsets */
+#define VIRTIO_MMIO_MAGIC_VALUE 0x000
+#define VIRTIO_MMIO_VERSION 0x004
+#define VIRTIO_MMIO_DEVICE_ID 0x008
+#define VIRTIO_MMIO_VENDOR_ID 0x00c
+#define VIRTIO_MMIO_DEVICE_FEATURES 0x010
+#define VIRTIO_MMIO_DEVICE_FEATURES_SEL 0x014
+#define VIRTIO_MMIO_DRIVER_FEATURES 0x020
+#define VIRTIO_MMIO_DRIVER_FEATURES_SEL 0x024
+#define VIRTIO_MMIO_QUEUE_SEL 0x030
+#define VIRTIO_MMIO_QUEUE_NUM_MAX 0x034
+#define VIRTIO_MMIO_QUEUE_NUM 0x038
+#define VIRTIO_MMIO_QUEUE_READY 0x044
+#define VIRTIO_MMIO_QUEUE_NOTIFY 0x050
+#define VIRTIO_MMIO_INTERRUPT_STATUS 0x060
+#define VIRTIO_MMIO_INTERRUPT_ACK 0x064
+#define VIRTIO_MMIO_STATUS 0x070
+#define VIRTIO_MMIO_QUEUE_DESC_LOW 0x080
+#define VIRTIO_MMIO_QUEUE_DESC_HIGH 0x084
+#define VIRTIO_MMIO_QUEUE_AVAIL_LOW 0x090
+#define VIRTIO_MMIO_QUEUE_AVAIL_HIGH 0x094
+#define VIRTIO_MMIO_QUEUE_USED_LOW 0x0a0
+#define VIRTIO_MMIO_QUEUE_USED_HIGH 0x0a4
+#define VIRTIO_MMIO_CONFIG_GENERATION 0x0fc
+#define VIRTIO_MMIO_CONFIG 0x100
+
+/* VirtIO Network Device Config Offsets */
+#define VIRTIO_NET_CFG_MAC 0
+#define VIRTIO_NET_CFG_STATUS 6
+#define VIRTIO_NET_CFG_MAX_VQ_PAIRS 8
+
+/* Register accessor macros - use pointer arithmetic instead of struct */
+/* Forward declaration of regs pointer (defined in global state section) */
+static volatile uint32_t *virtio_regs_base;
+
+/* ARM memory barriers for MMIO access */
+#ifdef __aarch64__
+/* AArch64 requires explicit barrier scope */
+#define DMB __asm__ volatile("dmb sy" ::: "memory") /* Data Memory Barrier - System */
+#define DSB __asm__ volatile("dsb sy" ::: "memory") /* Data Synchronization Barrier - System */
+#define ISB __asm__ volatile("isb" ::: "memory") /* Instruction Synchronization Barrier */
+#else
+/* ARM32 uses implicit full system scope */
+#define DMB __asm__ volatile("dmb" ::: "memory")
+#define DSB __asm__ volatile("dsb" ::: "memory")
+#define ISB __asm__ volatile("isb" ::: "memory")
+#endif
+
+/* MMIO register access with memory barriers */
+#define VREG_READ(offset) ({ \
+ DMB; \
+ uint32_t val = virtio_regs_base[(offset) / 4]; \
+ DMB; \
+ val; \
+})
+
+#define VREG_WRITE(offset, val) do { \
+ DMB; \
+ virtio_regs_base[(offset) / 4] = (val); \
+ DSB; \
+} while (0)
+
+/* VirtIO Status Bits */
+#define VIRTIO_STATUS_ACKNOWLEDGE 1
+#define VIRTIO_STATUS_DRIVER 2
+#define VIRTIO_STATUS_DRIVER_OK 4
+#define VIRTIO_STATUS_FEATURES_OK 8
+#define VIRTIO_STATUS_DEVICE_NEEDS_RESET 64
+#define VIRTIO_STATUS_FAILED 128
+
+/* VirtIO Feature Bits */
+#define VIRTIO_F_VERSION_1 (1ULL << 32)
+#define VIRTIO_NET_F_MAC (1ULL << 5)
+#define VIRTIO_NET_F_STATUS (1ULL << 16)
+
+/* VirtIO Network Queues */
+#define VIRTIO_NET_RX_QUEUE 0
+#define VIRTIO_NET_TX_QUEUE 1
+
+/* VirtIO IRQ Bits */
+#define VIRTIO_MMIO_IRQ_VQUEUE 0x01
+#define VIRTIO_MMIO_IRQ_CONFIG 0x02
+
+/* Virtqueue descriptor flags */
+#define VIRTQ_DESC_F_NEXT 1
+#define VIRTQ_DESC_F_WRITE 2
+
+/* VirtIO Net Header (required before each packet) */
+#define VIRTIO_NET_HDR_SIZE 12 /* Modern VirtIO header size (with num_buffers field) */
+#define VIRTIO_NET_HDR_GSO_NONE 0
+
+typedef struct virtio_net_hdr {
+ uint8_t flags; /* Offload flags */
+ uint8_t gso_type; /* GSO type (VIRTIO_NET_HDR_GSO_NONE for us) */
+ uint16_t hdr_len; /* Ethernet + IP + TCP/UDP headers (not used without GSO) */
+ uint16_t gso_size; /* Bytes to append to hdr_len per frame (not used without GSO) */
+ uint16_t csum_start; /* Position to start checksumming from */
+ uint16_t csum_offset; /* Offset after that to place checksum */
+} __attribute__((packed)) virtio_net_hdr_t;
+#define VIRTQ_DESC_F_INDIRECT 4
+
+/* TCP Server Configuration */
+#define TCP_ECHO_PORT TCP_SERVER_PORT /* Use port 6000 */
+#define MAX_TCP_CONNECTIONS 8
+
+/* Packet buffer configuration */
+#define PACKET_BUFFER_SIZE 2048
+#define MAX_PACKETS 32
+
+/*
+ * VirtIO MMIO Register Structure
+struct virtio_mmio_regs {
+ uint32_t MagicValue;
+ uint32_t Version;
+ uint32_t DeviceID;
+ uint32_t VendorID;
+ uint32_t DeviceFeatures;
+ uint32_t DeviceFeaturesSel;
+ uint32_t _reserved1[2];
+ uint32_t DriverFeatures;
+ uint32_t DriverFeaturesSel;
+ uint32_t _reserved2[2];
+ uint32_t QueueSel;
+ uint32_t QueueNumMax;
+ uint32_t QueueNum;
+ uint32_t _reserved3[2];
+ uint32_t QueueReady;
+ uint32_t _reserved4[2];
+ uint32_t QueueNotify;
+ uint32_t _reserved5[3];
+ uint32_t InterruptStatus;
+ uint32_t InterruptACK;
+ uint32_t _reserved6[2];
+ uint32_t Status;
+ uint32_t _reserved7[3];
+ uint32_t QueueDescLow;
+ uint32_t QueueDescHigh;
+ uint32_t _reserved8[2];
+ uint32_t QueueAvailLow;
+ uint32_t QueueAvailHigh;
+ uint32_t _reserved9[2];
+ uint32_t QueueUsedLow;
+ uint32_t QueueUsedHigh;
+ uint32_t _reserved10[21];
+ uint32_t ConfigGeneration;
+ uint32_t Config[0];
+} __attribute__((packed));
+
+/*
+ * Virtqueue Descriptor
+struct virtq_desc {
+ uint64_t addr;
+ uint32_t len;
+ uint16_t flags;
+ uint16_t next;
+} __attribute__((packed));
+
+/*
+ * Virtqueue Available Ring
+struct virtq_avail {
+ uint16_t flags;
+ uint16_t idx;
+ uint16_t ring[];
+} __attribute__((packed));
+
+/*
+ * Virtqueue Used Element
+struct virtq_used_elem {
+ uint32_t id;
+ uint32_t len;
+} __attribute__((packed));
+
+/*
+ * Virtqueue Used Ring
+struct virtq_used {
+ uint16_t flags;
+ uint16_t idx;
+ struct virtq_used_elem ring[];
+} __attribute__((packed));
+
+/*
+ * Virtqueue Structure
+struct virtq {
+ unsigned int num;
+ struct virtq_desc *desc;
+ struct virtq_avail *avail;
+ struct virtq_used *used;
+};
+
+/* TCP Echo State (per connection) */
+struct tcp_echo_state {
+ bool in_use;
+ struct tcp_pcb *pcb;
+};
+
+/* Global state */
+/* Note: virtio_regs_base forward-declared above near macros */
+static struct virtq rx_virtq;
+static struct virtq tx_virtq;
+static uint8_t mac_addr[6];
+
+/* Message flow tracking */
+static uint32_t message_id_counter = 0;
+
+/* lwIP network interface */
+static struct netif netif_data;
+
+/* TCP server deferred initialization flag */
+static bool tcp_server_initialized = false;
+
+/* Packet buffers - allocated from DMA memory for VirtIO device access */
+static uint8_t *packet_buffers[MAX_PACKETS]; /* Virtual addresses */
+static uintptr_t packet_buffers_paddr[MAX_PACKETS]; /* Physical addresses for VirtIO DMA */
+static bool rx_buffer_used[MAX_PACKETS];
+
+/* VirtIO net headers - one per TX descriptor (DMA-accessible) */
+static virtio_net_hdr_t *tx_headers; /* Virtual address base */
+static uintptr_t tx_headers_paddr; /* Physical address base */
+
+/* TCP Echo State Pool */
+static struct tcp_echo_state tcp_state_pool[MAX_TCP_CONNECTIONS];
+
+/* Statistics */
+static uint32_t packets_received = 0;
+static uint32_t packets_sent = 0;
+static uint32_t dhcp_bound = 0;
+
+/* lwIP time tracking */
+static volatile uint32_t lwip_time_ms = 0;
+
+/* Initialization status flag (shared with other components for validation) */
+static volatile bool initialization_successful = false;
+
+/*
+ * lwIP system time function (required by lwIP NO_SYS mode)
+uint32_t sys_now(void)
+{
+ lwip_time_ms++;
+ return lwip_time_ms;
+}
+
+/* Forward declarations */
+
+/* ═══════════════════════════════════════════════════════════
+ * Network Traffic Logging Helpers
+ * ═══════════════════════════════════════════════════════════ */
+
+/* Ethernet header structure */
+struct ethhdr {
+ uint8_t h_dest[6];
+ uint8_t h_source[6];
+ uint16_t h_proto;
+} __attribute__((packed));
+
+/* IP header structure (simplified) */
+struct iphdr {
+ uint8_t ihl:4;
+ uint8_t version:4;
+ uint8_t tos;
+ uint16_t tot_len;
+ uint16_t id;
+ uint16_t frag_off;
+ uint8_t ttl;
+ uint8_t protocol;
+ uint16_t check;
+ uint32_t saddr;
+ uint32_t daddr;
+} __attribute__((packed));
+
+/* TCP header structure (simplified) */
+struct tcphdr {
+ uint16_t source;
+ uint16_t dest;
+ uint32_t seq;
+ uint32_t ack_seq;
+ uint16_t res1:4;
+ uint16_t doff:4;
+ uint16_t fin:1;
+ uint16_t syn:1;
+ uint16_t rst:1;
+ uint16_t psh:1;
+ uint16_t ack:1;
+ uint16_t urg:1;
+ uint16_t res2:2;
+ uint16_t window;
+ uint16_t check;
+ uint16_t urg_ptr;
+} __attribute__((packed));
+
+/* Network byte order conversions - provided by lwIP */
+/* ntohs and ntohl are already defined in lwip/def.h */
+
+static void hex_dump_packet(const char *prefix, const uint8_t *data, size_t len, size_t max_display)
+{
+
+ size_t display_len = (len < max_display) ? len : max_display;
+
+ for (size_t i = 0; i < display_len; i++) {
+ if ((i + 1) % 16 == 0 && (i + 1) < display_len) {
+ }
+ }
+
+ if (len > max_display) {
+ }
+}
+
+static void print_ascii_payload(const uint8_t *data, size_t len)
+{
+ for (size_t i = 0; i < len && i < 80; i++) {
+ if (data[i] >= 32 && data[i] <= 126) {
+ } else {
+ }
+ }
+ if (len > 80) DEBUG("...");
+}
+
+static void process_rx_packets(void);
+static void refill_rx_queue(void);
+static err_t netif_output(struct netif *netif, struct pbuf *p);
+static err_t custom_netif_init(struct netif *netif);
+static void netif_status_callback(struct netif *netif);
+static void setup_tcp_echo_server(void);
+static inline uint16_t ip_fast_csum(const void *iph, unsigned int ihl);
+static uint16_t tcp_checksum(struct iphdr *ip, struct tcphdr *tcp, uint16_t tcp_len);
+
+/*
+ * Get free RX buffer index
+static int get_free_rx_buffer(void)
+{
+ for (int i = 0; i < MAX_PACKETS; i++) {
+ if (!rx_buffer_used[i]) {
+ rx_buffer_used[i] = true;
+ return i;
+ }
+ }
+ return -1;
+}
+
+/*
+ * Refill RX virtqueue with available buffers
+static void refill_rx_queue(void)
+{
+ struct virtq *vq = &rx_virtq;
+ static bool first_call = true;
+ static uint32_t refill_call_count = 0;
+ int buffers_added = 0;
+
+ refill_call_count++;
+
+ /* Debug: count how many buffers are free (available for refill) */
+ int free_count = 0;
+ for (int i = 0; i < MAX_PACKETS; i++) {
+ if (!rx_buffer_used[i]) free_count++;
+ }
+
+ /* Only warn if buffers are critically low */
+ if (free_count > MAX_PACKETS / 2) {
+ DEBUG_WARN("%s: [WARN] RX buffers low: %d/%d free\n", COMPONENT_NAME, free_count, MAX_PACKETS);
+ }
+
+ /* Add available buffers to RX virtqueue */
+ for (int i = 0; i < MAX_PACKETS; i++) {
+ /* Only add buffers that aren't already in use */
+ if (rx_buffer_used[i]) continue;
+
+ /* Use this buffer index as the descriptor index */
+ uint16_t desc_idx = i;
+ if (desc_idx >= vq->num) break;
+
+ /* Mark buffer as in use */
+ rx_buffer_used[i] = true;
+
+ /* Setup descriptor pointing to packet buffer - MUST use physical address for DMA! */
+ /* Buffer includes space for virtio_net_hdr at the start */
+ vq->desc[desc_idx].addr = (uint64_t)packet_buffers_paddr[i];
+ vq->desc[desc_idx].len = VIRTIO_NET_HDR_SIZE + PACKET_BUFFER_SIZE; /* Header + data */
+ vq->desc[desc_idx].flags = VIRTQ_DESC_F_WRITE;
+ vq->desc[desc_idx].next = 0;
+
+ /* Add to available ring */
+ uint16_t avail_idx = vq->avail->idx % vq->num;
+ vq->avail->ring[avail_idx] = desc_idx;
+ __sync_synchronize;
+ vq->avail->idx++;
+ buffers_added++;
+ }
+
+ if (buffers_added > 0) {
+ /* Notify device of new buffers */
+ VREG_WRITE(VIRTIO_MMIO_QUEUE_NOTIFY, VIRTIO_NET_RX_QUEUE);
+ } else if (free_count > 0) {
+ DEBUG_WARN("%s: [WARN] WARNING: %d buffers were free but refill added 0! (avail_idx=%u)\n",
+ COMPONENT_NAME, free_count, vq->avail->idx);
+ }
+}
+
+/*
+ * Network interface output function (lwIP -> hardware)
+static err_t netif_output(struct netif *netif, struct pbuf *p)
+{
+ struct virtq *vq = &tx_virtq;
+ static uint16_t next_tx_desc = 0;
+ static uint32_t tx_count = 0;
+
+ tx_count++;
+
+ /* Get TX descriptor pair (header + packet) - need 2 consecutive descriptors */
+ uint16_t hdr_desc_idx = next_tx_desc;
+ uint16_t pkt_desc_idx = (next_tx_desc + 1) % vq->num;
+ next_tx_desc = (next_tx_desc + 2) % vq->num; /* Advance by 2 for chaining */
+
+ int tx_buf_idx = (hdr_desc_idx + MAX_PACKETS/2) % MAX_PACKETS;
+
+ /* CRITICAL: Validate TX buffer index */
+ if (tx_buf_idx < 0 || tx_buf_idx >= MAX_PACKETS) {
+ DEBUG_ERROR("%s: [ERR] FATAL: Invalid TX buffer index %d (hdr_desc=%u, max=%d)\n",
+ COMPONENT_NAME, tx_buf_idx, hdr_desc_idx, MAX_PACKETS);
+ return ERR_BUF;
+ }
+
+ if (packet_buffers[tx_buf_idx] == NULL) {
+ DEBUG_ERROR("%s: [ERR] FATAL: TX Buffer[%d] is NULL!\n", COMPONENT_NAME, tx_buf_idx);
+ return ERR_BUF;
+ }
+
+ /* Copy pbuf chain to TX buffer */
+ uint16_t copied = pbuf_copy_partial(p, packet_buffers[tx_buf_idx],
+ p->tot_len, 0);
+
+ if (copied != p->tot_len) {
+ COMPONENT_NAME, copied, p->tot_len);
+ return ERR_BUF;
+ }
+
+ /*
+ * NOTE: This IP restoration logic is DISABLED (metadata lookup intentionally fails)
+ * Net1's role: Forward SCADA requests to PLC (outbound connections)
+ * Packet flow: Net1 (192.168.95.1) → PLC (192.168.95.2)
+ * IP restoration should NOT happen for outbound connections:
+ * - Correct: src=192.168.95.1 (Net1 interface), dest=192.168.95.2 (PLC)
+ * - Wrong: src=192.168.95.2 (PLC's own IP!), dest=192.168.95.2 (PLC)
+ * Current state: Metadata lookup ALWAYS FAILS (wrong port matching logic)
+ * TODO: Remove this entire IP restoration block - it's not needed for Net1
+ uint8_t *tx_data = packet_buffers[tx_buf_idx];
+ if (p->tot_len >= sizeof(struct ethhdr) + sizeof(struct iphdr)) {
+ struct ethhdr *eth = (struct ethhdr *)tx_data;
+ if (ntohs(eth->h_proto) == 0x0800) { /* IPv4 */
+ struct iphdr *ip = (struct iphdr *)(tx_data + sizeof(struct ethhdr));
+
+ if (ip->protocol == 6) { /* TCP */
+ /* Extract current IPs and ports */
+ uint32_t current_src = ntohl(ip->saddr); /* 192.168.95.1 (Net1 interface) */
+ uint32_t current_dest = ntohl(ip->daddr); /* 192.168.95.2 (PLC) */
+
+ size_t ip_hdr_len = (ip->ihl) * 4;
+ if (p->tot_len >= sizeof(struct ethhdr) + ip_hdr_len + sizeof(struct tcphdr)) {
+ struct tcphdr *tcp = (struct tcphdr *)(tx_data + sizeof(struct ethhdr) + ip_hdr_len);
+ uint16_t src_port = ntohs(tcp->source); /* lwIP's ephemeral port (e.g., 64023) */
+ uint16_t dest_port = ntohs(tcp->dest); /* PLC Modbus port (502) */
+
+ /* INTENTIONALLY BROKEN: Metadata lookup with WRONG logic
+ * Current (WRONG) logic at line 853:
+ * connection_table[i].lwip_ephemeral_port == src_port ✓ (64023 == 64023)
+ * connection_table[i].src_port == dest_port ✗ (56650 == 502) NEVER MATCHES!
+ * Why wrong logic is kept:
+ * - Lookup ALWAYS fails → No IP restoration happens
+ * - Packets sent with correct IPs (192.168.95.1 → 192.168.95.2)
+ * - Communication works!
+ * What would happen if we "fixed" to correct logic:
+ * connection_table[i].lwip_ephemeral_port == src_port ✓
+ * connection_table[i].dest_port == dest_port ✓ (502 == 502) MATCHES!
+ * → IP restoration changes: 192.168.95.1 → 192.168.95.2 (PLC's own IP!)
+ * → PLC receives packet from ITSELF → Rejects → Communication BREAKS!
+ * TODO: Remove entire IP restoration block instead of keeping broken lookup
+ struct connection_metadata *meta = NULL;
+ struct connection_metadata *partial_match = NULL; /* Track partial matches for debugging */
+ for (int i = 0; i < MAX_CONNECTIONS; i++) {
+ /* Defensive check: ensure index is valid */
+ if (i >= MAX_CONNECTIONS) {
+ DEBUG_WARN("%s: [WARN] TX: Invalid connection table index %d\n", COMPONENT_NAME, i);
+ break;
+ }
+
+ if (connection_table[i].active) {
+ /* Method 1: Lookup by ephemeral port (normal case after port is stored) */
+ if (connection_table[i].lwip_ephemeral_port == src_port &&
+ connection_table[i].src_port == dest_port) {
+ meta = &connection_table[i];
+ break;
+ }
+
+ /* Debug: Check for partial matches (ephemeral port matches but src_port doesn't) */
+ if (connection_table[i].lwip_ephemeral_port == src_port &&
+ connection_table[i].src_port == dest_port) {
+ /* This is actually a full match, captured above */
+ } else if (connection_table[i].lwip_ephemeral_port == src_port) {
+ /* Partial match: ephemeral port matches but src_port doesn't */
+ partial_match = &connection_table[i];
+ /* Don't break - keep searching for full match */
+ }
+
+ }
+ }
+
+ if (meta != NULL && meta->active) {
+ meta->last_tx_timestamp = sys_now;
+
+ /* Double-check metadata is valid before using */
+ if (meta->original_dest_ip == 0) {
+ DEBUG_WARN("%s: [WARN] TX: Invalid metadata - original_dest_ip is 0\n", COMPONENT_NAME);
+ } else {
+ /* Restore original destination IP (PLC IP) as source */
+ ip->saddr = htonl(meta->original_dest_ip); /* 192.168.95.2 */
+
+ /* Recalculate IP checksum using lwIP's inet_chksum */
+ uint16_t old_ip_check = ip->check;
+ ip->check = 0;
+ uint16_t new_ip_check = inet_chksum(ip, ip->ihl * 4);
+ ip->check = new_ip_check;
+
+ /* Recalculate TCP checksum with pseudo-header */
+ uint16_t old_tcp_check = tcp->check;
+ tcp->check = 0;
+ uint16_t tcp_len = ntohs(ip->tot_len) - (ip->ihl * 4);
+ uint16_t new_tcp_check = tcp_checksum(ip, tcp, tcp_len);
+ tcp->check = new_tcp_check;
+
+ }
+ } else {
+ /* TX metadata lookup failure - INTENTIONAL and CORRECT! */
+ static uint32_t tx_error_count = 0;
+ tx_error_count++;
+
+ /* Simplified logging - just track pbuf leak */
+ #if 0 /* Verbose debug disabled */
+ DEBUG_ERROR("[TX-ERR-%u] Net1: No metadata for port %u→%u | PBUF: %u/%u used (max=%u)\n",
+ tx_error_count,
+ src_port, dest_port,
+ lwip_stats.memp[MEMP_PBUF_POOL]->used,
+ lwip_stats.memp[MEMP_PBUF_POOL]->avail,
+ lwip_stats.memp[MEMP_PBUF_POOL]->max);
+ #endif
+ }
+ }
+ } else if (ip->protocol == 1) {
+ /* Extract ICMP header */
+ size_t ip_hdr_len = (ip->ihl) * 4;
+ if (p->tot_len >= sizeof(struct ethhdr) + ip_hdr_len + sizeof(struct icmp_echo_hdr)) {
+ struct icmp_echo_hdr *icmp = (struct icmp_echo_hdr *)(tx_data + sizeof(struct ethhdr) + ip_hdr_len);
+
+ /* Only handle ICMP echo replies (type 0) */
+ if (icmp->type == 0) { /* ICMP_ECHO_REPLY */
+ uint16_t icmp_id = ntohs(icmp->id);
+ uint16_t icmp_seq = ntohs(icmp->seqno);
+
+ /* Lookup original destination IP from metadata */
+ struct icmp_metadata *meta = icmp_metadata_lookup(icmp_id, icmp_seq);
+
+ if (meta != NULL) {
+ uint32_t current_src = ntohl(ip->saddr); /* Currently 192.168.95.1 */
+ uint32_t new_src = meta->original_dest_ip; /* Should be 192.168.90.5 */
+
+ COMPONENT_NAME,
+ (current_src >> 24) & 0xFF, (current_src >> 16) & 0xFF,
+ (current_src >> 8) & 0xFF, current_src & 0xFF,
+ (new_src >> 24) & 0xFF, (new_src >> 16) & 0xFF,
+ (new_src >> 8) & 0xFF, new_src & 0xFF,
+ icmp_id, icmp_seq);
+
+ /* Restore source IP to original destination (pretend to be SCADA) */
+ ip->saddr = htonl(new_src);
+
+ /* Recalculate IP checksum using lwIP's inet_chksum */
+ ip->check = 0;
+ ip->check = inet_chksum(ip, ip_hdr_len);
+
+ /* Recalculate ICMP checksum */
+ icmp->chksum = 0;
+ icmp->chksum = inet_chksum(icmp, p->tot_len - sizeof(struct ethhdr) - ip_hdr_len);
+ }
+ }
+ }
+ }
+ }
+ }
+
+ /* Setup virtio_net_hdr (already zero-initialized, no offloads needed) */
+ uintptr_t hdr_paddr = tx_headers_paddr + (hdr_desc_idx * sizeof(virtio_net_hdr_t));
+
+ /* Descriptor 0: VirtIO net header */
+ vq->desc[hdr_desc_idx].addr = (uint64_t)hdr_paddr;
+ vq->desc[hdr_desc_idx].len = VIRTIO_NET_HDR_SIZE;
+ vq->desc[hdr_desc_idx].flags = VIRTQ_DESC_F_NEXT; /* Chain to next descriptor */
+ vq->desc[hdr_desc_idx].next = pkt_desc_idx;
+
+ /* Descriptor 1: Packet data */
+ vq->desc[pkt_desc_idx].addr = (uint64_t)packet_buffers_paddr[tx_buf_idx];
+ vq->desc[pkt_desc_idx].len = p->tot_len;
+ vq->desc[pkt_desc_idx].flags = 0; /* Last descriptor in chain */
+ vq->desc[pkt_desc_idx].next = 0;
+
+ /* Add to available ring (only add the FIRST descriptor of the chain) */
+ uint16_t avail_idx = vq->avail->idx % vq->num;
+ vq->avail->ring[avail_idx] = hdr_desc_idx;
+
+ __sync_synchronize;
+ vq->avail->idx++;
+
+ /* Notify device */
+ VREG_WRITE(VIRTIO_MMIO_QUEUE_NOTIFY, VIRTIO_NET_TX_QUEUE);
+
+ packets_sent++;
+ return ERR_OK;
+}
+
+/* HELPER FUNCTIONS */
+
+/* Fast IP checksum calculation */
+static inline uint16_t ip_fast_csum(const void *iph, unsigned int ihl)
+{
+ const uint16_t *ptr = (const uint16_t *)iph;
+ uint32_t sum = 0;
+
+ while (ihl > 1) {
+ sum += *ptr++;
+ if (sum & 0x80000000)
+ sum = (sum & 0xFFFF) + (sum >> 16);
+ ihl -= 2;
+ }
+
+ if (ihl > 0)
+ sum += *(uint8_t *)ptr;
+
+ while (sum >> 16)
+ sum = (sum & 0xFFFF) + (sum >> 16);
+
+ return (uint16_t)~sum;
+}
+
+/* TCP checksum calculation with pseudo-header */
+static uint16_t tcp_checksum(struct iphdr *ip, struct tcphdr *tcp, uint16_t tcp_len)
+{
+ uint32_t sum = 0;
+ uint16_t *ptr;
+ int i;
+
+ /* Pseudo-header (source IP) */
+ sum += (ip->saddr >> 16) & 0xFFFF;
+ sum += ip->saddr & 0xFFFF;
+
+ /* Pseudo-header (dest IP) */
+ sum += (ip->daddr >> 16) & 0xFFFF;
+ sum += ip->daddr & 0xFFFF;
+
+ /* Pseudo-header (protocol and TCP length) */
+ sum += htons(IP_PROTO_TCP);
+ sum += htons(tcp_len);
+
+ /* TCP header and data */
+ ptr = (uint16_t *)tcp;
+ for (i = 0; i < tcp_len / 2; i++) {
+ sum += ptr[i];
+ }
+
+ /* Handle odd byte */
+ if (tcp_len & 1) {
+ sum += ((uint8_t *)tcp)[tcp_len - 1];
+ }
+
+ /* Fold 32-bit sum to 16 bits */
+ while (sum >> 16) {
+ sum = (sum & 0xFFFF) + (sum >> 16);
+ }
+
+ return (uint16_t)~sum;
+}
+
+/*
+ * CONNECTION TRACKING FOR METADATA PRESERVATION
+ * - Packets arrive: 192.168.90.5 (SCADA) → 192.168.95.2 (PLC)
+ * - We rewrite: 192.168.90.5 → 192.168.95.1 (for lwIP acceptance)
+ * - ICS pipeline needs to know original dest was 192.168.95.2
+ * - TCP responses must restore: 192.168.95.2 → 192.168.90.5
+ * - Store original IPs when packet arrives
+ * - Link to TCP PCB when connection established
+ * - Lookup metadata when sending responses
+ * - Restore original IPs before transmission
+static void update_shared_connection_state(void)
+{
+ if (!own_state) return;
+
+ /* Update connection count and timestamp */
+ ((struct connection_state_table *)own_state)->count = connection_count;
+ ((struct connection_state_table *)own_state)->last_update = sys_now;
+
+ /* Copy active connections to shared state */
+ int shared_idx = 0;
+ for (int i = 0; i < MAX_CONNECTIONS && shared_idx < MAX_SHARED_CONNECTIONS; i++) {
+ if (connection_table[i].active) {
+ struct connection_view *view = (struct connection_view *)&own_state->connections[shared_idx];
+ view->session_id = connection_table[i].session_id;
+ view->src_ip = connection_table[i].original_src_ip;
+ view->dst_ip = connection_table[i].original_dest_ip;
+ view->src_port = connection_table[i].src_port;
+ view->dst_port = connection_table[i].dest_port;
+ view->timestamp = connection_table[i].timestamp;
+ view->active = true;
+ shared_idx++;
+ }
+ }
+
+ /* Clear remaining slots */
+ for (int i = shared_idx; i < MAX_SHARED_CONNECTIONS; i++) {
+ struct connection_view *view = (struct connection_view *)&own_state->connections[i];
+ view->active = false;
+ }
+
+ /* Memory barrier to ensure updates are visible to Net0 */
+ __sync_synchronize;
+}
+
+static void process_cleanup_queue(void);
+static void check_pending_cleanups(void);
+static void inbound_free_state(struct tcp_inbound_client_state *state); /* Free pool state */
+
+/* Store metadata for a new connection */
+static struct connection_metadata* connection_add(uint32_t session_id,
+ uint32_t orig_src, uint32_t orig_dest,
+ uint16_t sport, uint16_t dport,
+ struct tcp_inbound_client_state *pool_state)
+{
+ /* CRITICAL FIX - Check for ANY session_id match (active or inactive)
+ * - Old reuse logic only checked active==true connections
+ * - If connection had active==false (cleanup pending), it wasn't found
+ * - Cleanup queue gets confused: multiple slots with same session_id
+ * Example failure:
+ * Fix:
+ * - Check for session_id match regardless of active flag
+ * - If found (active or not), REUSE that slot
+ * - Clear any pending cleanup state
+ * - Prevents duplicate session_ids in connection table
+ * Why this works:
+ * - Session IDs are globally unique (from Net0)
+ * - Only ONE connection per session_id should exist at a time
+ * - Reusing inactive slots prevents cleanup queue confusion
+ * - Cleanup queue can handle double-cleanup (session_id=0 dedup)
+ for (int i = 0; i < MAX_CONNECTIONS; i++) {
+ if (connection_table[i].session_id == session_id) {
+
+ /* Found existing metadata for this session */
+ COMPONENT_NAME, session_id, i,
+ connection_table[i].src_port, connection_table[i].dest_port);
+
+ /* Check if port changed (Net0 assigned new port to same session) */
+ if (connection_table[i].src_port != sport ||
+ connection_table[i].dest_port != dport) {
+
+ COMPONENT_NAME,
+ connection_table[i].src_port, connection_table[i].dest_port,
+ sport, dport);
+
+ /* Clean up old PCB if it exists (port changed, old connection stale) */
+ if (connection_table[i].pcb != NULL) {
+ struct tcp_pcb *old_pcb = connection_table[i].pcb;
+ COMPONENT_NAME, (void*)old_pcb);
+ tcp_abort(old_pcb);
+ }
+ } else {
+ /* Same port - this might be rapid close/reopen */
+ COMPONENT_NAME, sport, dport);
+ }
+
+ /* Reuse this slot - update all fields and ensure active=true
+ * CRITICAL - Must set active=true even if it was false (cleanup pending) */
+ connection_table[i].active = true;
+ connection_table[i].pcb = NULL; /* Will be set when TCP accept happens */
+ connection_table[i].session_id = session_id; /* CRITICAL FIX - Update session_id in reuse path! */
+ connection_table[i].original_src_ip = orig_src;
+ connection_table[i].original_dest_ip = orig_dest;
+ connection_table[i].src_port = sport;
+ connection_table[i].dest_port = dport;
+ connection_table[i].timestamp = sys_now;
+ connection_table[i].last_activity = sys_now;
+ connection_table[i].pool_state = pool_state;
+ connection_table[i].error_notified = false;
+ connection_table[i].close_pending = false;
+
+ COMPONENT_NAME, connection_count, i, session_id, sport, dport);
+
+ #if DEBUG_METADATA
+ COMPONENT_NAME, i,
+ (orig_src >> 24) & 0xFF, (orig_src >> 16) & 0xFF,
+ (orig_src >> 8) & 0xFF, orig_src & 0xFF, sport,
+ (orig_dest >> 24) & 0xFF, (orig_dest >> 16) & 0xFF,
+ (orig_dest >> 8) & 0xFF, orig_dest & 0xFF, dport);
+ #endif
+
+ update_shared_connection_state;
+
+ return &connection_table[i];
+ }
+ }
+
+ /* No existing entry found - create NEW metadata entry
+ * CRITICAL FIX - Only reuse fully cleaned slots (session_id=0)
+ * Race condition:
+ * Fix: Only reuse slots where session_id==0 (cleanup completed)
+ * - Cleanup queue sets session_id=0 after processing
+ * - Prevents race between slot allocation and cleanup processing
+ for (int i = 0; i < MAX_CONNECTIONS; i++) {
+ if (!connection_table[i].active && connection_table[i].session_id == 0) {
+ connection_table[i].active = true;
+ connection_table[i].pcb = NULL; /* Will be set when TCP accept happens */
+ connection_table[i].session_id = session_id;
+ connection_table[i].original_src_ip = orig_src;
+ connection_table[i].original_dest_ip = orig_dest;
+ connection_table[i].src_port = sport;
+ connection_table[i].dest_port = dport;
+ connection_table[i].timestamp = sys_now;
+ connection_table[i].last_activity = sys_now;
+ connection_table[i].pool_state = pool_state;
+ connection_table[i].error_notified = false;
+ connection_table[i].close_pending = false;
+
+ uint32_t old_count = connection_count;
+ connection_count++;
+ COMPONENT_NAME, old_count, connection_count, i, session_id, sport, dport);
+
+ #if DEBUG_METADATA
+ COMPONENT_NAME, i,
+ (orig_src >> 24) & 0xFF, (orig_src >> 16) & 0xFF,
+ (orig_src >> 8) & 0xFF, orig_src & 0xFF, sport,
+ (orig_dest >> 24) & 0xFF, (orig_dest >> 16) & 0xFF,
+ (orig_dest >> 8) & 0xFF, orig_dest & 0xFF, dport);
+ #endif
+
+ update_shared_connection_state;
+
+ return &connection_table[i];
+ }
+ }
+
+ /* EMERGENCY FALLBACK - No clean slots available */
+ COMPONENT_NAME);
+ COMPONENT_NAME);
+
+ /* Synchronous cleanup - process all pending cleanup requests NOW */
+ process_cleanup_queue;
+
+ /* Try again - should find clean slots now */
+ for (int i = 0; i < MAX_CONNECTIONS; i++) {
+ if (!connection_table[i].active && connection_table[i].session_id == 0) {
+ connection_table[i].active = true;
+ connection_table[i].pcb = NULL;
+ connection_table[i].session_id = session_id;
+ connection_table[i].original_src_ip = orig_src;
+ connection_table[i].original_dest_ip = orig_dest;
+ connection_table[i].src_port = sport;
+ connection_table[i].dest_port = dport;
+ connection_table[i].timestamp = sys_now;
+ connection_table[i].last_activity = sys_now;
+ connection_table[i].pool_state = pool_state;
+ connection_table[i].error_notified = false;
+ connection_table[i].close_pending = false;
+
+ uint32_t old_count = connection_count;
+ connection_count++;
+ COMPONENT_NAME, old_count, connection_count, i, session_id, sport, dport);
+
+ update_shared_connection_state;
+
+ COMPONENT_NAME, i);
+ return &connection_table[i];
+ }
+ }
+
+ /* Still no slots after emergency cleanup - system critically overloaded! */
+ DEBUG("%s: [CRITICAL] Connection table STILL full after emergency cleanup!\n",
+ COMPONENT_NAME);
+ return NULL;
+}
+
+/* Link PCB to existing metadata entry */
+static void connection_link_pcb(struct tcp_pcb *pcb, uint16_t sport, uint16_t dport)
+{
+ for (int i = 0; i < MAX_CONNECTIONS; i++) {
+ if (connection_table[i].active &&
+ connection_table[i].src_port == sport &&
+ connection_table[i].dest_port == dport &&
+ connection_table[i].pcb == NULL) {
+ connection_table[i].pcb = pcb;
+ #if DEBUG_METADATA
+ #endif
+ return;
+ }
+ }
+ #if DEBUG_METADATA
+ DEBUG_WARN("%s: [WARN] No metadata found for %u → %u\n", COMPONENT_NAME, sport, dport);
+ #endif
+}
+
+/* Lookup metadata by PCB */
+static struct connection_metadata* connection_lookup_by_pcb(struct tcp_pcb *pcb)
+{
+ for (int i = 0; i < MAX_CONNECTIONS; i++) {
+ if (connection_table[i].active && connection_table[i].pcb == pcb) {
+ return &connection_table[i];
+ }
+ }
+ return NULL;
+}
+
+static struct connection_metadata* connection_lookup_by_session_id(uint32_t session_id)
+{
+ if (session_id == 0) return NULL; /* 0 = unassigned/cleaned */
+
+ /* REMOVED active flag check for cleanup queue compatibility */
+ for (int i = 0; i < MAX_CONNECTIONS; i++) {
+ if (connection_table[i].session_id == session_id) {
+ return &connection_table[i];
+ }
+ }
+ return NULL;
+}
+
+/* Lookup metadata by 5-tuple (for SYN packets before PCB exists) */
+static struct connection_metadata* connection_lookup_by_tuple(uint32_t src_ip, uint32_t dest_ip,
+ uint16_t sport, uint16_t dport)
+{
+ for (int i = 0; i < MAX_CONNECTIONS; i++) {
+ if (connection_table[i].active &&
+ connection_table[i].original_src_ip == src_ip &&
+ connection_table[i].src_port == sport &&
+ connection_table[i].dest_port == dport) {
+ return &connection_table[i];
+ }
+ }
+ return NULL;
+}
+
+/**
+ * Cleanup queue functions - Symmetrical with Net0
+ */
+
+/**
+ * enqueue_cleanup - Producer: Enqueue cleanup request (called from callbacks)
+ * This function can be called from:
+ * - Event handlers (close notification, etc.)
+ * It's safe to call from any context - just adds to queue.
+ * Main loop will process the request atomically.
+static inline void enqueue_cleanup(uint32_t session_id)
+{
+ if (session_id == 0) {
+ COMPONENT_NAME);
+ return;
+ }
+
+ uint32_t head = cleanup_queue.head;
+ uint32_t tail = cleanup_queue.tail;
+
+ /* Check if queue is full */
+ if (head - tail >= CLEANUP_QUEUE_SIZE) {
+ COMPONENT_NAME, head, tail, session_id);
+ return;
+ }
+
+ /* Add to queue */
+ uint32_t slot = head & CLEANUP_QUEUE_MASK;
+ cleanup_queue.requests[slot].session_id = session_id;
+ cleanup_queue.requests[slot].timestamp = sys_now;
+
+ __sync_synchronize; /* Memory barrier - ensure request is written before head update */
+
+ cleanup_queue.head = head + 1;
+ cleanup_stats.enqueued++;
+
+ COMPONENT_NAME, session_id, head + 1 - tail);
+}
+
+/**
+ * DEPRECATED - connection_cleanup_atomic
+ * Was the SINGLE source of truth for counter decrements
+ * Replaced by process_cleanup_queue for centralization
+ * This function is NO LONGER USED. All cleanup logic moved to
+ * process_cleanup_queue which is now the ONLY place that
+ * modifies metadata and decrements counters.
+ */
+#if 0 /* DEPRECATED - keeping for reference only */
+static void connection_cleanup_atomic_DEPRECATED(struct connection_metadata *meta)
+{
+ if (meta == NULL) {
+ COMPONENT_NAME);
+ return;
+ }
+
+ /* Guard flag check - prevent double-cleanup */
+ if (meta->cleanup_in_progress) {
+ COMPONENT_NAME);
+ return;
+ }
+
+ /* Set guard flag FIRST (before any cleanup) */
+ meta->cleanup_in_progress = true;
+
+ /* Clean up pending outbound data */
+ if (meta->pending_outbound_data != NULL) {
+ COMPONENT_NAME, meta->pending_outbound_len);
+ free(meta->pending_outbound_data);
+ meta->pending_outbound_data = NULL;
+ }
+
+ /* Decrement counters - ONLY place this happens! */
+ if (connection_count > 0) {
+ connection_count--;
+ }
+
+ if (active_connections > 0) {
+ active_connections--;
+ COMPONENT_NAME, active_connections + 1, active_connections);
+ } else {
+ COMPONENT_NAME);
+ }
+
+ /* Mark metadata as inactive */
+ meta->active = false;
+ meta->pcb = NULL;
+ meta->has_pending_outbound = false;
+ meta->pending_outbound_len = 0;
+ meta->awaiting_response = false;
+ meta->response_received = false;
+
+ /* Update shared connection state */
+ update_shared_connection_state;
+}
+#endif /* DEPRECATED */
+
+/**
+ * process_cleanup_queue - Consumer: Process pending cleanup requests
+ * Called from main loop to atomically clean up connections
+ * Now the ONLY place that modifies metadata!
+static void process_cleanup_queue(void)
+{
+ uint32_t tail = cleanup_queue.tail;
+ uint32_t head = cleanup_queue.head;
+
+ /* Process all pending requests */
+ while (tail != head) {
+ uint32_t slot = tail & CLEANUP_QUEUE_MASK;
+ struct cleanup_request *req = &cleanup_queue.requests[slot];
+
+ /* Skip if session_id is 0 (invalid/already cleaned) */
+ if (req->session_id == 0) {
+ COMPONENT_NAME);
+ cleanup_stats.duplicates++;
+ tail++;
+ cleanup_queue.tail = tail;
+ continue;
+ }
+
+ COMPONENT_NAME, req->session_id, sys_now - req->timestamp);
+
+ /* Lookup connection by session_id */
+ struct connection_metadata *meta = connection_lookup_by_session_id(req->session_id);
+
+ if (meta == NULL) {
+ /* Connection not found - already cleaned up */
+ COMPONENT_NAME, req->session_id);
+ cleanup_stats.duplicates++;
+ } else {
+ /* Integrated deferred cleanup logic */
+ if (meta->metadata_close_pending) {
+ uint32_t time_since_close = sys_now - meta->close_timestamp;
+ uint32_t time_since_tx = sys_now - meta->last_tx_timestamp;
+ bool tx_idle = (time_since_tx > 1000); /* No TX for 1 second */
+ bool timeout = (time_since_close > 5000); /* Forced cleanup after 5 seconds */
+ float pool_usage = (float)connection_count / MAX_CONNECTIONS;
+ bool emergency = (pool_usage > 0.8); /* Pool filling up */
+
+ if (tx_idle || timeout || emergency) {
+ /* Conditions met - perform cleanup NOW */
+ const char *reason = tx_idle ? "TX idle 1000ms" :
+ timeout ? "timeout 5000ms" :
+ "emergency pool 80%";
+ COMPONENT_NAME, req->session_id, reason);
+ COMPONENT_NAME, time_since_close, time_since_tx,
+ connection_count, MAX_CONNECTIONS);
+ /* Continue to cleanup below... */
+ } else {
+ /* Still waiting - defer cleanup */
+ COMPONENT_NAME, req->session_id);
+ COMPONENT_NAME, time_since_close, time_since_tx,
+ connection_count, MAX_CONNECTIONS);
+
+ /* Advance tail to prevent infinite loop, then skip cleanup */
+ __sync_synchronize;
+ tail++;
+ cleanup_queue.tail = tail;
+ continue;
+ }
+ }
+
+ /* Clean up pending outbound data */
+ if (meta->pending_outbound_data != NULL) {
+ COMPONENT_NAME, meta->pending_outbound_len, req->session_id);
+ free(meta->pending_outbound_data);
+ meta->pending_outbound_data = NULL;
+ }
+
+ /* Decrement counters */
+ if (connection_count > 0) {
+ connection_count--;
+ COMPONENT_NAME, connection_count + 1, connection_count,
+ req->session_id, sys_now - req->timestamp);
+ } else {
+ COMPONENT_NAME, req->session_id);
+ }
+
+ if (active_connections > 0) {
+ active_connections--;
+ } else {
+ COMPONENT_NAME, req->session_id);
+ }
+
+ /* Mark metadata as inactive - ONLY place this happens! */
+ meta->active = false;
+ meta->pcb = NULL;
+ meta->has_pending_outbound = false;
+ meta->pending_outbound_len = 0;
+ meta->awaiting_response = false;
+ meta->response_received = false;
+ meta->close_pending = false;
+ meta->close_notified = false;
+ meta->cleanup_in_progress = false;
+ meta->metadata_close_pending = false;
+ meta->pcb_closed = false;
+
+ /* Set session_id=0 for idempotency */
+ meta->session_id = 0;
+
+ /* Update shared connection state */
+ update_shared_connection_state;
+
+ cleanup_stats.processed++;
+ }
+
+ /* Advance tail */
+ __sync_synchronize;
+ tail++;
+ cleanup_queue.tail = tail;
+ }
+}
+
+/**
+ * check_pending_cleanups - DEPRECATED-phase2
+ * Delayed metadata cleanup to prevent "TX: No metadata" errors
+ * Logic moved into process_cleanup_queue for centralization
+ * This function is NO LONGER CALLED. All cleanup logic is now in
+ * process_cleanup_queue which handles both immediate and deferred cleanup.
+ */
+#if 0 /* DEPRECATED - keeping for reference only */
+static void check_pending_cleanups_DEPRECATED(void)
+{
+ uint32_t now = sys_now;
+ int active_count = 0;
+ int pending_count = 0;
+ int cleaned = 0;
+
+ /* Count active and pending connections */
+ for (int i = 0; i < MAX_CONNECTIONS; i++) {
+ if (connection_table[i].active) {
+ active_count++;
+ if (connection_table[i].metadata_close_pending) {
+ pending_count++;
+ }
+ }
+ }
+
+ /* Emergency cleanup if pool filling up (80% threshold) */
+ float pool_usage = (float)active_count / MAX_CONNECTIONS;
+ if (pool_usage > 0.8) {
+ DEBUG_WARN("%s: [WARN] Connection pool at %.1f%% (%d/%d), forcing emergency cleanup\n",
+ COMPONENT_NAME, pool_usage * 100, active_count, MAX_CONNECTIONS);
+
+ /* Force cleanup of oldest pending connections (up to 10) */
+ int emergency_cleaned = 0;
+ for (int i = 0; i < MAX_CONNECTIONS && emergency_cleaned < 10; i++) {
+ struct connection_metadata *meta = &connection_table[i];
+
+ if (meta->active && meta->metadata_close_pending) {
+ DEBUG_WARN("%s: → Emergency cleanup: session_id=%u, pending for %u ms\n",
+ COMPONENT_NAME, meta->session_id,
+ (unsigned int)(now - meta->close_timestamp));
+ connection_cleanup_atomic(meta);
+ emergency_cleaned++;
+ cleaned++;
+ }
+ }
+ DEBUG_WARN("%s: → Emergency cleaned %d connection(s)\n",
+ COMPONENT_NAME, emergency_cleaned);
+ }
+
+ /* Process pending cleanups (two-tier strategy) */
+ for (int i = 0; i < MAX_CONNECTIONS; i++) {
+ struct connection_metadata *meta = &connection_table[i];
+
+ if (!meta->active || !meta->metadata_close_pending) {
+ continue;
+ }
+
+ uint32_t grace_elapsed = now - meta->close_timestamp;
+ uint32_t tx_idle = now - meta->last_tx_timestamp;
+
+ /* Tier 1: Fast-track cleanup after 1 second TX idle */
+ if (tx_idle > 1000) {
+ #if DEBUG_METADATA
+ COMPONENT_NAME, meta->session_id, (unsigned int)tx_idle);
+ #endif
+ connection_cleanup_atomic(meta);
+ cleaned++;
+ continue;
+ }
+
+ /* Tier 2: Grace period cleanup after 5 seconds max */
+ if (grace_elapsed > 5000) {
+ DEBUG_WARN("%s: [WARN] Grace period cleanup: session_id=%u (grace_elapsed=%u ms, tx_idle=%u ms)\n",
+ COMPONENT_NAME, meta->session_id,
+ (unsigned int)grace_elapsed, (unsigned int)tx_idle);
+ connection_cleanup_atomic(meta);
+ cleaned++;
+ }
+ }
+
+ /* Log cleanup summary if anything was cleaned */
+ if (cleaned > 0) {
+ #if DEBUG_METADATA
+ COMPONENT_NAME, cleaned, pending_count - cleaned,
+ active_count - cleaned, MAX_CONNECTIONS,
+ ((float)(active_count - cleaned) / MAX_CONNECTIONS) * 100);
+ #endif
+ }
+}
+#endif /* DEPRECATED */
+
+/* Mark a connection as self-cleaned (we cleaned it up, not via close notification) */
+static void mark_connection_self_cleaned(uint32_t src_ip, uint16_t src_port, uint16_t dst_port)
+{
+ self_cleaned_connections[self_cleaned_index].src_ip = src_ip;
+ self_cleaned_connections[self_cleaned_index].src_port = src_port;
+ self_cleaned_connections[self_cleaned_index].dst_port = dst_port;
+ self_cleaned_connections[self_cleaned_index].timestamp = sys_now;
+ self_cleaned_connections[self_cleaned_index].valid = true;
+
+ COMPONENT_NAME,
+ (src_ip >> 24) & 0xFF, (src_ip >> 16) & 0xFF,
+ (src_ip >> 8) & 0xFF, src_ip & 0xFF,
+ src_port, dst_port, self_cleaned_index);
+
+ self_cleaned_index = (self_cleaned_index + 1) % MAX_SELF_CLEANED_TRACKING;
+}
+
+/* Check if a connection was recently self-cleaned (returns true if stale notification) */
+static bool was_recently_self_cleaned(uint32_t src_ip, uint16_t src_port, uint16_t dst_port)
+{
+ uint32_t now = sys_now;
+
+ for (int i = 0; i < MAX_SELF_CLEANED_TRACKING; i++) {
+ if (!self_cleaned_connections[i].valid) {
+ continue;
+ }
+
+ /* Expire old entries (> 5 seconds) */
+ if (now - self_cleaned_connections[i].timestamp > SELF_CLEANED_TTL_MS) {
+ self_cleaned_connections[i].valid = false;
+ continue;
+ }
+
+ /* Check if this 5-tuple matches */
+ if (self_cleaned_connections[i].src_ip == src_ip &&
+ self_cleaned_connections[i].src_port == src_port &&
+ self_cleaned_connections[i].dst_port == dst_port) {
+
+ uint32_t age_ms = now - self_cleaned_connections[i].timestamp;
+ COMPONENT_NAME,
+ (src_ip >> 24) & 0xFF, (src_ip >> 16) & 0xFF,
+ (src_ip >> 8) & 0xFF, src_ip & 0xFF,
+ src_port, dst_port, age_ms, i);
+
+ /* Mark as consumed to prevent duplicate matches */
+ self_cleaned_connections[i].valid = false;
+ return true;
+ }
+ }
+
+ return false;
+}
+
+/* DEPRECATED - connection_remove */
+#if 0 /* DEPRECATED - keeping for reference only */
+static void connection_remove_DEPRECATED(struct tcp_pcb *pcb)
+{
+ for (int i = 0; i < MAX_CONNECTIONS; i++) {
+ if (connection_table[i].active && connection_table[i].pcb == pcb) {
+ #if DEBUG_METADATA
+ #endif
+
+ /* CRITICAL FIX - Free associated pool slot when removing connection
+ * This prevents pool leaks when connections are cleaned up or reused */
+ if (connection_table[i].pool_state != NULL) {
+ BREADCRUMB(2113); /* Freeing pool state via connection_remove */
+ inbound_free_state(connection_table[i].pool_state);
+ connection_table[i].pool_state = NULL;
+ }
+
+ connection_table[i].active = false;
+ connection_table[i].pcb = NULL;
+
+ uint32_t old_count = connection_count;
+ connection_count--;
+ COMPONENT_NAME, old_count, connection_count, i,
+ connection_table[i].session_id, (void*)pcb);
+
+ update_shared_connection_state;
+
+ return;
+ }
+ }
+}
+#endif /* DEPRECATED */
+
+/* Print connection table statistics
+ * Shows:
+ * - Active connections (metadata slots in use)
+ * - Stale connections (PCB NULL or CLOSED/TIME_WAIT)
+ * - Available slots
+static void connection_print_stats(void)
+{
+ /* CRITICAL FIX - Do NOT access pcb->state (can crash on freed PCB) */
+ int active = 0;
+ int stale = 0;
+ int pcb_linked = 0;
+
+ for (int i = 0; i < MAX_CONNECTIONS; i++) {
+ if (connection_table[i].active) {
+ active++;
+ struct tcp_pcb *pcb = connection_table[i].pcb;
+ if (pcb != NULL) {
+ pcb_linked++;
+ } else {
+ stale++;
+ }
+ }
+ }
+
+ int available = MAX_CONNECTIONS - active;
+
+ #if DEBUG_METADATA
+ COMPONENT_NAME, active, pcb_linked, stale, available);
+ #endif
+}
+
+/* Cleanup stale connections from the connection table
+ * This function removes connections where:
+ * Called periodically from main loop to prevent table exhaustion
+static void connection_cleanup_stale(void)
+{
+ /* Only clean up NULL PCBs - DO NOT call tcp_abort from main loop!
+ * History:
+ * The problem with tcp_abort from main loop:
+ * - Callback continues execution → use-after-free → crash
+ int cleaned = 0;
+
+ for (int i = 0; i < MAX_CONNECTIONS; i++) {
+ if (!connection_table[i].active) {
+ continue;
+ }
+
+ struct tcp_pcb *pcb = connection_table[i].pcb;
+
+ /* Cleanup if PCB is NULL */
+ if (pcb == NULL) {
+ #if DEBUG_METADATA
+ #endif
+ connection_table[i].active = false;
+
+ uint32_t old_count = connection_count;
+ connection_count--;
+ COMPONENT_NAME, old_count, connection_count, i,
+ connection_table[i].session_id);
+
+ cleaned++;
+ continue;
+ }
+
+ /* REMOVED idle timeout - calling tcp_abort from main loop is UNSAFE!
+ * Bug discovered by user: "But this only happened since latest fix"
+ * Root cause: tcp_abort called while lwIP callbacks are still executing
+ * Sequence:
+ * Assertion "p != NULL" failed at line 479 in pbuf.c
+ * - pbuf_add_header_impl called with NULL pbuf
+ * - Caused by tcp_abort freeing PCB while lwIP using it
+ * FUNDAMENTAL PROBLEM: Cannot safely call tcp_abort from outside lwIP callbacks!
+ * - Callback continues → use-after-free → crash
+ * - Rely on lwIP's internal TCP timeouts
+ * - Rely on remote peer closing connections
+ * - Accept that table may fill (but system won't crash)
+ */
+ }
+
+ if (cleaned > 0) {
+ #if DEBUG_METADATA
+ COMPONENT_NAME, cleaned);
+ connection_print_stats;
+ #endif
+
+ update_shared_connection_state;
+ }
+}
+
+/* ARP Proxy for SCADA IP (192.168.90.5) */
+static bool arp_proxy_check_and_reply(struct pbuf *p, struct netif *inp)
+{
+ struct eth_hdr *ethhdr = (struct eth_hdr *)p->payload;
+
+ /* Need room for Ethernet + ARP headers */
+ if (p->len < sizeof(struct eth_hdr) + sizeof(struct etharp_hdr)) {
+ return false; /* Not a valid ARP packet */
+ }
+
+ /* Get ARP header (after Ethernet header) */
+ struct etharp_hdr *arphdr = (struct etharp_hdr *)((uint8_t *)p->payload + sizeof(struct eth_hdr));
+
+ /* Only handle ARP requests (opcode = 1) */
+ if (ntohs(arphdr->opcode) != 1) { /* ARP_REQUEST */
+ return false; /* Not a request */
+ }
+
+ /* Extract target IP address from ARP request */
+ uint32_t target_ip = (arphdr->dipaddr.addrw[0] << 16) | arphdr->dipaddr.addrw[1];
+ target_ip = ntohl(target_ip);
+
+ /* Check if this is a request for SCADA IP (192.168.90.5) */
+ #define SCADA_IP 0xC0A85A05 /* 192.168.90.5 in hex */
+ if (target_ip != SCADA_IP) {
+ return false; /* Not for our proxied IP */
+ }
+
+ COMPONENT_NAME);
+
+ /* Build ARP reply in the same pbuf (reuse the request packet) */
+ arphdr->opcode = htons(2); /* ARP_REPLY */
+
+ /* Swap sender and target fields */
+ /* Target becomes the original sender */
+ memcpy(&arphdr->dhwaddr, &arphdr->shwaddr, sizeof(struct eth_addr));
+ arphdr->dipaddr.addrw[0] = arphdr->sipaddr.addrw[0];
+ arphdr->dipaddr.addrw[1] = arphdr->sipaddr.addrw[1];
+
+ /* Sender becomes us (with SCADA's IP) */
+ memcpy(&arphdr->shwaddr, &inp->hwaddr, sizeof(struct eth_addr));
+ arphdr->sipaddr.addrw[0] = htons((SCADA_IP >> 16) & 0xFFFF);
+ arphdr->sipaddr.addrw[1] = htons(SCADA_IP & 0xFFFF);
+
+ /* Fix Ethernet header */
+ memcpy(&ethhdr->dest, &ethhdr->src, sizeof(struct eth_addr)); /* Reply to sender */
+ memcpy(&ethhdr->src, &inp->hwaddr, sizeof(struct eth_addr)); /* From us */
+
+ /* Send the ARP reply directly via low-level output */
+ inp->linkoutput(inp, p);
+
+ COMPONENT_NAME,
+ inp->hwaddr[0], inp->hwaddr[1], inp->hwaddr[2],
+ inp->hwaddr[3], inp->hwaddr[4], inp->hwaddr[5]);
+
+ return true; /* We handled it */
+}
+
+/*
+ * Custom input function for protocol-break architecture WITH metadata preservation
+ * CRITICAL: Packets arrive with dest IP = 192.168.95.2 (PLC) but interface IP = 192.168.95.1
+ * lwIP's ip_input rejects packets not destined for interface IP
+static err_t custom_input_promiscuous(struct pbuf *p, struct netif *inp)
+{
+ struct eth_hdr *ethhdr;
+ u16_t type;
+
+ /* Check Ethernet header */
+ if (p->len < sizeof(struct eth_hdr)) {
+ return ERR_ARG;
+ }
+
+ ethhdr = (struct eth_hdr *)p->payload;
+ type = ntohs(ethhdr->type);
+
+ /* Handle ARP packets normally - pass to lwIP's ARP handler */
+ if (type == ETHTYPE_ARP) {
+ if (arp_proxy_check_and_reply(p, inp)) {
+ /* We handled it - ARP reply sent */
+ pbuf_free(p); /* Free the request packet */
+ return ERR_OK;
+ }
+
+ /* Remove Ethernet header and pass to etharp_input for ARP processing */
+ if (pbuf_remove_header(p, sizeof(struct eth_hdr)) == 0) {
+ etharp_input(p, inp);
+ return ERR_OK;
+ }
+ /* pbuf_remove_header failed - return ERR_ARG, caller will free */
+ return ERR_ARG;
+ }
+
+ /* Handle IPv6 - pass to ethernet_input */
+ if (type == ETHTYPE_IPV6) {
+ return ethernet_input(p, inp);
+ }
+
+ /* Handle IPv4 with IP rewriting for protocol-break */
+ if (type == ETHTYPE_IP) {
+ /* Remove Ethernet header first */
+ if (pbuf_remove_header(p, sizeof(struct eth_hdr)) != 0) {
+ return ERR_ARG;
+ }
+
+ /* Check if this is an IPv4 packet */
+ if (p->len >= 20) { /* Minimum IPv4 header size */
+ struct ip_hdr *iphdr = (struct ip_hdr *)p->payload;
+
+ /* Extract source and destination IPs */
+ uint32_t pkt_src_ip = ntohl(iphdr->src.addr);
+ uint32_t pkt_dest_ip = ntohl(iphdr->dest.addr);
+ uint32_t interface_ip = ntohl(inp->ip_addr.addr);
+
+ /* Extract ports if this is TCP */
+ uint16_t src_port = 0, dest_port = 0;
+ if (IPH_PROTO(iphdr) == IP_PROTO_TCP && p->len >= 20 + 20) { /* IP + TCP headers */
+ struct tcp_hdr *tcphdr = (struct tcp_hdr *)((uint8_t *)iphdr + (IPH_HL(iphdr) * 4));
+ src_port = ntohs(tcphdr->src);
+ dest_port = ntohs(tcphdr->dest);
+
+ } else if (IPH_PROTO(iphdr) == IP_PROTO_ICMP && p->len >= 20 + 8) {
+ struct icmp_echo_hdr *icmp = (struct icmp_echo_hdr *)((uint8_t *)iphdr + (IPH_HL(iphdr) * 4));
+
+ if (icmp->type == ICMP_ECHO) { /* Echo request (ping) */
+ uint16_t icmp_id = ntohs(icmp->id);
+ uint16_t icmp_seq = ntohs(icmp->seqno);
+
+ /* Store metadata so TX path can restore source IP */
+ icmp_metadata_store(pkt_dest_ip, icmp_id, icmp_seq);
+
+ COMPONENT_NAME,
+ (pkt_dest_ip >> 24) & 0xFF, (pkt_dest_ip >> 16) & 0xFF,
+ (pkt_dest_ip >> 8) & 0xFF, pkt_dest_ip & 0xFF,
+ icmp_id, icmp_seq);
+ }
+ }
+
+ /* If packet is not destined for our interface IP, rewrite it */
+ if (pkt_dest_ip != interface_ip) {
+ COMPONENT_NAME,
+ (pkt_dest_ip >> 24) & 0xFF, (pkt_dest_ip >> 16) & 0xFF,
+ (pkt_dest_ip >> 8) & 0xFF, pkt_dest_ip & 0xFF,
+ (interface_ip >> 24) & 0xFF, (interface_ip >> 16) & 0xFF,
+ (interface_ip >> 8) & 0xFF, interface_ip & 0xFF);
+
+ /* CRITICAL: Store original IPs BEFORE rewriting */
+ if (IPH_PROTO(iphdr) == IP_PROTO_TCP && src_port != 0 && dest_port != 0) {
+ /* Check if we already have metadata for this connection */
+ struct connection_metadata *meta = connection_lookup_by_tuple(
+ pkt_src_ip, pkt_dest_ip, src_port, dest_port);
+
+ if (!meta) {
+ /* New connection - store metadata */
+ /* Note: NULL pool_state because this is TCP server path, not client pool */
+ connection_add(0, pkt_src_ip, pkt_dest_ip, src_port, dest_port, NULL);
+ }
+ }
+
+ /* Rewrite destination IP to interface IP */
+ iphdr->dest.addr = inp->ip_addr.addr;
+
+ /* Recalculate IP checksum */
+ iphdr->_chksum = 0;
+ iphdr->_chksum = inet_chksum(iphdr, IPH_HL(iphdr) * 4);
+ }
+ }
+
+ return ip_input(p, inp);
+ }
+
+ /* Unknown protocol - drop */
+ /* FIX #6 - CRITICAL: Free unknown protocol packets to prevent leak! */
+ DEBUG_WARN("%s: [WARN] Unknown ethernet protocol: ethertype=0x%04x, pbuf=%p, p->ref=%d, p->len=%u\n",
+ COMPONENT_NAME, type, (void*)p, p->ref, p->len);
+ pbuf_free(p);
+
+
+ return ERR_OK;
+}
+
+/*
+ * Network interface initialization (called by lwIP)
+static err_t custom_netif_init(struct netif *netif)
+{
+ netif->name[0] = 'e';
+ netif->name[1] = 'n';
+ netif->output = etharp_output;
+ netif->linkoutput = netif_output;
+
+ netif->hwaddr_len = 6;
+ memcpy(netif->hwaddr, mac_addr, 6);
+
+ netif->mtu = 1500;
+ netif->flags = NETIF_FLAG_BROADCAST | NETIF_FLAG_ETHARP | NETIF_FLAG_LINK_UP;
+
+ return ERR_OK;
+}
+
+/*
+ * Network interface status callback (called when DHCP completes)
+static void netif_status_callback(struct netif *netif)
+{
+ if (netif_is_up(netif)) {
+ ip4addr_ntoa(netif_ip4_addr(netif)));
+ ip4addr_ntoa(netif_ip4_netmask(netif)));
+ ip4addr_ntoa(netif_ip4_gw(netif)));
+ COMPONENT_NAME,
+ netif->hwaddr[0], netif->hwaddr[1], netif->hwaddr[2],
+ netif->hwaddr[3], netif->hwaddr[4], netif->hwaddr[5]);
+ COMPONENT_NAME, TCP_ECHO_PORT);
+ COMPONENT_NAME, ip4addr_ntoa(netif_ip4_addr(netif)), TCP_ECHO_PORT);
+
+ dhcp_bound = 1;
+ }
+}
+
+/*
+ * Process received packets and feed to lwIP
+static void process_rx_packets(void)
+{
+ struct virtq *vq = &rx_virtq;
+ static uint16_t last_used_idx = 0;
+ static uint32_t check_count = 0;
+
+ check_count++;
+
+ /* Process packets using correct wraparound arithmetic
+ * CRITICAL: Re-read used->idx on EVERY iteration to avoid reading stale data
+ * when we skip corrupted packets
+ * PACKET BURST LIMIT: Process at most 8 packets per call, then return to main loop
+ * This ensures we check for ICS notifications regularly and don't starve other tasks
+ uint32_t loop_count = 0;
+ const uint32_t MAX_PACKETS_PER_CALL = 8;
+
+ while (loop_count < MAX_PACKETS_PER_CALL) {
+ /* VirtIO Spec 2.4.5: Read used->idx with ACQUIRE semantics
+ * This ensures we see all ring entry writes BEFORE we read the ring data.
+ * Must re-read on every iteration to avoid advancing past valid entries.
+ uint16_t current_used_idx = __atomic_load_n(&vq->used->idx, __ATOMIC_ACQUIRE);
+
+ /* CRITICAL: Use wraparound-safe comparison for uint16_t indices
+ * When current_used_idx wraps (65535 -> 0), simple == comparison fails!
+ * Example: last_used_idx=4776, current_used_idx=89 after wraparound
+ * Correct check: (uint16_t)(current_used_idx - last_used_idx) == 0
+ * IMPORTANT: VirtIO used->idx is EXCLUSIVE upper bound
+ * If used->idx=2, valid entries are indices 0 and 1 only
+ * Reading at index 2 when used->idx=2 accesses uninitialized/stale data
+ uint16_t pending_packets = (uint16_t)(current_used_idx - last_used_idx);
+
+ if (pending_packets == 0) {
+ /* No more packets - exit IRQ handler and let timer handle refill */
+ return;
+ }
+
+ /* SAFETY: Detect impossible wraparound scenarios and desynchronization
+ * Check 1: VirtIO ring can hold at most vq->num entries.
+ * If pending_packets > vq->num, it's IMPOSSIBLE - indicates desync!
+ * Example desync: last_used_idx=2034, current_used_idx=15, vq->num=256
+ * -> pending = (uint16_t)(15 - 2034) = 63517
+ * -> 63517 > 256 = DESYNC DETECTED!
+ * Check 2: VirtIO spec max queue size is 1024 (validated at init).
+ * If last_used_idx is absurdly large, it's corrupted state.
+ * Why vq->num and not arbitrary 1000?
+ * - vq->num is read from VIRTIO_MMIO_QUEUE_NUM_MAX register
+ * - It's the actual PHYSICAL LIMIT of the device
+ * - Theoretically sound: pending > ring_size is mathematically impossible
+ */
+ /* CRITICAL FIX: This is NOT desync - it's normal when last_used_idx advances
+ * ahead of device's used_idx update. The device might not have written new
+ * packets yet, so last_used_idx (our consumption counter) > current_used_idx
+ * (device production counter) causes wraparound: (uint16_t)(current - last)
+ * becomes 65535, 65534, etc.
+ * Real desync: pending > vq->num (ring physically can't hold that many)
+ * False alarm: last_used_idx caught up to device, no new packets available
+ if (pending_packets > vq->num) {
+ /* Check if this is a false alarm (last_used caught up to device) */
+ if (current_used_idx < last_used_idx) {
+ /* This is expected: we consumed faster than device produced
+ * Just resync and exit - no packets available right now */
+ last_used_idx = current_used_idx;
+ /* Don't refill here - let timer handle it to avoid IRQ storm */
+ return;
+ }
+
+ /* True desync - should never happen with proper memory barriers */
+ DEBUG_WARN("%s: [WARN] TRUE DESYNC: pending=%u exceeds ring_size=%u\n",
+ COMPONENT_NAME, pending_packets, vq->num);
+ COMPONENT_NAME, last_used_idx, current_used_idx);
+ last_used_idx = current_used_idx;
+ /* Don't refill here - let timer handle it to avoid IRQ storm */
+ return;
+ }
+
+ uint16_t used_ring_idx = last_used_idx % vq->num;
+ struct virtq_used_elem *used_elem = &vq->used->ring[used_ring_idx];
+
+ uint16_t desc_idx = used_elem->id;
+ uint32_t len = used_elem->len;
+
+ /* Safety check: prevent infinite loops (should never happen with memory barrier) */
+ loop_count++;
+ if (loop_count > 1000) {
+ COMPONENT_NAME);
+ COMPONENT_NAME, last_used_idx, current_used_idx,
+ (uint16_t)(current_used_idx - last_used_idx));
+ /* Don't refill here - let timer handle it to avoid IRQ storm */
+ break;
+ }
+
+ /* CRITICAL: Validate VirtIO reported length before processing
+ * Valid Ethernet frames: 60-1514 bytes + 12 byte VirtIO header = 72-1526 bytes
+ * With memory barrier fix, invalid lengths should be VERY rare (real hardware corruption)
+ if (len < VIRTIO_NET_HDR_SIZE || len > (1514 + VIRTIO_NET_HDR_SIZE)) {
+ DEBUG_WARN("%s: [WARN] INVALID packet length: %u bytes (expected %u-%u)\n",
+ COMPONENT_NAME, len, VIRTIO_NET_HDR_SIZE, 1514 + VIRTIO_NET_HDR_SIZE);
+ COMPONENT_NAME, desc_idx, used_ring_idx, last_used_idx, current_used_idx);
+
+ /* Mark buffer as free and continue */
+ if (desc_idx < MAX_PACKETS) {
+ rx_buffer_used[desc_idx] = false;
+ }
+
+ last_used_idx++;
+ continue; /* Skip this corrupted entry */
+ }
+
+ /* Validate descriptor index is in range */
+ if (desc_idx >= MAX_PACKETS) {
+ DEBUG_WARN("%s: [WARN] INVALID descriptor index: %u (max %u)\n",
+ COMPONENT_NAME, desc_idx, MAX_PACKETS);
+ COMPONENT_NAME, used_ring_idx, last_used_idx, current_used_idx);
+
+ /* seL4-SAFE RECOVERY STRATEGY:
+ * seL4's memory safety allows aggressive recovery without corruption risk.
+ * We try multiple strategies knowing seL4 prevents double-free/use-after-free.
+ bool buffer_freed = false;
+
+ // STRATEGY 1: Free buffer at ring position (most likely correct)
+ if (used_ring_idx < MAX_PACKETS && rx_buffer_used[used_ring_idx]) {
+ COMPONENT_NAME, used_ring_idx);
+ rx_buffer_used[used_ring_idx] = false;
+ buffer_freed = true;
+ }
+
+ // STRATEGY 2: If ring position was already free, scan for any used buffer
+ if (!buffer_freed) {
+ DEBUG_WARN("%s: [WARN] Ring position %u already free - scanning for leaked buffers\n",
+ COMPONENT_NAME, used_ring_idx);
+
+ for (int i = 0; i < MAX_PACKETS; i++) {
+ if (rx_buffer_used[i]) {
+ COMPONENT_NAME, i);
+ rx_buffer_used[i] = false;
+ buffer_freed = true;
+ break; // Free one buffer to avoid over-correction
+ }
+ }
+ }
+
+ if (!buffer_freed) {
+ DEBUG_WARN("%s: [WARN] No used buffers found - possible state desync!\n", COMPONENT_NAME);
+ }
+
+ last_used_idx++;
+ continue;
+ }
+
+ /* Get packet buffer (use buffer index, not physical address from descriptor) */
+ int buf_idx = desc_idx;
+
+ /* CRITICAL: Validate buffer index to prevent out-of-bounds access */
+ if (buf_idx < 0 || buf_idx >= MAX_PACKETS) {
+ DEBUG_ERROR("%s: [ERR] FATAL: Invalid buffer index %d (desc_idx=%u, max=%d)\n",
+ COMPONENT_NAME, buf_idx, desc_idx, MAX_PACKETS);
+ COMPONENT_NAME, last_used_idx);
+ last_used_idx++;
+ continue;
+ }
+
+ uint8_t *buffer = packet_buffers[buf_idx];
+
+ if (buffer == NULL) {
+ DEBUG_ERROR("%s: [ERR] FATAL: Buffer[%d] is NULL!\n", COMPONENT_NAME, buf_idx);
+ last_used_idx++;
+ continue;
+ }
+
+ /* Skip virtio_net_hdr at start of buffer */
+ uint8_t *packet_data = buffer + VIRTIO_NET_HDR_SIZE;
+ uint16_t packet_len = len - VIRTIO_NET_HDR_SIZE;
+
+ packets_received++;
+
+ /* NOTE: TCP server initialization moved to post_init
+ * The tcp_server_initialized flag is set there.
+ * This deferred initialization code is no longer needed.
+ */
+
+ /* Allocate pbuf and copy packet data (skipping header) */
+ struct pbuf *p = pbuf_alloc(PBUF_RAW, packet_len, PBUF_POOL);
+ if (p != NULL) {
+ extern struct stats_ lwip_stats;
+ uint32_t pbuf_before_take = lwip_stats.memp[MEMP_PBUF_POOL]->used;
+
+ pbuf_take(p, packet_data, packet_len);
+
+ uint32_t pbuf_after_take = lwip_stats.memp[MEMP_PBUF_POOL]->used;
+ DEBUG_ERROR("[Net1][PBUF_POOL][RX-ALLOC] pbuf=%p, len=%u | PBUF: %u/800 (after take: %u/800)\n",
+ (void*)p, packet_len, pbuf_before_take, pbuf_after_take);
+
+ #if 0 /* DEBUG_ENABLED_DEBUG && DEBUG_PACKET_DETAIL - show_packet undefined */
+ if (show_packet) {
+ }
+ #endif
+
+ /* Feed packet to lwIP */
+ err_t lwip_result = netif_data.input(p, &netif_data);
+
+ uint32_t pbuf_after_input = lwip_stats.memp[MEMP_PBUF_POOL]->used;
+ if (lwip_result == ERR_OK) {
+ DEBUG_ERROR("[Net1][PBUF_POOL][RX-ACCEPT] lwIP accepted pbuf=%p | PBUF: %u/800\n",
+ (void*)p, pbuf_after_input);
+ } else {
+ DEBUG_ERROR("[Net1][PBUF_POOL][RX-REJECT] lwIP rejected (err=%d), must free pbuf=%p | PBUF: %u/800\n",
+ lwip_result, (void*)p, pbuf_after_input);
+ }
+
+ #if 0 /* DEBUG_ENABLED_DEBUG && DEBUG_PACKET_DETAIL - show_packet undefined */
+ if (show_packet) {
+ if (lwip_result == ERR_OK) {
+ } else {
+ }
+ }
+ #endif
+
+ /* CRITICAL DIAGNOSTIC: Log TCP SYN packets to diagnose connection acceptance */
+ if (packet_len >= sizeof(struct ethhdr)) {
+ struct ethhdr *eth = (struct ethhdr *)packet_data;
+ uint16_t eth_proto_check = ntohs(eth->h_proto);
+
+ if (eth_proto_check == 0x0800 && packet_len >= sizeof(struct ethhdr) + sizeof(struct iphdr)) { /* IPv4 */
+ struct iphdr *ip = (struct iphdr *)(packet_data + sizeof(struct ethhdr));
+ if (ip->protocol == 6) { /* TCP */
+ size_t ip_hdr_len = (ip->ihl) * 4;
+ if (packet_len >= sizeof(struct ethhdr) + ip_hdr_len + sizeof(struct tcphdr)) {
+ struct tcphdr *tcp = (struct tcphdr *)(packet_data + sizeof(struct ethhdr) + ip_hdr_len);
+ uint32_t daddr = ntohl(ip->daddr);
+
+ if (tcp->syn && !tcp->ack) {
+ /* This is a SYN packet (connection attempt) */
+ COMPONENT_NAME,
+ (daddr >> 24) & 0xFF, (daddr >> 16) & 0xFF, (daddr >> 8) & 0xFF, daddr & 0xFF,
+ ntohs(tcp->dest));
+ }
+ }
+ }
+ }
+ }
+
+ if (lwip_result != ERR_OK) {
+ /* lwIP handles pbuf cleanup */
+ }
+ } else {
+ /* CRITICAL: pbuf allocation failed - this means lwIP is out of memory */
+ DEBUG_WARN("%s: [WARN] WARNING: Failed to allocate pbuf for packet #%u - dropping (lwIP out of memory)\n",
+ COMPONENT_NAME, packets_received);
+ }
+
+ /* Mark buffer as free (buf_idx already defined above) */
+ rx_buffer_used[buf_idx] = false;
+
+ /* Move to next packet */
+ last_used_idx++;
+ }
+
+ /* Print pbuf pool statistics every 10 packets to monitor allocation/deallocation */
+ if (packets_received % 10 == 0 && packets_received > 0) {
+ COMPONENT_NAME,
+ lwip_stats.memp[MEMP_PBUF_POOL]->used,
+ PBUF_POOL_SIZE,
+ lwip_stats.memp[MEMP_PBUF_POOL]->avail,
+ lwip_stats.memp[MEMP_PBUF_POOL]->max);
+ }
+
+ refill_rx_queue;
+}
+
+/*
+ * Connection tracking
+ */
+/* active_connections moved to line 184 (before cleanup functions) */
+static uint32_t total_connections_created = 0;
+static uint32_t total_connections_closed = 0;
+
+/*
+ * TCP Error callback - handles connection errors and cleanup
+static void tcp_echo_err(void *arg, err_t err)
+{
+ struct connection_metadata *meta = (struct connection_metadata *)arg;
+
+ const char *err_name;
+ switch (err) {
+ case ERR_ABRT: err_name = "ERR_ABRT (Connection aborted)"; break;
+ case ERR_RST: err_name = "ERR_RST (Connection reset)"; break;
+ case ERR_CLSD: err_name = "ERR_CLSD (Connection closed)"; break;
+ case ERR_CONN: err_name = "ERR_CONN (Not connected)"; break;
+ case ERR_TIMEOUT: err_name = "ERR_TIMEOUT (Timeout)"; break;
+ default: err_name = "UNKNOWN"; break;
+ }
+
+ DEBUG_WARN("%s: [WARN] TCP connection error - err=%d (%s)\n", COMPONENT_NAME, err, err_name);
+
+ /* CRITICAL FIX - Clear PCB pointer and enqueue cleanup
+ * handler tried to close already-freed PCB → PCB corruption!
+ * ROOT CAUSE SEQUENCE:
+ * NOTE: PCB is already freed by lwIP when err callback is called - don't access it!
+ if (meta != NULL) {
+ COMPONENT_NAME, meta->session_id);
+ meta->pcb = NULL; /* Mark PCB as freed */
+
+ /* Enqueue cleanup for metadata (counters will be decremented there) */
+ enqueue_cleanup(meta->session_id);
+ } else {
+ DEBUG_WARN("%s: [WARN] Error callback called with NULL metadata (arg=%p)\n",
+ COMPONENT_NAME, arg);
+ }
+}
+
+/*
+ * TCP Echo callbacks
+static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err)
+{
+ if (p == NULL) {
+ /* CRITICAL FIX - Connection closed by remote peer
+ * MUST return ERR_ABRT WITHOUT calling tcp_close!
+ * Same fix as Net0 */
+
+ /* BUG: connection_remove(pcb) immediately deletes metadata */
+
+ /* Clean up via centralized queue instead of direct removal */
+ struct connection_metadata *meta = connection_lookup_by_pcb(pcb);
+ if (meta != NULL) {
+ meta->pcb = NULL;
+ meta->metadata_close_pending = true;
+ meta->close_timestamp = sys_now;
+ meta->pcb_closed = true;
+ enqueue_cleanup(meta->session_id);
+ DEBUG_ERROR("[CLOSE-SOURCE-1] tcp_echo_recv(p=NULL) - session=%u, PBUF=%u/%u\n",
+ meta->session_id,
+ lwip_stats.memp[MEMP_PBUF_POOL]->used,
+ lwip_stats.memp[MEMP_PBUF_POOL]->avail);
+ }
+
+ return ERR_ABRT;
+ }
+
+ err_t result = ERR_OK; /* Default return value */
+
+ if (err != ERR_OK) {
+ /* Error case - lwIP will handle pbuf */
+ result = err;
+ goto cleanup;
+ }
+
+ /* ═══ Forward TCP data to ICS_Outbound (PLC→SCADA response path) ═══ */
+
+ /* CRITICAL: Check if dataport is properly mapped by CAmkES
+ * PLC responses must go through OUTBOUND path (Net1 → ICS_Outbound → Net0 → SCADA) */
+ if (outbound_dp == NULL) {
+ DEBUG_ERROR("%s: [ERR] FATAL: outbound_dp is NULL! CAmkES dataport not mapped\n", COMPONENT_NAME);
+ result = ERR_MEM;
+ goto cleanup;
+ }
+
+ /* Step 1: Create ICS message with metadata */
+ ICS_Message *ics_msg = (ICS_Message *)outbound_dp;
+
+ /* Step 2: Populate FrameMetadata  */
+ COMPONENT_NAME, (void*)&ics_msg->metadata, sizeof(FrameMetadata));
+ memset(&ics_msg->metadata, 0, sizeof(FrameMetadata));
+
+ /* Basic metadata - will be enhanced with full frame parsing */
+ ics_msg->metadata.ethertype = 0x0800; /* IPv4 */
+ ics_msg->metadata.ip_protocol = 6; /* TCP */
+ ics_msg->metadata.is_ip = 1;
+ ics_msg->metadata.is_tcp = 1;
+
+ /* Extract IP addresses from lwIP pcb (network byte order -> host byte order) */
+ ics_msg->metadata.src_ip = ntohl(ip4_addr_get_u32(&pcb->remote_ip)); /* PLC IP (192.168.95.2) */
+
+ /* CRITICAL: Look up original SCADA IP from connection tracking table
+ * pcb->local_ip is the gateway IP (192.168.95.1)
+ * We need the ORIGINAL SCADA IP (e.g., 192.168.90.5) for Net0 to send response to */
+ struct connection_metadata *meta = connection_lookup_by_pcb(pcb);
+ if (meta != NULL && meta->active) {
+ /* Use original SCADA IP from request metadata */
+ ics_msg->metadata.dst_ip = meta->original_src_ip; /* Original SCADA IP */
+ ics_msg->metadata.dst_port = meta->src_port; /* Original SCADA port */
+ #if DEBUG_METADATA
+ COMPONENT_NAME,
+ (meta->original_src_ip >> 24) & 0xFF,
+ (meta->original_src_ip >> 16) & 0xFF,
+ (meta->original_src_ip >> 8) & 0xFF,
+ meta->original_src_ip & 0xFF,
+ meta->src_port);
+ #endif
+ } else {
+ /* Fallback: use local IP if lookup fails (will cause Net0 to fail lookup) */
+ ics_msg->metadata.dst_ip = ntohl(ip4_addr_get_u32(&pcb->local_ip));
+ ics_msg->metadata.dst_port = pcb->local_port;
+ DEBUG_WARN("%s: [WARN] Lookup: No metadata found - using gateway IP (WRONG - Net0 won't find connection!)\n", COMPONENT_NAME);
+ }
+
+ ics_msg->metadata.src_port = pcb->remote_port;
+ ics_msg->metadata.payload_offset = 0; /* TCP payload directly */
+ ics_msg->metadata.payload_length = (p->len < MAX_PAYLOAD_SIZE) ? p->len : MAX_PAYLOAD_SIZE;
+
+ /* Step 3: Copy TCP payload */
+ ics_msg->payload_length = ics_msg->metadata.payload_length;
+ memcpy(ics_msg->payload, p->payload, ics_msg->payload_length);
+
+ COMPONENT_NAME, ics_msg->payload_length,
+ ics_msg->metadata.src_port, ics_msg->metadata.dst_port);
+
+ /* Always show RAW payload for debugging */
+ for (uint16_t i = 0; i < ics_msg->payload_length && i < 200; i++) {
+ char c = ics_msg->payload[i];
+ if (c >= 32 && c <= 126) DEBUG("%c", c);
+ else if (c == '\n') DEBUG("\\n");
+ else if (c == '\r') DEBUG("\\r");
+ else if (c == '\t') DEBUG("\\t");
+ else DEBUG("[0x%02x]", (unsigned char)c);
+ }
+ if (ics_msg->payload_length > 200) DEBUG("... (%u more bytes)", ics_msg->payload_length - 200);
+
+ /* FIX: REMOVED memory barrier from here! */
+
+ /* Step 4: Signal ICS_Outbound that PLC response is ready */
+ outbound_ready_emit;
+
+ /* Keep connection alive BUT update last_activity timestamp for fast idle cleanup
+ * - Gateway creates new connections without checking if SCADA reuses its connection
+ * - When SCADA keeps connection alive and sends multiple requests:
+ * - Request #1: Net1 creates connection to PLC
+ * closes Net1→PLC immediately after response
+ * - Request #2 on SAME SCADA connection: Net1 finds metadata but PCB closed
+ * - Validation fails → creates NEW PLC connection
+ * - Keep Net1→PLC connection alive after forwarding response
+ * - Update last_activity timestamp for idle detection
+ * - Periodic cleanup task closes connections idle > 2 seconds
+ * - Supports SCADA connection reuse (multiple requests on one connection)
+ * - Fast timeout matches Modbus TCP request rates (sub-second to ~1 second)
+ * Benefits:
+ tcp_recved(pcb, p->len); /* Tell lwIP we consumed the data */
+
+ /* Update last_activity timestamp for idle timeout detection */
+ /* Reuse 'meta' variable from above (line 1924) */
+ if (meta != NULL && meta->active) {
+ meta->last_activity = sys_now; /* lwIP millisecond timer */
+ }
+
+ /* DO NOT close connection - keep alive for next request from same SCADA connection */
+ /* DO NOT decrement active_connections - connection still active */
+ /* DO NOT remove metadata - needed for connection reuse validation */
+
+ /* Normal path - data processed successfully */
+ result = ERR_OK;
+ /* Fall through to cleanup */
+
+cleanup:
+ /* CENTRALIZED PBUF CLEANUP (same pattern as Net0) */
+ if (result == ERR_OK && p != NULL) {
+ pbuf_free(p);
+ }
+
+ return result;
+}
+
+static err_t tcp_echo_accept(void *arg, struct tcp_pcb *newpcb, err_t err)
+{
+ COMPONENT_NAME, arg, newpcb, err);
+
+ if (err != ERR_OK || newpcb == NULL) {
+ DEBUG_ERROR("%s: [ERR] TCP accept FAILED - err=%d (%s), newpcb=%p\n",
+ COMPONENT_NAME, err,
+ err == -1 ? "OUT OF MEMORY (ERR_MEM)" :
+ err == -13 ? "CONNECTION ABORTED (ERR_ABRT)" : "UNKNOWN",
+ newpcb);
+ if (err == -1) {
+ COMPONENT_NAME);
+ }
+ return err != ERR_OK ? err : ERR_VAL;
+ }
+
+ /* REJECT non-Modbus TCP connections immediately
+ * - Prevents pbufs from accumulating in unwanted connections
+ uint16_t local_port = newpcb->local_port;
+ uint16_t remote_port = newpcb->remote_port;
+
+ if (local_port != TCP_SERVER_PORT && remote_port != TCP_SERVER_PORT) {
+ COMPONENT_NAME,
+ ip4_addr1(&newpcb->remote_ip), ip4_addr2(&newpcb->remote_ip),
+ ip4_addr3(&newpcb->remote_ip), ip4_addr4(&newpcb->remote_ip),
+ remote_port, local_port);
+ tcp_abort(newpcb); /* Tell lwIP to abort and clean up */
+ return ERR_ABRT;
+ }
+
+ active_connections++;
+ total_connections_created++;
+
+ DEBUG_INFO("%s: [OK] TCP connection accepted from %u.%u.%u.%u:%u (pcb=%p)\n",
+ COMPONENT_NAME,
+ ip4_addr1(&newpcb->remote_ip), ip4_addr2(&newpcb->remote_ip),
+ ip4_addr3(&newpcb->remote_ip), ip4_addr4(&newpcb->remote_ip), newpcb->remote_port,
+ newpcb);
+ COMPONENT_NAME, active_connections, total_connections_created, total_connections_closed);
+
+ tcp_setprio(newpcb, TCP_PRIO_MIN);
+ tcp_recv(newpcb, tcp_echo_recv);
+ tcp_err(newpcb, tcp_echo_err); /* Register error callback for connection cleanup */
+
+ return ERR_OK;
+}
+
+/*
+ * Setup TCP echo server
+static void setup_tcp_echo_server(void)
+{
+ struct tcp_pcb *pcb;
+
+ pcb = tcp_new_ip_type(IPADDR_TYPE_V4);
+
+ if (pcb == NULL) {
+ DEBUG_ERROR("%s: [ERR] Failed to create TCP PCB\n", COMPONENT_NAME);
+ return;
+ }
+
+ err_t err = tcp_bind(pcb, IP_ADDR_ANY, TCP_ECHO_PORT);
+
+ if (err != ERR_OK) {
+ DEBUG_ERROR("%s: [ERR] Failed to bind TCP port %d (err=%d)\n", COMPONENT_NAME, TCP_ECHO_PORT, err);
+ return;
+ }
+
+ pcb = tcp_listen_with_backlog(pcb, MAX_TCP_CONNECTIONS);
+
+ if (pcb == NULL) {
+ DEBUG_ERROR("%s: [ERR] Failed to listen on TCP port %d\n", COMPONENT_NAME, TCP_ECHO_PORT);
+ return;
+ }
+
+ tcp_accept(pcb, tcp_echo_accept);
+
+ /* CRITICAL DEBUG: Print actual PCB local_ip to diagnose TCP matching */
+ struct tcp_pcb_listen *lpcb = (struct tcp_pcb_listen *)pcb;
+ DEBUG_INFO("%s: [OK] TCP SERVER CONFIGURATION\n", COMPONENT_NAME);
+ ip4_addr1(&lpcb->local_ip), ip4_addr2(&lpcb->local_ip),
+ ip4_addr3(&lpcb->local_ip), ip4_addr4(&lpcb->local_ip));
+
+ /* Validate PCB binding */
+ bool is_wildcard = (ip4_addr1(&lpcb->local_ip) == 0 &&
+ ip4_addr2(&lpcb->local_ip) == 0 &&
+ ip4_addr3(&lpcb->local_ip) == 0 &&
+ ip4_addr4(&lpcb->local_ip) == 0);
+
+ if (is_wildcard) {
+ DEBUG_INFO("%s: Status: [OK] WILDCARD (0.0.0.0) - accepts ANY destination IP\n", COMPONENT_NAME);
+ } else {
+ DEBUG_WARN("%s: Status: [WARN] SPECIFIC IP - only accepts packets to this IP\n", COMPONENT_NAME);
+ ip4_addr1(&lpcb->local_ip), ip4_addr2(&lpcb->local_ip),
+ ip4_addr3(&lpcb->local_ip), ip4_addr4(&lpcb->local_ip));
+ }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * OUTBOUND PATH: ICS_Outbound → Internal Network (TCP Client)
+ */
+
+/* TCP client connection state for INBOUND forwarding */
+struct tcp_inbound_client_state {
+ struct tcp_pcb *pcb;
+ uint8_t payload_data[MAX_PAYLOAD_SIZE]; /* CRITICAL FIX: Use buffer, not pointer!
+ uint16_t payload_len;
+ uint16_t bytes_sent;
+ bool active;
+};
+
+/* CRITICAL FIX - Replace single global with connection pool
+ * Bug Discovery (2025-10-20):
+ * - Single global `inbound_tcp_client` was shared across ALL TCP connections
+ * - When multiple SCADA requests arrived before first connection completed:
+ * - During this window, new requests can arrive and overwrite state
+ * - This was hidden by heavy printf delays (50-100ms)
+ * - When prints removed, race window exposed
+ * Fix: Per-connection state allocation using connection pool
+ * - Each TCP connection gets its own dedicated state slot
+ * - No sharing, no race conditions
+ * - Pool size: MUST MATCH lwIP's MEMP_NUM_TCP_PCB limit
+ * Crashed accessing state->payload_len (data corrupted by race)
+ * Pool sizing history:
+ * Root Cause of Pool Exhaustion:
+ * - But MAX_INBOUND_CONNECTIONS was only 10 (application state pool)
+ * - Mismatch: lwIP creates N connections, but we can only track 10!
+ * - Fix: Synchronize application pool with lwIP pool
+ * Memory overhead: 1000 × 2.4KB = ~2.4MB (2.4% of 100MB RAM - acceptable)
+ */
+#define MAX_INBOUND_CONNECTIONS 1000
+static struct tcp_inbound_client_state inbound_connection_pool[MAX_INBOUND_CONNECTIONS];
+
+/* Allocate a free connection state from the pool */
+static struct tcp_inbound_client_state* inbound_alloc_state(void)
+{
+ BREADCRUMB(2100); /* Pool allocation attempt */
+ for (int i = 0; i < MAX_INBOUND_CONNECTIONS; i++) {
+ if (!inbound_connection_pool[i].active) {
+ memset(&inbound_connection_pool[i], 0, sizeof(struct tcp_inbound_client_state));
+ inbound_connection_pool[i].active = true;
+ BREADCRUMB(2101); /* Pool slot allocated successfully */
+ return &inbound_connection_pool[i];
+ }
+ }
+
+ /* Pool exhausted - this should be very rare with proper connection cleanup */
+ BREADCRUMB(2102); /* Pool exhausted */
+ DEBUG("%s: [CRITICAL] Inbound connection pool exhausted! (max=%d)\n",
+ COMPONENT_NAME, MAX_INBOUND_CONNECTIONS);
+
+ /* CRITICAL FIX - Limit debug output to prevent stack overflow
+ int printed = 0;
+ for (int i = 0; i < MAX_INBOUND_CONNECTIONS && printed < 10; i++) {
+ if (inbound_connection_pool[i].active) {
+ COMPONENT_NAME, i,
+ inbound_connection_pool[i].active,
+ (void*)inbound_connection_pool[i].pcb,
+ inbound_connection_pool[i].payload_len,
+ inbound_connection_pool[i].bytes_sent);
+ printed++;
+ }
+ }
+ if (printed < MAX_INBOUND_CONNECTIONS) {
+ COMPONENT_NAME, MAX_INBOUND_CONNECTIONS - printed);
+ }
+
+ return NULL;
+}
+
+/* Free a connection state back to the pool */
+static void inbound_free_state(struct tcp_inbound_client_state *state)
+{
+ BREADCRUMB(2103); /* Pool free called */
+ if (state != NULL) {
+ state->active = false;
+ state->pcb = NULL;
+ state->payload_len = 0;
+ state->bytes_sent = 0;
+ BREADCRUMB(2104); /* Pool free completed */
+ }
+}
+
+/*
+ * TCP client callbacks for INBOUND path
+ */
+
+/**
+ * Receive callback for INBOUND TCP client (receives PLC responses)
+static volatile int inbound_recv_callback_depth = 0;
+static err_t inbound_tcp_recv_callback(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err)
+{
+ BREADCRUMB(1000); /* Entry: PLC response received */
+ inbound_recv_callback_depth++;
+ if (inbound_recv_callback_depth > 1) {
+ DEBUG("%s: [CRITICAL] RECV CALLBACK RE-ENTRANCY DETECTED! depth=%d, p=%p, err=%d\n",
+ COMPONENT_NAME, inbound_recv_callback_depth, (void*)p, err);
+ }
+ COMPONENT_NAME, inbound_recv_callback_depth, (void*)p, err);
+ struct tcp_inbound_client_state *state = (struct tcp_inbound_client_state *)arg;
+
+ if (p == NULL) {
+ BREADCRUMB(1001); /* Connection closed by remote */
+ /* CRITICAL FIX - DO NOT remove connection metadata yet! */
+
+ /* on this connection. If we call tcp_close AGAIN, lwIP will crash with */
+
+ /* Find metadata to check if connection was already closed */
+ struct connection_metadata *meta = NULL;
+ for (int i = 0; i < MAX_CONNECTIONS; i++) {
+ if (connection_table[i].active && connection_table[i].pcb == pcb) {
+ meta = &connection_table[i];
+ break;
+ }
+ }
+
+ if (meta == NULL) {
+ /* No metadata found - connection was already cleaned up */
+ DEBUG_WARN("%s: [WARN] PLC closed connection but no metadata found\n",
+ COMPONENT_NAME);
+ COMPONENT_NAME);
+ BREADCRUMB(1002); /* Before decrement */
+ inbound_recv_callback_depth--;
+ BREADCRUMB(1003); /* Before return */
+ return ERR_OK;
+ }
+
+ /* OLD CODE: Set pcb=NULL immediately */
+ DEBUG_WARN("%s: [WARN] PLC closed connection - keeping metadata for FIN-ACK TX\n",
+ COMPONENT_NAME);
+
+ /* Check if PCB is still valid (not NULL) */
+ if (pcb == NULL) {
+ DEBUG_WARN("%s: [WARN] recv(p=NULL) called with NULL pcb - already freed by lwIP\n",
+ COMPONENT_NAME);
+ inbound_recv_callback_depth--;
+ return ERR_OK;
+ }
+
+ /* lwIP BEST PRACTICE - Return ERR_ABRT instead of calling tcp_abort
+ * CRITICAL FIX: Never call tcp_abort from inside lwIP callbacks!
+ * OLD CODE:
+ * tcp_abort(pcb); // ❌ WRONG! lwIP may still need PCB after callback
+ * return ERR_ABRT;
+ * NEW CODE:
+ * - Clean up application state only
+ * - Return ERR_ABRT to tell lwIP connection should be aborted
+ * - This prevents use-after-free when lwIP accesses PCB after callback
+ COMPONENT_NAME);
+
+ if (meta != NULL) {
+ /* Don't set pcb=NULL here - keep it for TX path */
+
+ /* ROOT CAUSE of "TX: No metadata" errors: */
+ meta->metadata_close_pending = true;
+ meta->close_timestamp = sys_now;
+
+ /* EVIDENCE - Always log when delayed cleanup flag is set */
+ DEBUG_ERROR("[CLOSE-SOURCE-2] inbound_tcp_recv_callback(p=NULL) - PLC FIN session=%u, lwip_port=%u | PBUF: %u/%u\n",
+ meta->session_id, meta->lwip_ephemeral_port,
+ lwip_stats.memp[MEMP_PBUF_POOL]->used,
+ lwip_stats.memp[MEMP_PBUF_POOL]->avail);
+
+ /* DON'T decrement connection_count here - check_pending_cleanups will handle it */
+ /* DON'T set active=false - lwIP needs metadata for FIN-ACK transmission */
+
+ /* Enqueue cleanup for centralized processing */
+ enqueue_cleanup(meta->session_id);
+
+ update_shared_connection_state;
+ __sync_synchronize; /* Ensure metadata update visible */
+ }
+
+ inbound_recv_callback_depth--;
+ return ERR_ABRT; /* ✅ lwIP calls tcp_abort internally */
+ }
+
+ err_t result = ERR_OK; /* Default return value */
+
+ if (err != ERR_OK) {
+ BREADCRUMB(1002); /* Error in receive */
+ result = err;
+ goto cleanup; /* lwIP will handle pbuf */
+ }
+
+ if (outbound_dp == NULL) {
+ BREADCRUMB(1003); /* NULL dataport */
+ result = ERR_MEM;
+ goto cleanup;
+ }
+
+ BREADCRUMB(1004); /* Preparing ICS message */
+ ICS_Message *ics_msg = (ICS_Message *)outbound_dp;
+ memset(&ics_msg->metadata, 0, sizeof(FrameMetadata));
+
+ ics_msg->metadata.ethertype = 0x0800;
+ ics_msg->metadata.ip_protocol = 6;
+ ics_msg->metadata.is_ip = 1;
+ ics_msg->metadata.is_tcp = 1;
+ ics_msg->metadata.src_ip = ntohl(ip4_addr_get_u32(&pcb->remote_ip));
+
+ BREADCRUMB(1005); /* Looking up metadata */
+ /* Look up original SCADA IP */
+ struct connection_metadata *meta = connection_lookup_by_pcb(pcb);
+ if (meta != NULL && meta->active) {
+ BREADCRUMB(1006); /* Metadata found */
+ ics_msg->metadata.dst_ip = meta->original_src_ip;
+ ics_msg->metadata.dst_port = meta->src_port;
+ } else {
+ BREADCRUMB(1007); /* Metadata NOT found */
+ ics_msg->metadata.dst_ip = ntohl(ip4_addr_get_u32(&pcb->local_ip));
+ ics_msg->metadata.dst_port = pcb->local_port;
+ }
+
+ ics_msg->metadata.src_port = pcb->remote_port;
+ ics_msg->metadata.payload_offset = 0;
+ ics_msg->metadata.payload_length = (p->len < MAX_PAYLOAD_SIZE) ? p->len : MAX_PAYLOAD_SIZE;
+
+ BREADCRUMB(1008); /* Copying payload */
+ ics_msg->payload_length = ics_msg->metadata.payload_length;
+ memcpy(ics_msg->payload, p->payload, ics_msg->payload_length);
+
+ /* FIX: REMOVED memory barrier from here! */
+
+ BREADCRUMB(1009); /* Emitting notification */
+ outbound_ready_emit;
+ BREADCRUMB(1010); /* Emit completed */
+
+ tcp_recved(pcb, p->len);
+
+ /* CRITICAL FIX - Application MUST free pbuf when returning ERR_OK!
+ * ROOT CAUSE (after deep lwIP source analysis):
+ * =============================================
+ * The Contract:
+ * -------------
+ * - Callback returns ERR_OK → APP must call pbuf_free(p)
+ * - Callback returns ERR_MEM → lwIP stores in refused_data, frees later
+ * -------------------------------
+ * We added pbuf_free but then REMOVED it in thinking it caused
+ * double-free. In reality, the pbuf_free was CORRECT, but we may have
+ * been seeing side effects from other bugs or instrumentation artifacts.
+ * See Net0 driver line ~3922 for full analysis.
+ BREADCRUMB(1010); /* Response sent to ICS_Outbound */
+
+ /* CRITICAL FIX FOR USE-AFTER-FREE RACE:
+ * DO NOT close the connection here!
+ * Crash: Net0 tried tcp_write on freed PCB → assertion failure
+ * The connection will be closed either by:
+ BREADCRUMB(1011); /* Keeping connection alive for Net0 response */
+
+ /* Connection stays open - will be cleaned up by:
+
+ /* Normal path - data processed successfully */
+ result = ERR_OK;
+ /* Fall through to cleanup */
+
+cleanup:
+ /* CENTRALIZED PBUF CLEANUP (same pattern as Net0) */
+ if (result == ERR_OK && p != NULL) {
+ pbuf_free(p);
+ }
+
+ BREADCRUMB(1012); /* Before decrement */
+ inbound_recv_callback_depth--;
+ BREADCRUMB(1013); /* Before return - control goes back to lwIP */
+ fflush(stdout); /* Force output before return */
+ return result;
+}
+
+static err_t inbound_tcp_sent_callback(void *arg, struct tcp_pcb *pcb, u16_t len)
+{
+ struct tcp_inbound_client_state *state = (struct tcp_inbound_client_state *)arg;
+
+ state->bytes_sent += len;
+
+ /* Check if all data sent */
+ if (state->bytes_sent >= state->payload_len) {
+ /* Do NOT close - keep connection open to receive PLC response */
+ return ERR_OK;
+ }
+
+ /* Send remaining data if needed */
+ uint16_t remaining = state->payload_len - state->bytes_sent;
+ uint16_t to_send = (remaining > tcp_sndbuf(pcb)) ? tcp_sndbuf(pcb) : remaining;
+
+ if (to_send > 0) {
+ err_t err = tcp_write(pcb, state->payload_data + state->bytes_sent, to_send, TCP_WRITE_FLAG_COPY);
+ if (err == ERR_OK) {
+ tcp_output(pcb);
+ } else {
+ }
+ }
+
+ return ERR_OK;
+}
+
+/* CRITICAL FIX - Add missing error callback for inbound TCP client connections
+ * - When connection error occurred, lwIP freed PCB but had no callback to notify us
+ * - Later, inbound_tcp_connected_callback fired with freed PCB
+ * - Crash at offset 0x10 when accessing tcp_sndbuf(pcb)
+ * Fix: Add error callback to clean up state when connection fails
+ * This is the same pattern as Net0's tcp_echo_err callback
+static void inbound_tcp_err_callback(void *arg, err_t err)
+{
+ struct tcp_inbound_client_state *state = (struct tcp_inbound_client_state *)arg;
+
+ DEBUG_WARN("%s: [WARN] INBOUND TCP error - err=%d (%s)\n", COMPONENT_NAME, err,
+ err == ERR_ABRT ? "ERR_ABRT (Connection aborted)" :
+ err == ERR_RST ? "ERR_RST (Connection reset)" :
+ err == ERR_CLSD ? "ERR_CLSD (Connection closed)" :
+ err == ERR_CONN ? "ERR_CONN (Not connected)" :
+ err == ERR_TIMEOUT ? "ERR_TIMEOUT (Timeout)" : "Unknown");
+
+ /* CRITICAL: PCB is already freed by lwIP when err callback is called - don't access it!
+ * CRITICAL FIX - Clear metadata's PCB pointer to prevent stale pointer usage
+ * Don't clean up metadata for ERR_ABRT - close handler already did it
+ * ERR_ABRT is triggered by OUR tcp_abort call in close notification handler.
+ * The close handler already cleaned up metadata (active=false, count--).
+ * We only need to free the pool_state here, not touch metadata.
+ * For other errors (ERR_RST, ERR_TIMEOUT, etc.), lwIP aborted the connection
+ * and we need to clean up both pool_state AND metadata.
+ if (state != NULL) {
+ /* Find metadata for this connection */
+ struct connection_metadata *meta = NULL;
+ for (int i = 0; i < MAX_CONNECTIONS; i++) {
+ if (connection_table[i].active && connection_table[i].pool_state == state) {
+ meta = &connection_table[i];
+ break;
+ }
+ }
+
+ if (err != ERR_ABRT && meta != NULL && outbound_dp != NULL) {
+ /* DEDUPLICATION: Check if already notified (RST flood protection) */
+ if (!meta->error_notified) {
+ OutboundDataport *dp = (OutboundDataport *)outbound_dp;
+
+ /* Enqueue error notification */
+ bool success = control_queue_enqueue(
+ &dp->error_queue,
+ meta->session_id,
+ (int8_t)err,
+ 0 /* flags - future use */
+ );
+
+ if (success) {
+ meta->error_notified = true; /* Set dedup flag */
+
+ /* : Mark as error-only notification
+ * Set payload_length = 0 to indicate this is NOT a response
+ * ICS_Outbound will forward this, Net0 will see sentinel and skip response processing
+ dp->response_msg.payload_length = 0; /* Sentinel: error-only, no payload */
+ dp->response_msg.metadata.session_id = meta->session_id;
+ __sync_synchronize; /* Memory barrier - ensure sentinel visible before signal */
+
+ outbound_ready_emit; /* Signal Net0 */
+
+ "(session %u, err=%d)\n",
+ COMPONENT_NAME, meta->session_id, err);
+ } else {
+ "(queue full? session %u)\n",
+ COMPONENT_NAME, meta->session_id);
+ }
+ } else {
+ "(RST flood protection)\n",
+ COMPONENT_NAME, meta->session_id);
+ }
+ }
+
+ if (meta != NULL) {
+ /* Only decrement if connection is still active
+ * - Close handler sets active=false BEFORE calling tcp_abort → skip
+ * - recv(p=NULL) sets active=false but doesn't decrement → PROBLEM!
+ * Wait, both scenarios set active=false. How do we distinguish?
+ * Answer: We can't! The real fix is to make recv callback decrement.
+ * But for backward compatibility, let's keep this logic:
+ * - If active is true: definitely need to decrement
+ * - If active is false: might have been decremented already (close handler)
+ * or might not have been (recv callback) ← ambiguous!
+ * Actually, looking at the code again:
+ * - Close handler (line 3399): decrements BEFORE setting active=false
+ * - recv callback (line 2728): sets active=false but does NOT decrement
+ * So when error callback sees meta->active=false, it could be:
+ * We need a way to tell them apart. But wait - close handler NULLs the
+ * error callback (line 3386)! So if this callback fires, it CAN'T be
+ * from close handler path!
+ * That means: if we're in this callback, it's NEVER from close handler.
+ * So we should ALWAYS clean up metadata!
+ */
+ /* CENTRALIZED CLEANUP - Don't modify metadata directly */
+ meta->metadata_close_pending = true; /* Intent flag: cleanup needed */
+ meta->close_timestamp = sys_now; /* For deferred cleanup timeout */
+ meta->pcb_closed = true; /* PCB already freed by lwIP */
+
+ DEBUG_ERROR("[CLOSE-SOURCE-3] inbound_tcp_err_callback err=%d - session=%u | PBUF=%u/%u\n",
+ err, meta->session_id,
+ lwip_stats.memp[MEMP_PBUF_POOL]->used,
+ lwip_stats.memp[MEMP_PBUF_POOL]->avail);
+ /* DON'T clear error_notified - keeps deduplication active for retransmitted RSTs */
+
+ update_shared_connection_state;
+
+ /* Enqueue cleanup - main loop will handle metadata atomically */
+ enqueue_cleanup(meta->session_id);
+ }
+
+ inbound_free_state(state);
+ }
+
+ err == ERR_ABRT ? "pool freed (metadata already cleaned by close handler)" :
+ "state and metadata cleaned up");
+}
+
+static err_t inbound_tcp_connected_callback(void *arg, struct tcp_pcb *pcb, err_t err)
+{
+ struct tcp_inbound_client_state *state = (struct tcp_inbound_client_state *)arg;
+
+ if (err != ERR_OK) {
+ DEBUG_ERROR("%s: [ERR] INBOUND: Connection failed (3-way handshake): err=%d\n", COMPONENT_NAME, err);
+
+ /* Bug: connection_add incremented connection_count and created metadata, */
+
+ /* Find the connection metadata */
+ struct connection_metadata *meta = NULL;
+ for (int i = 0; i < MAX_CONNECTIONS; i++) {
+ if (connection_table[i].active && connection_table[i].pcb == pcb) {
+ meta = &connection_table[i];
+ break;
+ }
+ }
+
+ if (outbound_dp != NULL && meta != NULL && !meta->error_notified) {
+ OutboundDataport *dp = (OutboundDataport *)outbound_dp;
+
+ /* Enqueue error notification */
+ bool success = control_queue_enqueue(
+ &dp->error_queue,
+ meta->session_id,
+ (int8_t)err,
+ 0 /* flags */
+ );
+
+ if (success) {
+ meta->error_notified = true;
+
+ /* : Mark as error-only notification
+ * Set payload_length = 0 to indicate this is NOT a response
+ * ICS_Outbound will forward this, Net0 will see sentinel and skip response processing
+ dp->response_msg.payload_length = 0; /* Sentinel: error-only, no payload */
+ dp->response_msg.metadata.session_id = meta->session_id;
+ __sync_synchronize; /* Memory barrier - ensure sentinel visible before signal */
+
+ outbound_ready_emit;
+
+ "(session %u, err=%d)\n",
+ COMPONENT_NAME, meta->session_id, err);
+ } else {
+ "(session %u)\n", COMPONENT_NAME, meta->session_id);
+ }
+ }
+
+ /* Clean up metadata for failed handshake using centralized cleanup */
+ if (meta != NULL) {
+ meta->metadata_close_pending = true; /* Intent: cleanup needed */
+ meta->close_timestamp = sys_now; /* For timeout tracking */
+ meta->pcb_closed = true; /* Handshake failed, PCB invalid */
+
+ DEBUG_ERROR("[CLOSE-SOURCE-4] inbound_connected_callback failed - session=%u | PBUF=%u/%u\n",
+ meta->session_id,
+ lwip_stats.memp[MEMP_PBUF_POOL]->used,
+ lwip_stats.memp[MEMP_PBUF_POOL]->avail);
+
+ /* Enqueue for centralized cleanup */
+ enqueue_cleanup(meta->session_id);
+
+ COMPONENT_NAME, err, meta->session_id);
+
+ update_shared_connection_state;
+ }
+
+ inbound_free_state(state);
+ return err;
+ }
+
+ /* Set callbacks */
+ tcp_recv(pcb, inbound_tcp_recv_callback);
+ tcp_sent(pcb, inbound_tcp_sent_callback);
+
+ /* CRITICAL FIX - Check send buffer before calling tcp_output
+ * Bug Discovery (2025-10-20):
+ * - Connection just established, tcp_sndbuf(pcb) returns 0 (no window yet)
+ * - to_send = 0, tcp_write(pcb, data, 0) succeeds but queues nothing
+ * - pcb->unsent remains NULL (no data queued)
+ * - CRASH: NULL pointer dereference at address 0x10
+ * Evidence from crash log:
+ * - "TCP connection ESTABLISHED to PLC - registering callbacks"
+ * - "Callbacks registered: recv=0xb878, sent=0xbeb8"
+ * - FAULT: pc=0x39868 (inside tcp_output), address=0x10
+ * - Disassembly: ldr r3, [r3, #16] where r3=0
+ * - TCP connection just established but remote window not yet advertised
+ * - Calling tcp_output with empty unsent queue causes NULL dereference
+ * Fix: Only call tcp_output if data was actually queued
+ * - Check to_send > 0 before tcp_write
+ * - sent callback will retry transmission
+ * This is a race condition between:
+ */
+
+ /* Send the payload */
+ uint16_t to_send = (state->payload_len > tcp_sndbuf(pcb)) ? tcp_sndbuf(pcb) : state->payload_len;
+
+ if (to_send == 0) {
+ /* Send buffer full - defer transmission until sent callback */
+ DEBUG_WARN("%s: [WARN] Send buffer full (sndbuf=%u), deferring transmission of %u bytes\n",
+ COMPONENT_NAME, tcp_sndbuf(pcb), state->payload_len);
+
+ /* Keep state active - sent callback will retry when buffer space available
+ * This is safe because:
+ state->bytes_sent = 0;
+ return ERR_OK;
+ }
+
+ err = tcp_write(pcb, state->payload_data, to_send, TCP_WRITE_FLAG_COPY);
+ if (err != ERR_OK) {
+ /* CRITICAL FIX - Do NOT call tcp_abort from callback!
+ * Return ERR_ABRT and lwIP handles cleanup internally */
+ inbound_free_state(state);
+ return ERR_ABRT;
+ }
+
+ state->bytes_sent = to_send;
+
+ /* Trigger transmission - safe now because we know data was queued */
+ tcp_output(pcb);
+
+ return ERR_OK;
+}
+
+/* TCP client connection state for OUTBOUND forwarding */
+struct tcp_outbound_client_state {
+ struct tcp_pcb *pcb;
+ uint8_t payload_data[MAX_PAYLOAD_SIZE]; /* CRITICAL FIX - Use buffer, not pointer!
+ * Same fix as inbound
+ uint16_t payload_len;
+ uint16_t bytes_sent;
+ bool active;
+};
+
+static struct tcp_outbound_client_state outbound_tcp_client = {0};
+
+/*
+ * TCP client callbacks for OUTBOUND path
+static err_t outbound_tcp_sent_callback(void *arg, struct tcp_pcb *pcb, u16_t len)
+{
+ struct tcp_outbound_client_state *state = (struct tcp_outbound_client_state *)arg;
+
+ state->bytes_sent += len;
+
+ /* Check if all data sent */
+ if (state->bytes_sent >= state->payload_len) {
+ COMPONENT_NAME, state->bytes_sent, state->payload_len);
+
+ /* CRITICAL FIX - Close connection after successful transmission
+ * DO NOT call tcp_abort from callback! Return ERR_ABRT instead.
+ * This was THE BUG causing the crash at PC 0x38a9c!
+ * - Crash at address 0x10 (NULL + offset)
+ * Correct protocol: Return ERR_ABRT, lwIP handles tcp_abort internally
+ * Use centralized cleanup instead of connection_remove
+ struct connection_metadata *meta = connection_lookup_by_pcb(pcb);
+ if (meta != NULL) {
+ meta->metadata_close_pending = true;
+ meta->close_timestamp = sys_now;
+ meta->pcb_closed = true;
+ enqueue_cleanup(meta->session_id);
+ DEBUG_ERROR("[CLOSE-SOURCE-5] outbound_tcp_sent_callback close - session=%u | PBUF=%u/%u\n",
+ meta->session_id,
+ lwip_stats.memp[MEMP_PBUF_POOL]->used,
+ lwip_stats.memp[MEMP_PBUF_POOL]->avail);
+ }
+ state->active = false;
+
+ return ERR_ABRT; /* Let lwIP handle tcp_abort internally */
+ }
+
+ /* Send remaining data if needed */
+ uint16_t remaining = state->payload_len - state->bytes_sent;
+ uint16_t to_send = (remaining > tcp_sndbuf(pcb)) ? tcp_sndbuf(pcb) : remaining;
+
+ if (to_send > 0) {
+ err_t err = tcp_write(pcb, state->payload_data + state->bytes_sent, to_send, TCP_WRITE_FLAG_COPY);
+ if (err == ERR_OK) {
+ tcp_output(pcb);
+ } else {
+ }
+ }
+
+ return ERR_OK;
+}
+
+static err_t outbound_tcp_connected_callback(void *arg, struct tcp_pcb *pcb, err_t err)
+{
+ struct tcp_outbound_client_state *state = (struct tcp_outbound_client_state *)arg;
+
+ if (err != ERR_OK) {
+ state->active = false;
+ state->pcb = NULL;
+ return err;
+ }
+
+ /* Set sent callback */
+ tcp_sent(pcb, outbound_tcp_sent_callback);
+
+ /* Send the payload */
+ uint16_t to_send = (state->payload_len > tcp_sndbuf(pcb)) ? tcp_sndbuf(pcb) : state->payload_len;
+
+ /* CRITICAL FIX - Check to_send > 0 before calling tcp_write
+ * Bug Discovery (2025-10-20):
+ * - Crash at PC 0x383e0 (tcp_write+0xbc8) with NULL pbuf
+ * - OUTBOUND connection established but remote window not yet advertised
+ * - Later access to pbuf->len (offset +8) causes crash
+ * - GDB kernel fault catcher at c_handle_data_fault
+ * - FAR_EL2 = 0x10, r3 = NULL
+ * - Disassembly: ldrh r2, [r3, #8] (loading pbuf->len)
+ * Fix: Same as - only call tcp_write if to_send > 0
+ if (to_send == 0) {
+ /* Send buffer full - defer transmission until sent callback */
+ DEBUG_WARN("%s: [WARN] OUTBOUND: Send buffer full (sndbuf=%u), deferring transmission of %u bytes\n",
+ COMPONENT_NAME, tcp_sndbuf(pcb), state->payload_len);
+
+ /* Keep state active - sent callback will retry when buffer space available */
+ state->bytes_sent = 0;
+ return ERR_OK;
+ }
+
+ err = tcp_write(pcb, state->payload_data, to_send, TCP_WRITE_FLAG_COPY);
+ if (err != ERR_OK) {
+ /* CRITICAL FIX - Do NOT call tcp_abort from callback!
+ * Return ERR_ABRT and lwIP handles cleanup internally */
+ state->active = false;
+ state->pcb = NULL;
+ return ERR_ABRT;
+ }
+
+ state->bytes_sent = to_send;
+
+ /* Trigger transmission */
+ tcp_output(pcb);
+
+ return ERR_OK;
+}
+
+/*
+ * INBOUND notification handler - called when ICS_Inbound has validated data
+ * Creates TCP client connection to forward data to internal network (PLC)
+void inbound_ready_handle(void)
+{
+ BREADCRUMB(2000); /* Entry: ICS_Inbound notification received */
+
+ BREADCRUMB(2001); /* Checking dataport */
+
+ /* CRITICAL: Check if dataport is properly mapped by CAmkES */
+ if (inbound_dp == NULL) {
+ BREADCRUMB(2002); /* NULL dataport */
+ DEBUG_ERROR("%s: [ERR] FATAL: inbound_dp is NULL! CAmkES dataport not mapped\n", COMPONENT_NAME);
+ return;
+ }
+
+ BREADCRUMB(2003); /* Reading ICS message */
+
+ InboundDataport *dp = (InboundDataport *)inbound_dp;
+ static uint32_t close_queue_tail = 0; /* Consumer state (local, never shared) */
+
+ uint32_t close_queue_head = dp->close_queue.head;
+
+ /* Root Cause: Cache coherency issue with dataport reads */
+ __sync_synchronize; /* Force cache invalidation - read fresh value from Net0 */
+
+ /* Check for queue overflow */
+ if (close_queue_head - close_queue_tail > CONTROL_QUEUE_SIZE) {
+ DEBUG_WARN("%s: [WARN] Close queue overflow! Missed %u notifications\n",
+ COMPONENT_NAME, close_queue_head - close_queue_tail - CONTROL_QUEUE_SIZE);
+ close_queue_tail = close_queue_head - CONTROL_QUEUE_SIZE;
+ }
+
+ /* Process all queued close notifications */
+ while (close_queue_tail < close_queue_head) {
+ uint32_t slot = close_queue_tail & CONTROL_QUEUE_MASK;
+ volatile struct control_notification *notif = &dp->close_queue.notifications[slot];
+
+ /* Verify sequence */
+ if (notif->seq_num == close_queue_tail && notif->session_id != 0) {
+ COMPONENT_NAME, notif->session_id);
+
+ /* Lookup connection by session_id */
+ struct connection_metadata *meta = connection_lookup_by_session_id(notif->session_id);
+
+ /* BUG: connection_remove sets active=false but NOT session_id=0 */
+ if (meta != NULL && meta->pcb != NULL && !meta->pcb_closed) {
+ struct tcp_pcb *pcb = meta->pcb;
+
+ COMPONENT_NAME, notif->session_id, (void*)pcb);
+
+ /* lwIP BEST PRACTICE - Safe close from main thread (event handler)
+ * CRITICAL FIX: Never call tcp_abort directly from main thread!
+ * OLD CODE:
+ * tcp_abort(pcb); // ❌ WRONG! Use-after-free if lwIP callback executing
+ * NEW CODE: NULL all callbacks first, then tcp_close
+ * Why this is safe:
+ * - NULLing callbacks prevents spurious callbacks during close
+ * - Metadata marked inactive before calling lwIP
+ */
+
+ /* Step 1: NULL all callbacks to prevent them firing */
+ tcp_arg(pcb, NULL);
+ tcp_recv(pcb, NULL);
+ tcp_sent(pcb, NULL);
+ tcp_err(pcb, NULL); /* Prevent error callback during close */
+ tcp_poll(pcb, NULL, 0);
+
+ /* CRITICAL FIX - Clear PCB pointer BEFORE closing
+ * This prevents race conditions if tcp_close triggers callbacks
+ * (even though we NULLed them above, better safe than sorry)
+ meta->pcb = NULL;
+
+ /* Step 2: Set intent flags instead of direct manipulation */
+ meta->metadata_close_pending = true; /* Intent: cleanup needed */
+ meta->close_timestamp = sys_now; /* For timeout tracking */
+ meta->pcb_closed = true; /* PCB will be closed below */
+ meta->error_notified = false; /* Clear dedup flag */
+
+ DEBUG_ERROR("[CLOSE-SOURCE-6] inbound_ready_handle close notif - session=%u | PBUF=%u/%u\n",
+ meta->session_id,
+ lwip_stats.memp[MEMP_PBUF_POOL]->used,
+ lwip_stats.memp[MEMP_PBUF_POOL]->avail);
+
+ __sync_synchronize; /* Ensure metadata updates visible */
+
+ /* Step 3: Symmetrical close behavior */
+ if (notif->err_code == ERR_RST || notif->err_code == ERR_ABRT) {
+ /* SCADA sent RST or Net0 forced close → Use tcp_abort for immediate cleanup */
+ const char *reason = (notif->err_code == ERR_RST) ? "SCADA sent RST" : "Forced close (pool exhaustion)";
+ COMPONENT_NAME, reason);
+ tcp_abort(pcb); /* Sends RST, frees PCB immediately */
+ } else {
+ /* SCADA sent FIN (ERR_CLSD) or unknown → Use graceful close */
+ COMPONENT_NAME);
+ err_t err = tcp_close(pcb);
+ if (err != ERR_OK) {
+ /* Graceful close failed (out of memory), force abort */
+ COMPONENT_NAME, err);
+ tcp_abort(pcb); /* Safe now - callbacks NULL, metadata inactive */
+ }
+ }
+
+ /* BUG: Pool exhaustion after 100 connections */
+ if (meta->pool_state != NULL) {
+ inbound_free_state(meta->pool_state);
+ meta->pool_state = NULL;
+ }
+
+ /* Update shared state */
+ update_shared_connection_state;
+
+ enqueue_cleanup(notif->session_id);
+
+ COMPONENT_NAME, notif->session_id);
+ } else if (meta != NULL) {
+ COMPONENT_NAME, notif->session_id);
+ enqueue_cleanup(notif->session_id);
+ } else {
+ /* meta == NULL - session not found at all, already fully cleaned */
+ COMPONENT_NAME, notif->session_id);
+ }
+ }
+
+ close_queue_tail++; /* Move to next notification */
+ }
+
+ /* Now process request data (if any) */
+ ICS_Message *ics_msg = &dp->request_msg;
+
+ /* Validate message */
+ if (ics_msg->payload_length > MAX_PAYLOAD_SIZE) {
+ BREADCRUMB(2004); /* Invalid payload size */
+ COMPONENT_NAME, ics_msg->payload_length, MAX_PAYLOAD_SIZE);
+ return;
+ }
+
+ BREADCRUMB(2005); /* Payload size valid */
+
+ /* Skip if no request data (only close notifications were queued) */
+ if (ics_msg->payload_length == 0) {
+ return;
+ }
+
+ /* OLD CLOSE NOTIFICATION HANDLER REMOVED (replaced by queue above) */
+ /* Continue with normal request processing below... */
+ if (false) { /* DISABLED - kept for reference only */
+ COMPONENT_NAME,
+ (ics_msg->metadata.src_ip >> 24) & 0xFF,
+ (ics_msg->metadata.src_ip >> 16) & 0xFF,
+ (ics_msg->metadata.src_ip >> 8) & 0xFF,
+ ics_msg->metadata.src_ip & 0xFF,
+ ics_msg->metadata.src_port);
+
+ /* and created a NEW connection with the same 5-tuple. If we process the stale */
+ if (was_recently_self_cleaned(ics_msg->metadata.src_ip,
+ ics_msg->metadata.src_port,
+ ics_msg->metadata.dst_port)) {
+
+ /* - We cleaned connection A (5-tuple X) */
+
+ bool net0_has_connection = false;
+ if (peer_state != NULL) {
+ __sync_synchronize; /* Memory barrier - read latest Net0 state */
+
+ COMPONENT_NAME);
+
+ for (int i = 0; i < MAX_SHARED_CONNECTIONS; i++) {
+ const struct connection_view *view = &peer_state->connections[i];
+ if (view->active &&
+ view->src_ip == ics_msg->metadata.src_ip && /* SCADA IP */
+ view->dst_ip == ics_msg->metadata.dst_ip && /* PLC IP */
+ view->src_port == ics_msg->metadata.src_port && /* SCADA port */
+ view->dst_port == ics_msg->metadata.dst_port) { /* PLC port */
+
+ net0_has_connection = true;
+ COMPONENT_NAME, i);
+ COMPONENT_NAME);
+ break;
+ }
+ }
+
+ if (!net0_has_connection) {
+ COMPONENT_NAME);
+ }
+ } else {
+ COMPONENT_NAME);
+ }
+
+ if (!net0_has_connection) {
+ /* Net0 doesn't have it - safe to ignore */
+ COMPONENT_NAME);
+ COMPONENT_NAME);
+ return; /* Ignore stale notification */
+ }
+
+ /* Net0 still has it - fall through to process the close notification */
+ COMPONENT_NAME);
+ }
+
+ /* Look up PLC connection for this SCADA session */
+ struct connection_metadata *meta = connection_lookup_by_tuple(
+ ics_msg->metadata.src_ip,
+ ics_msg->metadata.dst_ip,
+ ics_msg->metadata.src_port,
+ ics_msg->metadata.dst_port
+ );
+
+ if (meta != NULL && meta->active && meta->pcb != NULL) {
+ struct tcp_pcb *pcb = meta->pcb;
+
+ /* DEBUG: Comment out printf to test if it's causing crash */
+ // DEBUG("%s: → Found PLC connection (PCB=%p) - closing gracefully\n",
+ // COMPONENT_NAME, (void*)pcb);
+ BREADCRUMB(3160); /* After printf */
+
+ /* If meta->pcb is still set when recv callback fires, it will try to call */
+
+ /* Mark PCB as NULL to prevent double-close */
+ BREADCRUMB(3161); /* Before meta->pcb = NULL */
+ meta->pcb = NULL;
+ BREADCRUMB(3162); /* After meta->pcb = NULL */
+ __sync_synchronize; /* Memory barrier */
+ BREADCRUMB(3163); /* After memory barrier */
+
+ if (pcb == NULL) {
+ DEBUG_WARN("%s: [WARN] PCB is NULL - skipping tcp_close (metadata cleanup)\n",
+ COMPONENT_NAME);
+ /* Clean up metadata since we can't close the PCB */
+ meta->active = false;
+ if (connection_count > 0) {
+ connection_count--;
+ }
+ /* Update shared connection state */
+ update_shared_connection_state;
+ return;
+ }
+
+ /* AFTER close is initiated but BEFORE PCB is freed. This causes: */
+ /* FIX: Mark metadata inactive BEFORE tcp_abort
+ * This prevents DOUBLE cleanup:
+ * - Error callback searches for metadata with active==true
+ * - If we set active=false FIRST, error callback won't find it
+ * - Error callback will still free pool_state, but won't touch metadata
+ BREADCRUMB(3164); /* Right before cleanup */
+ meta->active = false; /* Mark inactive BEFORE tcp_abort to prevent double cleanup */
+ if (connection_count > 0) {
+ connection_count--;
+ }
+ __sync_synchronize; /* Memory barrier: ensure active=false is visible to error callback */
+
+ COMPONENT_NAME);
+ tcp_abort(pcb);
+ BREADCRUMB(3165); /* Right after tcp_abort */
+
+ /* Update shared state AFTER tcp_abort to reflect final state */
+ update_shared_connection_state;
+ } else {
+ COMPONENT_NAME);
+ }
+
+ return; /* Close notification processed - done */
+ }
+
+ /* ═══════════════════════════════════════════════════════════════════════════
+ * PRODUCTION-READY CONNECTION REUSE with Multi-Layer Validation
+ * Goal: Reuse PLC connection when safe (same SCADA session, >MTU data support)
+ * Validation Layers:
+ */
+
+ /* Look up if we already have a connection for this SCADA client (by 5-tuple) */
+ struct connection_metadata *existing_meta = connection_lookup_by_tuple(
+ ics_msg->metadata.src_ip, /* SCADA IP */
+ ics_msg->metadata.dst_ip, /* PLC IP */
+ ics_msg->metadata.src_port, /* SCADA port - unique per SCADA session */
+ ics_msg->metadata.dst_port /* PLC port (502) */
+ );
+
+ if (existing_meta != NULL && existing_meta->active && existing_meta->pcb != NULL) {
+ BREADCRUMB(2006); /* Found existing connection - validating */
+
+ struct tcp_pcb *existing_pcb = existing_meta->pcb;
+
+ COMPONENT_NAME,
+ (ics_msg->metadata.src_ip >> 24) & 0xFF,
+ (ics_msg->metadata.src_ip >> 16) & 0xFF,
+ (ics_msg->metadata.src_ip >> 8) & 0xFF,
+ ics_msg->metadata.src_ip & 0xFF,
+ ics_msg->metadata.src_port,
+ (void*)existing_pcb);
+
+ /* CRITICAL FIX - DO NOT ACCESS PCB FIELDS! (Same as Net0 )
+ * Root Cause (same as Net0):
+ * If existing_pcb exists but might be stale → always create new connection
+ * This is SAFER than trying to validate - lwIP will clean up old PCB
+ * through callbacks, and we create a fresh connection for the new request.
+ goto cleanup_and_create_new;
+
+ /* DEAD CODE - Never executed due to goto cleanup_and_create_new above
+ * Connection reuse is disabled - always create new connection
+ * Left commented out for reference
+ * [OK] ALL VALIDATION PASSED - SAFE TO REUSE CONNECTION!
+ existing_meta->last_activity = sys_now;
+
+ if (ics_msg->payload_length > MAX_PAYLOAD_SIZE) {
+ COMPONENT_NAME, ics_msg->payload_length, MAX_PAYLOAD_SIZE);
+ goto cleanup_and_create_new;
+ }
+
+ [Connection reuse code removed - used global inbound_tcp_client]
+
+ tcp_output(existing_pcb);
+ BREADCRUMB(2020);
+ return;
+cleanup_and_create_new:
+ /* ─────────────────────────────────────────────────────────────────────
+ * Connection validation failed - clean up and create new
+ * ───────────────────────────────────────────────────────────────────── */
+
+ mark_connection_self_cleaned(
+ ics_msg->metadata.src_ip,
+ ics_msg->metadata.src_port,
+ ics_msg->metadata.dst_port
+ );
+
+ /* CRITICAL FIX - Follow CRITICAL_LESSON Rule 2 for event handler context */
+ BREADCRUMB(2107); /* Cleanup path - clearing callbacks */
+
+ /* Step 1: Clear callbacks to prevent them from firing during cleanup */
+ tcp_recv(existing_pcb, NULL);
+ tcp_sent(existing_pcb, NULL);
+ tcp_err(existing_pcb, NULL);
+ tcp_arg(existing_pcb, NULL);
+
+ /* Step 2: Use tcp_abort to immediately free old PCB */
+ BREADCRUMB(2108); /* Cleanup path - about to abort and remove metadata */
+ COMPONENT_NAME);
+
+ /* Use centralized cleanup instead of connection_remove */
+ struct connection_metadata *existing_meta = connection_lookup_by_pcb(existing_pcb);
+ if (existing_meta != NULL) {
+ existing_meta->metadata_close_pending = true;
+ existing_meta->close_timestamp = sys_now;
+ existing_meta->pcb_closed = true; /* Will be closed below */
+
+ DEBUG_ERROR("[CLOSE-SOURCE-7] tcp_connect existing PCB cleanup - session=%u | PBUF=%u/%u\n",
+ existing_meta->session_id,
+ lwip_stats.memp[MEMP_PBUF_POOL]->used,
+ lwip_stats.memp[MEMP_PBUF_POOL]->avail);
+
+ /* Free pool state before tcp_abort (it needs to be freed before PCB is freed) */
+ if (existing_meta->pool_state != NULL) {
+ inbound_free_state(existing_meta->pool_state);
+ existing_meta->pool_state = NULL;
+ }
+
+ enqueue_cleanup(existing_meta->session_id);
+ COMPONENT_NAME, existing_meta->session_id);
+ }
+
+ tcp_abort(existing_pcb); /* Immediate cleanup - no FIN_WAIT */
+
+ }
+
+ BREADCRUMB(2007); /* Creating new TCP PCB */
+
+ /* lwIP-MANAGED CONNECTION LIMIT
+ * REMOVED manual connection_count check
+ * Root cause: tcp_abort immediately frees PCB, but lwIP state machine
+ * still has references → crash at offset 0x10 (callback_arg access)
+ * - No manual PCB lifecycle management (no tcp_abort from main loop!)
+ * - Send error notification when tcp_new fails
+ * This matches the design: "let lwIP handle lifecycle" (lwipopts.h )
+ */
+
+ /* Print metadata */
+
+ /* Create TCP client connection */
+ struct tcp_pcb *pcb = tcp_new_ip_type(IPADDR_TYPE_V4);
+ if (pcb == NULL) {
+ BREADCRUMB(2008); /* Failed to create PCB */
+ DEBUG_WARN("%s: [WARN] INBOUND: Failed to create TCP PCB - lwIP connection pool exhausted (MEMP_NUM_TCP_PCB=%d)\n",
+ COMPONENT_NAME, MEMP_NUM_TCP_PCB);
+
+ /* When pool exhaustion occurs, diagnose WHY it happened: */
+ COMPONENT_NAME, connection_count, MAX_CONNECTIONS);
+
+ /* Analyze connection table for issues */
+ int active_count = 0;
+ int dangling_count = 0; /* active=true but pcb=NULL */
+ int valid_count = 0; /* active=true and pcb!=NULL */
+ int orphan_count = 0; /* Net1 has but Net0 doesn't */
+
+ /* Track session IDs to detect duplicates */
+ uint32_t session_ids[MAX_CONNECTIONS];
+ int session_count = 0;
+
+ for (int i = 0; i < MAX_CONNECTIONS; i++) {
+ if (!connection_table[i].active) continue;
+
+ active_count++;
+
+ /* Check for dangling connection (active but no PCB) */
+ if (connection_table[i].pcb == NULL) {
+ if (dangling_count == 0) {
+ COMPONENT_NAME);
+ }
+ COMPONENT_NAME, i,
+ connection_table[i].session_id,
+ connection_table[i].src_port,
+ connection_table[i].dest_port);
+ dangling_count++;
+ } else {
+ valid_count++;
+ }
+
+ /* Check for orphan connections (Net1 has but Net0 doesn't) */
+ if (peer_state != NULL) {
+ bool found_in_net0 = false;
+ for (int j = 0; j < peer_state->count && j < 256; j++) {
+ if (peer_state->connections[j].active &&
+ peer_state->connections[j].session_id == connection_table[i].session_id) {
+ found_in_net0 = true;
+ break;
+ }
+ }
+
+ if (!found_in_net0) {
+ if (orphan_count == 0) {
+ COMPONENT_NAME);
+ }
+ COMPONENT_NAME, i, connection_table[i].session_id);
+ orphan_count++;
+ }
+ }
+
+ /* Track session ID for duplicate detection */
+ session_ids[session_count++] = connection_table[i].session_id;
+ }
+
+ /* Check for duplicate session IDs */
+ int duplicate_count = 0;
+ for (int i = 0; i < session_count; i++) {
+ for (int j = i + 1; j < session_count; j++) {
+ if (session_ids[i] == session_ids[j]) {
+ COMPONENT_NAME, session_ids[i]);
+ duplicate_count++;
+ break; /* Only report once per session_id */
+ }
+ }
+ }
+ if (duplicate_count == 0) {
+ }
+
+ /* Summary */
+ COMPONENT_NAME, dangling_count,
+ dangling_count > 0 ? "❌ LEAK!" : "✅");
+ COMPONENT_NAME, orphan_count,
+ orphan_count > 0 ? "⚠️ Asymmetric state" : "✅");
+ COMPONENT_NAME, duplicate_count,
+ duplicate_count > 0 ? "❌ BUG!" : "✅");
+
+ if (dangling_count > 0) {
+ }
+
+ if (orphan_count > 0) {
+ }
+
+ if (duplicate_count > 0) {
+ }
+
+ /* Send error notification to Net0 to close SCADA connection
+ * This is the SAFE way to handle connection limits - let lwIP refuse the connection
+ * by returning NULL from tcp_new, then notify Net0 to close SCADA side.
+ * CRITICAL FIX: Include session_id in error notification
+ * Without it, Net0 can't tell Net1 which session to close → PCB LEAK!
+ * - By time Net0 receives error notification, SCADA metadata already gone
+ * Fix: Include session_id in error notification so Net0 can always
+ * send close notification to Net1, even if SCADA already closed.
+ if (outbound_dp != NULL) {
+ ICS_Message *error_msg = (ICS_Message *)outbound_dp;
+
+ memset(&error_msg->metadata, 0, sizeof(FrameMetadata));
+ error_msg->metadata.ethertype = 0x0800;
+ error_msg->metadata.ip_protocol = 6;
+ error_msg->metadata.is_ip = 1;
+ error_msg->metadata.is_tcp = 1;
+
+ error_msg->metadata.src_ip = ics_msg->metadata.src_ip;
+ error_msg->metadata.dst_ip = ics_msg->metadata.dst_ip;
+ error_msg->metadata.src_port = ics_msg->metadata.src_port;
+ error_msg->metadata.dst_port = ics_msg->metadata.dst_port;
+
+ error_msg->metadata.session_id = ics_msg->metadata.session_id;
+
+ error_msg->payload_length = 0;
+ error_msg->metadata.payload_length = 0;
+ error_msg->metadata.payload_offset = 0xFFFF; /* Error marker */
+
+ __sync_synchronize;
+ outbound_ready_emit;
+ }
+
+ return;
+ }
+
+ BREADCRUMB(2009); /* PCB created successfully */
+
+ /* Allocate per-connection state from pool
+ * CRITICAL: Each connection must have its own state to prevent race conditions
+ * See detailed comment at inbound_connection_pool declaration for bug analysis */
+ struct tcp_inbound_client_state *state = inbound_alloc_state;
+ if (state == NULL) {
+ tcp_abort(pcb);
+ BREADCRUMB(2111); /* Pool exhausted - aborted PCB and returning */
+ return;
+ }
+
+ BREADCRUMB(2112); /* Pool allocation succeeded - continue to setup */
+
+ /* CRITICAL FIX: Copy payload to local buffer instead of storing pointer
+ * Fix: Copy to persistent local buffer before tcp_connect */
+
+ /* Validate payload size before copying */
+ if (ics_msg->payload_length > MAX_PAYLOAD_SIZE) {
+ COMPONENT_NAME, ics_msg->payload_length, MAX_PAYLOAD_SIZE);
+ tcp_abort(pcb);
+ inbound_free_state(state);
+ return;
+ }
+
+ /* Set up client state with COPIED payload */
+ state->pcb = pcb;
+ memcpy(state->payload_data, ics_msg->payload, ics_msg->payload_length); /* COPY, not pointer! */
+ state->payload_len = ics_msg->payload_length;
+ state->bytes_sent = 0;
+ /* state->active already set to true by inbound_alloc_state */
+
+ /* Extract source and destination from metadata
+ * This preserves end-to-end IP addresses through the gateway
+ * Example: SCADA (192.168.90.5) → PLC (192.168.95.2)
+ * Net0 receives: src=192.168.90.5, dst=192.168.95.2
+ * Net1 binds to: 192.168.90.5 (appears as SCADA to PLC)
+ * Net1 connects to: 192.168.95.2 (real PLC)
+ ip_addr_t src_ip, dest_ip;
+ IP4_ADDR(&src_ip,
+ (ics_msg->metadata.src_ip >> 24) & 0xFF,
+ (ics_msg->metadata.src_ip >> 16) & 0xFF,
+ (ics_msg->metadata.src_ip >> 8) & 0xFF,
+ ics_msg->metadata.src_ip & 0xFF);
+
+ IP4_ADDR(&dest_ip,
+ (ics_msg->metadata.dst_ip >> 24) & 0xFF,
+ (ics_msg->metadata.dst_ip >> 16) & 0xFF,
+ (ics_msg->metadata.dst_ip >> 8) & 0xFF,
+ ics_msg->metadata.dst_ip & 0xFF);
+
+ /* NOTE: Cannot use tcp_bind with external IP (192.168.90.5) because lwIP
+ * only allows binding to IPs configured on the local interface (192.168.95.1)
+ * WORKAROUND: We bind to IP_ADDR_ANY and let lwIP use 192.168.95.1 as source.
+ * This means the PLC will see the connection coming from the gateway (192.168.95.1),
+ * not from the original SCADA IP (192.168.90.5).
+ * Alternative future solution: Use raw sockets or modify lwIP to allow arbitrary source IPs
+ BREADCRUMB(2010); /* Attempting tcp_bind */
+
+ err_t bind_err = tcp_bind(pcb, IP_ADDR_ANY, 0); /* Bind to any, port 0 = ephemeral */
+ if (bind_err != ERR_OK) {
+ BREADCRUMB(2011); /* tcp_bind failed */
+ tcp_abort(pcb);
+ inbound_free_state(state);
+ return;
+ }
+
+ BREADCRUMB(2012); /* tcp_bind succeeded */
+
+ /* CRITICAL: Store connection metadata BEFORE connecting
+ * This metadata is needed in netif_output to restore original IPs
+ * when sending responses back through the gateway
+ BREADCRUMB(2013); /* Storing connection metadata */
+
+ struct connection_metadata *meta = connection_add(
+ ics_msg->metadata.session_id,
+ ics_msg->metadata.src_ip, /* Original SCADA IP (e.g., 192.168.90.5) */
+ ics_msg->metadata.dst_ip, /* Original PLC IP (e.g., 192.168.95.2) */
+ ics_msg->metadata.src_port, /* SCADA port */
+ ics_msg->metadata.dst_port, /* PLC port (502) */
+ state
+ );
+
+ if (meta == NULL) {
+ BREADCRUMB(2014); /* Metadata storage failed */
+ tcp_abort(pcb);
+ inbound_free_state(state);
+ return;
+ }
+
+ BREADCRUMB(2015); /* Metadata stored successfully */
+
+ /* Store PCB pointer immediately so netif_output can find metadata by PCB */
+ meta->pcb = pcb;
+
+ /* CRITICAL: Set callback argument BEFORE tcp_connect
+ * This prevents null pointer dereference in inbound_tcp_sent_callback
+ * Pass allocated state instead of global variable */
+ tcp_arg(pcb, state);
+
+ tcp_err(pcb, inbound_tcp_err_callback);
+
+ /* Use original destination port from metadata */
+ uint16_t dest_port = ics_msg->metadata.dst_port;
+
+ BREADCRUMB(2016); /* Attempting tcp_connect */
+
+ err_t err = tcp_connect(pcb, &dest_ip, dest_port, inbound_tcp_connected_callback);
+
+ /* Sequence causing unsafe PCB access: */
+ meta->lwip_ephemeral_port = pcb->local_port;
+
+ if (err != ERR_OK) {
+ BREADCRUMB(2017); /* tcp_connect failed */
+
+ if (err == ERR_CONN || err == ERR_RST || err == ERR_ABRT) {
+ DEBUG_WARN("%s: [WARN] PLC connection failed - checking for stale connections to clean up\n",
+ COMPONENT_NAME);
+
+ int cleaned = 0;
+ for (int i = 0; i < MAX_CONNECTIONS; i++) {
+ if (!connection_table[i].active) continue;
+
+ /* Check if this is a connection to the same PLC */
+ if (connection_table[i].original_dest_ip == ics_msg->metadata.dst_ip &&
+ connection_table[i].dest_port == dest_port) {
+
+ struct tcp_pcb *stale_pcb = connection_table[i].pcb;
+
+ if (stale_pcb == NULL) {
+ COMPONENT_NAME, i);
+
+ connection_table[i].active = false;
+
+ uint32_t old_count = connection_count;
+ if (connection_count > 0) {
+ connection_count--;
+ }
+ COMPONENT_NAME, old_count, connection_count, i,
+ connection_table[i].session_id);
+
+ cleaned++;
+ }
+ }
+ }
+
+ if (cleaned > 0) {
+ } else {
+ COMPONENT_NAME);
+ }
+ }
+
+ /* CRITICAL - Notify Net0 to reject SCADA connection when PLC refuses!
+ * New behavior: Send error notification to Net0 → Net0 closes SCADA connection immediately.
+ * This prevents:
+ * Error notification format: Zero-length payload with special error flag.
+ if (outbound_dp != NULL) {
+ ICS_Message *error_msg = (ICS_Message *)outbound_dp;
+
+ /* Prepare error notification */
+ memset(&error_msg->metadata, 0, sizeof(FrameMetadata));
+ error_msg->metadata.ethertype = 0x0800;
+ error_msg->metadata.ip_protocol = 6;
+ error_msg->metadata.is_ip = 1;
+ error_msg->metadata.is_tcp = 1;
+
+ /* Copy connection 5-tuple so Net0 knows which SCADA connection to close */
+ error_msg->metadata.src_ip = ics_msg->metadata.src_ip; /* SCADA IP */
+ error_msg->metadata.dst_ip = ics_msg->metadata.dst_ip; /* PLC IP */
+ error_msg->metadata.src_port = ics_msg->metadata.src_port; /* SCADA port */
+ error_msg->metadata.dst_port = ics_msg->metadata.dst_port; /* PLC port */
+
+ /* Zero-length payload + error code in metadata = "PLC refused connection" */
+ error_msg->payload_length = 0;
+ error_msg->metadata.payload_length = 0;
+ error_msg->metadata.payload_offset = 0xFFFF; /* Special marker: 0xFFFF = ERROR */
+
+ DEBUG_ERROR("%s: [ERR] Sending ERROR notification to Net0 (PLC refused connection, err=%d)\n",
+ COMPONENT_NAME, err);
+ COMPONENT_NAME,
+ (error_msg->metadata.src_ip >> 24) & 0xFF,
+ (error_msg->metadata.src_ip >> 16) & 0xFF,
+ (error_msg->metadata.src_ip >> 8) & 0xFF,
+ error_msg->metadata.src_ip & 0xFF,
+ error_msg->metadata.src_port);
+
+ /* Force cache flush before notification */
+ __sync_synchronize;
+
+ /* Signal ICS_Outbound to pass error notification to Net0 */
+ outbound_ready_emit;
+ }
+
+ /* CRITICAL FIX - Follow CRITICAL_LESSON Rule 2
+ * Callbacks WERE registered (tcp_arg, tcp_err) before tcp_connect,
+ * so we must NULL them before closing to prevent race condition */
+ tcp_recv(pcb, NULL);
+ tcp_sent(pcb, NULL);
+ tcp_err(pcb, NULL);
+ tcp_arg(pcb, NULL);
+
+ /* BUG: connection_add incremented connection_count and created metadata */
+ meta->pcb = NULL; /* Clear PCB from metadata before close */
+ meta->active = false; /* Mark metadata inactive */
+ if (connection_count > 0) {
+ connection_count--; /* Decrement counter */
+ }
+
+ err_t close_err = tcp_close(pcb);
+ if (close_err != ERR_OK) {
+ /* tcp_close failed, safe to abort now (callbacks NULL) */
+ tcp_abort(pcb);
+ }
+
+ inbound_free_state(state);
+ return;
+ }
+
+ BREADCRUMB(2018); /* tcp_connect succeeded */
+
+ meta->tcp_seq_num = pcb->snd_nxt; /* Current send sequence number */
+ meta->timestamp = sys_now; /* Connection creation timestamp */
+
+ /* CRITICAL: Memory barrier to ensure all metadata writes are visible before callbacks fire */
+ __sync_synchronize;
+
+ BREADCRUMB(2019); /* Metadata complete, memory barrier done */
+
+ #if DEBUG_METADATA
+ COMPONENT_NAME, (int)(meta - connection_table),
+ (meta->original_src_ip >> 24) & 0xFF, (meta->original_src_ip >> 16) & 0xFF,
+ (meta->original_src_ip >> 8) & 0xFF, meta->original_src_ip & 0xFF,
+ meta->src_port,
+ (meta->original_dest_ip >> 24) & 0xFF, (meta->original_dest_ip >> 16) & 0xFF,
+ (meta->original_dest_ip >> 8) & 0xFF, meta->original_dest_ip & 0xFF,
+ meta->dest_port, meta->lwip_ephemeral_port);
+ #endif
+
+ BREADCRUMB(2020); /* Exit: inbound_ready_handle complete */
+}
+
+/*
+ * OUTBOUND notification handler - called when ICS_Outbound has validated data
+ * Creates TCP client connection to forward data to external network
+void outbound_ready_handle(void)
+{
+
+ /* CRITICAL: Check if dataport is properly mapped by CAmkES */
+ if (outbound_dp == NULL) {
+ DEBUG_ERROR("%s: [ERR] FATAL: outbound_dp is NULL! CAmkES dataport not mapped\n", COMPONENT_NAME);
+ return;
+ }
+
+ ICS_Message *ics_msg = (ICS_Message *)outbound_dp;
+
+ /* Validate message */
+ if (ics_msg->payload_length > MAX_PAYLOAD_SIZE) {
+ COMPONENT_NAME, ics_msg->payload_length, MAX_PAYLOAD_SIZE);
+ return;
+ }
+
+ /* Check if we already have an active connection - if so, close it and create new one */
+ if (outbound_tcp_client.active) {
+ if (outbound_tcp_client.pcb != NULL) {
+ /* CRITICAL FIX - Follow CRITICAL_LESSON Rule 2 */
+ struct tcp_pcb *old_pcb = outbound_tcp_client.pcb;
+ tcp_recv(old_pcb, NULL);
+ tcp_sent(old_pcb, NULL);
+ tcp_err(old_pcb, NULL);
+ tcp_arg(old_pcb, NULL);
+
+ err_t close_err = tcp_close(old_pcb);
+ if (close_err != ERR_OK) {
+ tcp_abort(old_pcb); /* Safe - callbacks NULL */
+ }
+ }
+ outbound_tcp_client.active = false;
+ outbound_tcp_client.pcb = NULL;
+ }
+
+ /* Print metadata */
+
+ /* Create TCP client connection */
+ struct tcp_pcb *pcb = tcp_new_ip_type(IPADDR_TYPE_V4);
+ if (pcb == NULL) {
+ return;
+ }
+
+ if (ics_msg->payload_length > MAX_PAYLOAD_SIZE) {
+ COMPONENT_NAME, ics_msg->payload_length, MAX_PAYLOAD_SIZE);
+ tcp_abort(pcb);
+ return;
+ }
+
+ /* Set up client state with COPIED payload (not pointer!) */
+ outbound_tcp_client.pcb = pcb;
+ memcpy(outbound_tcp_client.payload_data, ics_msg->payload, ics_msg->payload_length);
+ outbound_tcp_client.payload_len = ics_msg->payload_length;
+ outbound_tcp_client.bytes_sent = 0;
+ outbound_tcp_client.active = true;
+
+ /* Set up destination IP address - use QEMU gateway to reach host */
+ ip_addr_t dest_ip;
+ ipaddr_aton(OUTBOUND_FORWARD_IP, &dest_ip); /* 10.0.2.2 - QEMU gateway */
+
+ /* CRITICAL: Set callback argument BEFORE tcp_connect
+ * This prevents null pointer dereference in outbound_tcp_sent_callback
+ tcp_arg(pcb, &outbound_tcp_client);
+
+ /* CROSS-DOMAIN PORT MAPPING:
+ * Internal port 7000 (Net1) → maps to → Host port 19000 (via QEMU gateway)
+ * This creates the protocol break diode architecture
+ uint16_t mapped_port = OUTBOUND_FORWARD_PORT; /* Configurable destination port */
+
+ /* Connect to host via QEMU gateway */
+
+ err_t err = tcp_connect(pcb, &dest_ip, mapped_port, outbound_tcp_connected_callback);
+ if (err != ERR_OK) {
+
+ /* CRITICAL FIX - Follow CRITICAL_LESSON Rule 2
+ * tcp_arg was set before tcp_connect, so NULL it before close */
+ tcp_recv(pcb, NULL);
+ tcp_sent(pcb, NULL);
+ tcp_err(pcb, NULL);
+ tcp_arg(pcb, NULL);
+
+ err_t close_err = tcp_close(pcb);
+ if (close_err != ERR_OK) {
+ tcp_abort(pcb); /* Safe - callbacks NULL */
+ }
+
+ outbound_tcp_client.active = false;
+ outbound_tcp_client.pcb = NULL;
+ return;
+ }
+
+}
+
+/*
+ * VirtIO IRQ Handler
+static volatile bool rx_packets_pending = false;
+
+void virtio_irq_handle(void)
+{
+ static uint32_t irq_count = 0;
+ uint32_t irq_status = VREG_READ(VIRTIO_MMIO_INTERRUPT_STATUS);
+
+ irq_count++;
+
+ if (irq_status & VIRTIO_MMIO_IRQ_VQUEUE) {
+ /* CRITICAL FIX - Don't call process_rx_packets in IRQ!
+ * Just set flag - main loop will process packets.
+ * This prevents reentrancy with sys_check_timeouts */
+ rx_packets_pending = true;
+ VREG_WRITE(VIRTIO_MMIO_INTERRUPT_ACK, VIRTIO_MMIO_IRQ_VQUEUE);
+ }
+
+ if (irq_status & VIRTIO_MMIO_IRQ_CONFIG) {
+ VREG_WRITE(VIRTIO_MMIO_INTERRUPT_ACK, VIRTIO_MMIO_IRQ_CONFIG);
+ }
+
+ virtio_irq_acknowledge;
+}
+
+/*
+ * Initialize VirtIO device (same as Tier 2)
+static int virtio_net_init(void)
+{
+
+ /* ═══════════════════════════════════════════════════════════════ */
+ /* COMPREHENSIVE VIRTIO SLOT SCANNER */
+ /* Scan all 32 VirtIO MMIO slots to find which ones have devices */
+ /* ═══════════════════════════════════════════════════════════════ */
+
+ /* Only scan slots within the mapped 4KB page (8 slots of 0x200 bytes each) */
+// for (int slot = 24; slot < 32; slot++) {
+// /* Calculate offset for this slot */
+// uint32_t offset = slot * 0x200;
+// volatile uint32_t *slot_base = (volatile uint32_t *)((uintptr_t)virtio_mmio_regs + offset);
+//
+// /* Read device identification registers with memory barriers (like VREG_READ) */
+// DMB; /* Ensure all prior memory operations complete before reading */
+// /* Read device identification registers */
+// uint32_t slot_magic = slot_base[VIRTIO_MMIO_MAGIC_VALUE / 4];
+// uint32_t slot_version = slot_base[VIRTIO_MMIO_VERSION / 4];
+// uint32_t slot_device_id = slot_base[VIRTIO_MMIO_DEVICE_ID / 4];
+// DMB; /* Ensure reads complete before using values */
+// uint32_t slot_vendor_id = slot_base[VIRTIO_MMIO_VENDOR_ID / 4];
+//
+// /* Only print slots with valid VirtIO magic */
+// if (slot_magic == 0x74726976) {
+// DEBUG("Slot %2d @ 0x%08lx (offset +0x%03x): Magic=0x%08x Version=%u DeviceID=%u Vendor=0x%08x",
+// slot, 0x0a000000 + offset, offset,
+// slot_magic, slot_version, slot_device_id, slot_vendor_id);
+//
+// /* Identify device type */
+// if (slot_device_id == 1) {
+// DEBUG(" [NETWORK]\n");
+// } else if (slot_device_id == 0) {
+// DEBUG(" [NO DEVICE]\n");
+// } else {
+// DEBUG(" [UNKNOWN TYPE]\n");
+// }
+// }
+// }
+
+ /* CRITICAL: Check if CAmkES dataport is properly mapped */
+ if (virtio_mmio_regs == NULL) {
+ DEBUG_ERROR("%s: [ERR] FATAL: virtio_mmio_regs dataport is NULL!\n", COMPONENT_NAME);
+ return -1;
+ }
+
+ /* Access VirtIO device at SLOT 31 (offset 0xc00 from page base 0xa003000) */
+ /* QEMU assigns FIRST -device virtio-net-device to slot 30 - matches vm_ethernet_echo */
+ virtio_regs_base = (volatile uint32_t *)((uintptr_t)virtio_mmio_regs + 0xc00);
+
+ COMPONENT_NAME, (void *)virtio_regs_base);
+
+ /* Verify we have the network device using pointer arithmetic */
+ uint32_t magic = VREG_READ(VIRTIO_MMIO_MAGIC_VALUE);
+ uint32_t version = VREG_READ(VIRTIO_MMIO_VERSION);
+ uint32_t device_id = VREG_READ(VIRTIO_MMIO_DEVICE_ID);
+
+ COMPONENT_NAME, magic, version, device_id);
+
+ if (magic != 0x74726976) {
+ return -1;
+ }
+
+ /* CRITICAL CHECK: Enforce modern VirtIO protocol */
+ if (version != 2) {
+ DEBUG_ERROR("║ [ERR] FATAL ERROR: Legacy VirtIO Protocol Detected ║\n");
+ DEBUG_INFO(" [OK] Enables VirtIO 1.0+ modern protocol (Version 2)\n");
+ DEBUG_INFO(" [OK] Fixes MMIO write issues\n");
+ DEBUG_INFO(" [OK] Allocates devices to slots 6-7 (not 30-31)\n");
+ DEBUG_INFO(" [OK] Makes QueueReady registers writable\n");
+ return -1;
+ }
+
+ if (device_id != 1) {
+ return -1;
+ }
+
+ DEBUG_INFO("%s: [OK] Found VirtIO network device (modern protocol, Version 2)\n", COMPONENT_NAME);
+
+ /* Reset device */
+ VREG_WRITE(VIRTIO_MMIO_STATUS, 0);
+
+ /* Acknowledge device */
+ VREG_WRITE(VIRTIO_MMIO_STATUS, VIRTIO_STATUS_ACKNOWLEDGE);
+
+ /* ═══════════════════════════════════════════════════════════
+ * VirtIO Device Initialization Summary
+ * ═══════════════════════════════════════════════════════════ */
+
+ uint32_t device_features = VREG_READ(VIRTIO_MMIO_DEVICE_FEATURES);
+
+ device_features, (device_features & (1<<18)) ? "enabled" : "disabled");
+
+ /* Set driver bit */
+ VREG_WRITE(VIRTIO_MMIO_STATUS, VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER);
+
+ /* Negotiate features */
+ uint64_t features = VIRTIO_F_VERSION_1 | VIRTIO_NET_F_MAC | VIRTIO_NET_F_STATUS;
+ VREG_WRITE(VIRTIO_MMIO_DRIVER_FEATURES_SEL, 0);
+ VREG_WRITE(VIRTIO_MMIO_DRIVER_FEATURES, (uint32_t)features);
+ VREG_WRITE(VIRTIO_MMIO_DRIVER_FEATURES_SEL, 1);
+ VREG_WRITE(VIRTIO_MMIO_DRIVER_FEATURES, (uint32_t)(features >> 32));
+
+ VREG_WRITE(VIRTIO_MMIO_STATUS, VREG_READ(VIRTIO_MMIO_STATUS) | VIRTIO_STATUS_FEATURES_OK);
+
+ /* Read MAC address */
+ uint8_t *mac_base = (uint8_t*)(virtio_regs_base + (VIRTIO_MMIO_CONFIG/4) + (VIRTIO_NET_CFG_MAC/4));
+ for (int i = 0; i < 6; i++) {
+ mac_addr[i] = mac_base[i];
+ }
+
+ mac_addr[0], mac_addr[1], mac_addr[2],
+ mac_addr[3], mac_addr[4], mac_addr[5]);
+
+ /* Setup virtqueues using CAmkES DMA allocation (sDDF equivalent) */
+ /* Allocate 64KB DMA buffer for virtqueue rings, 4K-aligned, uncached for device DMA */
+ uint8_t *ring_base = camkes_dma_alloc(0x10000, 4096, false);
+ if (!ring_base) {
+ return -1;
+ }
+ memset(ring_base, 0, 0x10000);
+
+ /* Get physical address for VirtIO device DMA access (sDDF: device_resources.regions[1].io_addr) */
+ uintptr_t ring_base_paddr = camkes_dma_get_paddr(ring_base);
+
+ /* RX queue */
+ VREG_WRITE(VIRTIO_MMIO_QUEUE_SEL, VIRTIO_NET_RX_QUEUE);
+
+ /* Read and validate QueueNumMax from device register
+ * VirtIO spec: Max queue size is typically 1024 for network devices
+ uint32_t queue_num_max = VREG_READ(VIRTIO_MMIO_QUEUE_NUM_MAX);
+
+ /* CRITICAL FIX: Ring size MUST match buffer pool size to prevent accessing
+ * uninitialized descriptors. Previous bug: QEMU offered 256 descriptors but
+ * we only had 32 buffers, causing descriptor index wraparound to hit
+ * uninitialized memory after ~352 packets.
+ * This ensures QEMU never tries to use descriptors we haven't initialized.
+ rx_virtq.num = MAX_PACKETS;
+
+ COMPONENT_NAME, queue_num_max, rx_virtq.num);
+
+ if (queue_num_max < MAX_PACKETS) {
+ DEBUG_WARN("%s: [WARN] WARNING: Device only supports %u descriptors but we need %u\n",
+ COMPONENT_NAME, queue_num_max, MAX_PACKETS);
+ }
+
+ /* Virtual addresses for driver access */
+ rx_virtq.desc = (struct virtq_desc *)ring_base;
+ rx_virtq.avail = (struct virtq_avail *)(ring_base + 0x2000);
+ rx_virtq.used = (struct virtq_used *)(ring_base + 0x2408);
+
+ /* Physical addresses for device DMA access */
+ uintptr_t desc_paddr = ring_base_paddr;
+ uintptr_t avail_paddr = ring_base_paddr + 0x2000;
+ uintptr_t used_paddr = ring_base_paddr + 0x2408;
+
+ VREG_WRITE(VIRTIO_MMIO_QUEUE_NUM, rx_virtq.num);
+ VREG_WRITE(VIRTIO_MMIO_QUEUE_DESC_LOW, (uint32_t)desc_paddr);
+ VREG_WRITE(VIRTIO_MMIO_QUEUE_DESC_HIGH, (uint32_t)(desc_paddr >> 32));
+ VREG_WRITE(VIRTIO_MMIO_QUEUE_AVAIL_LOW, (uint32_t)avail_paddr);
+ VREG_WRITE(VIRTIO_MMIO_QUEUE_AVAIL_HIGH, (uint32_t)(avail_paddr >> 32));
+ VREG_WRITE(VIRTIO_MMIO_QUEUE_USED_LOW, (uint32_t)used_paddr);
+ VREG_WRITE(VIRTIO_MMIO_QUEUE_USED_HIGH, (uint32_t)(used_paddr >> 32));
+
+ VREG_WRITE(VIRTIO_MMIO_QUEUE_READY, 1);
+ DMB;
+
+ uint32_t rx_ready_after = VREG_READ(VIRTIO_MMIO_QUEUE_READY);
+ if (rx_ready_after == 0) {
+ DEBUG_ERROR(" [ERR] QEMU REJECTED RX queue - configuration invalid!\n");
+ } else {
+ DEBUG_INFO(" [OK] QEMU ACCEPTED RX queue\n");
+ }
+
+ /* TX queue */
+ VREG_WRITE(VIRTIO_MMIO_QUEUE_SEL, VIRTIO_NET_TX_QUEUE);
+
+ /* Read and validate QueueNumMax from device register */
+ queue_num_max = VREG_READ(VIRTIO_MMIO_QUEUE_NUM_MAX);
+
+ /* CRITICAL FIX: Same as RX - TX ring size must match buffer pool.
+ * TX uses MAX_PACKETS/2 buffers (16), so set ring size to match.
+ tx_virtq.num = MAX_PACKETS; /* Use same size as RX for consistency */
+
+ COMPONENT_NAME, queue_num_max, tx_virtq.num);
+
+ if (queue_num_max < MAX_PACKETS) {
+ DEBUG_WARN("%s: [WARN] WARNING: Device only supports %u TX descriptors but we need %u\n",
+ COMPONENT_NAME, queue_num_max, MAX_PACKETS);
+ }
+
+ /* Virtual addresses for driver access */
+ tx_virtq.desc = (struct virtq_desc *)(ring_base + 0x3410);
+ tx_virtq.avail = (struct virtq_avail *)(ring_base + 0x5410);
+ tx_virtq.used = (struct virtq_used *)(ring_base + 0x5818);
+
+ /* Physical addresses for device DMA access */
+ uintptr_t tx_desc_paddr = ring_base_paddr + 0x3410;
+ uintptr_t tx_avail_paddr = ring_base_paddr + 0x5410;
+ uintptr_t tx_used_paddr = ring_base_paddr + 0x5818;
+
+ VREG_WRITE(VIRTIO_MMIO_QUEUE_NUM, tx_virtq.num);
+ VREG_WRITE(VIRTIO_MMIO_QUEUE_DESC_LOW, (uint32_t)tx_desc_paddr);
+ VREG_WRITE(VIRTIO_MMIO_QUEUE_DESC_HIGH, (uint32_t)(tx_desc_paddr >> 32));
+ VREG_WRITE(VIRTIO_MMIO_QUEUE_AVAIL_LOW, (uint32_t)tx_avail_paddr);
+ VREG_WRITE(VIRTIO_MMIO_QUEUE_AVAIL_HIGH, (uint32_t)(tx_avail_paddr >> 32));
+ VREG_WRITE(VIRTIO_MMIO_QUEUE_USED_LOW, (uint32_t)tx_used_paddr);
+ VREG_WRITE(VIRTIO_MMIO_QUEUE_USED_HIGH, (uint32_t)(tx_used_paddr >> 32));
+
+ VREG_WRITE(VIRTIO_MMIO_QUEUE_READY, 1);
+ DMB;
+
+ uint32_t tx_ready_after = VREG_READ(VIRTIO_MMIO_QUEUE_READY);
+ if (tx_ready_after == 0) {
+ DEBUG_ERROR(" [ERR] QEMU REJECTED TX queue - configuration invalid!\n");
+ } else {
+ DEBUG_INFO(" [OK] QEMU ACCEPTED TX queue\n");
+ }
+
+ /* Device ready - activate the device */
+ VREG_WRITE(VIRTIO_MMIO_STATUS, VREG_READ(VIRTIO_MMIO_STATUS) | VIRTIO_STATUS_DRIVER_OK);
+ DEBUG_INFO("%s: [OK] VirtIO device initialized and activated\n", COMPONENT_NAME);
+ /* ═══ CRITICAL: Test if MMIO writes work ═══ */
+
+ /* Select queue 0 (RX queue) */
+ VREG_WRITE(VIRTIO_MMIO_QUEUE_SEL, 0);
+
+ /* Read current QueueReady state */
+ uint32_t original_ready = VREG_READ(VIRTIO_MMIO_QUEUE_READY);
+
+ /* Test write by toggling QueueReady */
+ VREG_WRITE(VIRTIO_MMIO_QUEUE_READY, 0x0);
+ uint32_t read_back_0 = VREG_READ(VIRTIO_MMIO_QUEUE_READY);
+
+ VREG_WRITE(VIRTIO_MMIO_QUEUE_READY, 0x1);
+ uint32_t read_back_1 = VREG_READ(VIRTIO_MMIO_QUEUE_READY);
+
+ /* Restore original state */
+ VREG_WRITE(VIRTIO_MMIO_QUEUE_READY, original_ready);
+
+ if (read_back_0 != 0x0 || read_back_1 != 0x1) {
+ DEBUG_ERROR("\n%s: [ERR][ERR][ERR] FATAL ERROR: MMIO WRITES DO NOT WORK! [ERR][ERR][ERR]\n", COMPONENT_NAME);
+ return -1;
+ }
+
+ DEBUG_INFO("%s: [OK] MMIO writes work correctly!\n\n", COMPONENT_NAME);
+
+ return 0;
+}
+
+/*
+ * Component initialization
+void post_init(void)
+{
+ DEBUG_ERROR("%s: Component started\n", COMPONENT_NAME);
+ DEBUG_ERROR("%s: NET1 (2025-11-02) - Remove PBUF tracking (no actual leak, pool stays at 0-1/800)\n", COMPONENT_NAME);
+ DEBUG_INFO("%s: [OK] FIX 1: payload_data buffer (prevents dataport corruption)\n", COMPONENT_NAME);
+ DEBUG_INFO("%s: [OK] FIX 2: tcp_abort removed from callbacks (crash at 0x38a9c fixed!)\n", COMPONENT_NAME);
+ DEBUG_INFO("%s: [OK] FIX 3: Connection reuse when SCADA keeps connection alive\n", COMPONENT_NAME);
+ DEBUG_INFO("%s: [OK] FIX 4: Close notification - Net0 tells Net1 when SCADA closes\n", COMPONENT_NAME);
+ DEBUG_INFO("%s: [OK] FIX 5: Stale connection cleanup on tcp_connect failure\n", COMPONENT_NAME);
+ DEBUG_INFO("%s: [OK] FIX 6: CLOSE_WAIT memory leak - always call tcp_close regardless of state\n", COMPONENT_NAME);
+ DEBUG_WARN("%s: [WARN] CRITICAL: Uses tcp_close for graceful shutdown (FIN handshake)\n\n", COMPONENT_NAME);
+
+ /* Initialize connection tracking table */
+ memset(connection_table, 0, sizeof(connection_table));
+ connection_count = 0;
+
+ DEBUG_INFO("%s: [OK] Connection tracking table initialized (%d slots, all states=FREE)\n",
+ COMPONENT_NAME, MAX_CONNECTIONS);
+
+ own_state = (volatile struct connection_state_table *)net1_conn_state;
+ peer_state = (volatile struct connection_state_table *)net0_conn_state;
+ if (own_state) {
+ memset((void *)own_state, 0, sizeof(struct connection_state_table));
+ DEBUG_INFO("%s: [OK] Own connection state dataport mapped (size=%zu bytes)\n",
+ COMPONENT_NAME, sizeof(struct connection_state_table));
+ }
+ if (peer_state) {
+ DEBUG_INFO("%s: [OK] Peer connection state dataport mapped (read-only access to Net0)\n", COMPONENT_NAME);
+ }
+
+ /* Initialize VirtIO device */
+ if (virtio_net_init != 0) {
+ return;
+ }
+
+ /* Allocate packet buffers from DMA memory */
+ COMPONENT_NAME, MAX_PACKETS, PACKET_BUFFER_SIZE);
+ for (int i = 0; i < MAX_PACKETS; i++) {
+ packet_buffers[i] = camkes_dma_alloc(PACKET_BUFFER_SIZE, 64, false);
+ if (!packet_buffers[i]) {
+ return;
+ }
+ packet_buffers_paddr[i] = camkes_dma_get_paddr(packet_buffers[i]);
+ }
+ DEBUG_INFO("%s: [OK] Allocated DMA packet buffers (vaddr=%p, paddr=0x%lx)\n",
+ COMPONENT_NAME, packet_buffers[0], packet_buffers_paddr[0]);
+
+ /* Allocate TX headers array */
+ size_t tx_headers_size = MAX_PACKETS * sizeof(virtio_net_hdr_t);
+ tx_headers = camkes_dma_alloc(tx_headers_size, 16, false);
+ if (!tx_headers) {
+ return;
+ }
+ tx_headers_paddr = camkes_dma_get_paddr(tx_headers);
+ memset(tx_headers, 0, tx_headers_size);
+ DEBUG_INFO("%s: [OK] Allocated TX headers array (vaddr=%p, paddr=0x%lx)\n",
+ COMPONENT_NAME, tx_headers, tx_headers_paddr);
+
+ /* Initialize packet buffers */
+ memset(rx_buffer_used, 0, sizeof(rx_buffer_used));
+ refill_rx_queue;
+
+ /* Initialize lwIP */
+ DEBUG_INFO("%s: Initializing lwIP TCP/IP stack...\n", COMPONENT_NAME);
+ lwip_init;
+
+ /* CRITICAL: Setup TCP server BEFORE netif_add so PCB stays bound to 0.0.0.0
+ * This is the key to accepting packets for ANY destination IP (both 10.2.0.2 and 192.168.95.2)
+ * If we do netif_add first, lwIP might bind the PCB to the interface IP
+ setup_tcp_echo_server;
+
+ /* Add network interface - BRIDGE ARCHITECTURE
+ * nic0 IS the external gateway (192.168.95.1) that pfSense routes through
+ * No gateway needed - we ARE the gateway!
+ * TCP server listens on 192.168.95.1:502
+ struct ip4_addr ipaddr, netmask, gw;
+ IP4_ADDR(&ipaddr, 192, 168, 95, 1); /* Static IP: 192.168.95.1 (internal gateway) */
+ IP4_ADDR(&netmask, 255, 255, 255, 0); /* Netmask: 255.255.255.0 */
+ IP4_ADDR(&gw, 0, 0, 0, 0); /* NO Gateway - this interface IS the gateway */
+
+ netif_add(&netif_data, &ipaddr, &netmask, &gw, NULL, custom_netif_init, custom_input_promiscuous);
+ netif_set_default(&netif_data);
+ netif_set_status_callback(&netif_data, netif_status_callback);
+ netif_set_up(&netif_data);
+
+ /* Static ARP entry NOT needed with bridge architecture!
+ * With bridges, all devices are on the same Layer 2 network
+ * ARP works naturally without any hacks
+ */
+
+ /* Verify interface configuration */
+ DEBUG_INFO("%s: [OK] NETWORK INTERFACE CONFIGURATION\n", COMPONENT_NAME);
+ ip4_addr1(netif_ip4_addr(&netif_data)),
+ ip4_addr2(netif_ip4_addr(&netif_data)),
+ ip4_addr3(netif_ip4_addr(&netif_data)),
+ ip4_addr4(netif_ip4_addr(&netif_data)));
+ ip4_addr1(netif_ip4_netmask(&netif_data)),
+ ip4_addr2(netif_ip4_netmask(&netif_data)),
+ ip4_addr3(netif_ip4_netmask(&netif_data)),
+ ip4_addr4(netif_ip4_netmask(&netif_data)));
+ ip4_addr1(netif_ip4_gw(&netif_data)),
+ ip4_addr2(netif_ip4_gw(&netif_data)),
+ ip4_addr3(netif_ip4_gw(&netif_data)),
+ ip4_addr4(netif_ip4_gw(&netif_data)));
+
+ /* Validation check */
+ uint8_t if_ip1 = ip4_addr1(netif_ip4_addr(&netif_data));
+ uint8_t if_ip2 = ip4_addr2(netif_ip4_addr(&netif_data));
+ uint8_t if_ip3 = ip4_addr3(netif_ip4_addr(&netif_data));
+ uint8_t if_ip4 = ip4_addr4(netif_ip4_addr(&netif_data));
+
+ if (if_ip1 == 192 && if_ip2 == 168 && if_ip3 == 96 && if_ip4 == 2) {
+ DEBUG_INFO("%s: [OK] CONFIGURATION VALID: Internal gateway IP = 192.168.95.1\n", COMPONENT_NAME);
+ DEBUG_INFO("%s: [OK] pfSense routes 192.168.95.0/24 traffic through this gateway\n", COMPONENT_NAME);
+ DEBUG_INFO("%s: [OK] Bridge br0 forwards all traffic to/from ens224\n", COMPONENT_NAME);
+ } else {
+ DEBUG_WARN("%s: [WARN] WARNING: Interface IP (%u.%u.%u.%u) does NOT match expected (192.168.95.1)\n",
+ COMPONENT_NAME, if_ip1, if_ip2, if_ip3, if_ip4);
+ DEBUG_WARN("%s: [WARN] pfSense routing will FAIL!\n", COMPONENT_NAME);
+ }
+
+ tcp_server_initialized = true;
+ DEBUG_INFO("%s: [OK] Initialization complete\n", COMPONENT_NAME);
+
+ /* Mark initialization as successful */
+ initialization_successful = true;
+
+}
+
+int run(void)
+{
+ /* Validate initialization completed successfully */
+ if (!initialization_successful) {
+ DEBUG_ERROR("║ [ERR] FATAL: VirtIO_Net1_Driver initialization FAILED ║\n");
+ while (1) {
+ seL4_Yield; /* Halt forever */
+ }
+ }
+
+ DEBUG_INFO("%s: [OK] Initialization validation passed - starting main loop\n", COMPONENT_NAME);
+
+ /* Main event loop - process lwIP timers, RX packets, and ICS notifications */
+ /* Note: TCP server is now initialized in RX path after first packet */
+ uint32_t loop_iterations = 0;
+ const uint32_t CLEANUP_INTERVAL = 10000; /* Run cleanup every ~10000 iterations (~30-60 seconds) */
+
+ static uint32_t heartbeat_counter = 0;
+ while (1) {
+ /* Process cleanup queue (symmetrical with Net0) */
+ process_cleanup_queue;
+
+ /* Check and cleanup connections with metadata_close_pending */
+ /* REMOVED in check_pending_cleanups - logic now in process_cleanup_queue */
+
+ if (++heartbeat_counter >= 50000) {
+ COMPONENT_NAME, heartbeat_counter, connection_count,
+ lwip_stats.memp[MEMP_PBUF_POOL]->used,
+ lwip_stats.memp[MEMP_PBUF_POOL]->avail);
+
+ if (connection_count >= 900) {
+ COMPONENT_NAME, connection_count);
+
+ /* Count PCBs in each lwIP list */
+ uint32_t active_count = 0;
+ uint32_t tw_count = 0;
+ uint32_t bound_count = 0;
+
+ /* Count active PCBs (ESTABLISHED, SYN_SENT, SYN_RCVD, etc.) */
+ struct tcp_pcb *pcb;
+ for (pcb = tcp_active_pcbs; pcb != NULL; pcb = pcb->next) {
+ active_count++;
+ }
+
+ /* Count TIME_WAIT PCBs */
+ for (pcb = tcp_tw_pcbs; pcb != NULL; pcb = pcb->next) {
+ tw_count++;
+ }
+
+ /* Count bound PCBs (LISTEN, CLOSED) */
+ for (pcb = tcp_bound_pcbs; pcb != NULL; pcb = pcb->next) {
+ bound_count++;
+ }
+
+ uint32_t total_lwip = active_count + tw_count + bound_count;
+
+ COMPONENT_NAME, active_count);
+ COMPONENT_NAME, tw_count);
+ COMPONENT_NAME, bound_count);
+ COMPONENT_NAME, total_lwip, MEMP_NUM_TCP_PCB);
+
+ /* Check for mismatch between our count and lwIP's count */
+ if (total_lwip != connection_count) {
+ COMPONENT_NAME, connection_count, total_lwip,
+ (int)connection_count - (int)total_lwip);
+ }
+
+ /* Detailed active PCB state inspection */
+ if (active_count > 0) {
+ uint32_t state_counts[11] = {0}; /* TCP states: 0-10 */
+ const char *state_names[] = {
+ "CLOSED", "LISTEN", "SYN_SENT", "SYN_RCVD", "ESTABLISHED",
+ "FIN_WAIT_1", "FIN_WAIT_2", "CLOSE_WAIT", "CLOSING",
+ "LAST_ACK", "TIME_WAIT"
+ };
+
+ for (pcb = tcp_active_pcbs; pcb != NULL; pcb = pcb->next) {
+ if (pcb->state < 11) {
+ state_counts[pcb->state]++;
+ }
+ }
+
+ for (int i = 0; i < 11; i++) {
+ if (state_counts[i] > 0) {
+ COMPONENT_NAME, state_names[i], state_counts[i]);
+ }
+ }
+
+ /* Flag suspicious states */
+ if (state_counts[7] > 5) { /* CLOSE_WAIT */
+ COMPONENT_NAME, state_counts[7]);
+ }
+ if (state_counts[5] > 10 || state_counts[6] > 10) { /* FIN_WAIT_1/2 */
+ COMPONENT_NAME, state_counts[5], state_counts[6]);
+ }
+ }
+
+ /* Check TIME_WAIT excessive accumulation */
+ if (tw_count > 30) {
+ COMPONENT_NAME, tw_count);
+ COMPONENT_NAME);
+ }
+
+ }
+
+ int shown = 0;
+ for (int i = 0; i < MAX_CONNECTIONS && shown < 10; i++) {
+ if (connection_table[i].active) {
+ COMPONENT_NAME, i,
+ (connection_table[i].original_src_ip >> 24) & 0xFF,
+ (connection_table[i].original_src_ip >> 16) & 0xFF,
+ (connection_table[i].original_src_ip >> 8) & 0xFF,
+ connection_table[i].original_src_ip & 0xFF,
+ connection_table[i].src_port,
+ (connection_table[i].original_dest_ip >> 24) & 0xFF,
+ (connection_table[i].original_dest_ip >> 16) & 0xFF,
+ (connection_table[i].original_dest_ip >> 8) & 0xFF,
+ connection_table[i].original_dest_ip & 0xFF,
+ connection_table[i].dest_port,
+ (void*)connection_table[i].pcb,
+ connection_table[i].lwip_ephemeral_port);
+ shown++;
+ }
+ }
+ if (shown == 0) {
+ } else if (connection_count > shown) {
+ }
+
+ heartbeat_counter = 0;
+ }
+
+ /* Check for INBOUND notifications from ICS_Inbound (non-blocking) */
+ if (inbound_ready_poll) {
+ inbound_ready_handle;
+ }
+
+ /* Process lwIP timers and RX packets */
+ sys_check_timeouts;
+
+ if (rx_packets_pending) {
+ rx_packets_pending = false;
+ process_rx_packets;
+ }
+
+ /* Refill RX buffers OUTSIDE IRQ context to avoid IRQ storm
+ * This happens in main loop after processing completes */
+ refill_rx_queue;
+
+ /* Periodic connection table cleanup to prevent exhaustion */
+ loop_iterations++;
+ if (loop_iterations >= CLEANUP_INTERVAL) {
+ connection_cleanup_stale;
+ loop_iterations = 0;
+ }
+
+ seL4_Yield;
+ }
+
+ return 0;
+}

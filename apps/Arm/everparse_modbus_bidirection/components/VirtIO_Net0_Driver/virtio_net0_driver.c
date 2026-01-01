@@ -3155,18 +3155,15 @@ static err_t tcp_echo_poll(void *arg, struct tcp_pcb *pcb)
         }
 
         meta->close_pending = false;
-        /* v2.251: Don't NULL pcb here - lwIP may still call tcp_echo_recv(p=NULL)
-         * when remote sends FIN. Keep pcb valid so lookup succeeds.
-         * The pcb will be set to NULL in tcp_echo_recv(p=NULL) after final cleanup. */
+        /* v2.252: Mark for deferred cleanup - don't enqueue yet!
+         * lwIP will call tcp_echo_recv(p=NULL) when FIN handshake completes.
+         * That callback will handle the actual cleanup.
+         * If we enqueue now, main loop sets active=false before recv callback. */
+        meta->metadata_close_pending = true;
+        meta->close_timestamp = sys_now();
 
-        /* Calculate total latency from close_pending to cleanup */
-        uint32_t pending_duration = sys_now() - meta->close_timestamp;
-
-        /* v2.193: Enqueue cleanup (main loop will process) */
-        enqueue_cleanup(meta->session_id);
-
-        DEBUG("%s:   [OK] Close initiated and cleanup enqueued (session %u, pending for %ums)\n",
-               COMPONENT_NAME, meta->session_id, pending_duration);
+        DEBUG("%s:   [OK] Close initiated, waiting for tcp_echo_recv(p=NULL) callback (session %u)\n",
+               COMPONENT_NAME, meta->session_id);
 
         /* Return ERR_OK - lwIP will complete close handshake */
         return ERR_OK;

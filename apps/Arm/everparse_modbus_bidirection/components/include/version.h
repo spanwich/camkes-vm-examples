@@ -19,16 +19,21 @@
  */
 
 #define ICS_VERSION_MAJOR   2
-#define ICS_VERSION_MINOR   251
-#define ICS_VERSION_STRING  "2.251"
+#define ICS_VERSION_MINOR   252
+#define ICS_VERSION_STRING  "2.252"
 #define ICS_VERSION_DATE    "2026-01-02"
 
 /*
+ * v2.252 Changes (2026-01-02):
+ * - Fix Flaw 3 (complete): Don't enqueue cleanup from tcp_echo_poll()
+ *   Let tcp_echo_recv(p=NULL) handle cleanup when FIN handshake completes
+ *   (Actually fixes "Connection closed but no metadata found" errors)
+ *
  * v2.251 Changes (2026-01-02):
  * - Fix Flaw 1: Add missing session_id in Net1 response path
  *   (Net0 can now correlate responses with sessions)
- * - Fix Flaw 3: Don't set meta->pcb=NULL in tcp_echo_poll() until callbacks complete
- *   (Fixes "Connection closed but no metadata found" errors)
+ * - Fix Flaw 3 (partial): Don't set meta->pcb=NULL in tcp_echo_poll()
+ *   (Was incomplete - cleanup queue still ran before recv callback)
  *
  * v2.250 Changes (2026-01-02):
  * - EverParse v3 parser with trailing byte attack detection

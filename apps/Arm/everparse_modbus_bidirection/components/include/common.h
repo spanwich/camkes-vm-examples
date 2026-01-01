@@ -215,17 +215,24 @@ static inline bool basic_bounds_check(const ICS_Message* msg, size_t available_b
 }
 
 /*
- * EverParse validation function - Formally Verified Modbus TCP Parser
+ * EverParse validation function - Formally Verified Modbus TCP Parser (v3)
  *
  * Integrates EverParse-generated parser with mathematical guarantees:
  * - Memory Safety: No buffer overflows possible
  * - Arithmetic Safety: No integer overflow/underflow
  * - Functional Correctness: Accepts exactly valid Modbus TCP messages
  * - Cross-field Validation: ByteCount vs Quantity enforced
+ * - Trailing Byte Detection: Rejects packets with extra bytes (v3 security fix)
  *
- * For implementation details, see ModbusTCP_SimpleWrapper.h
+ * v3 CRITICAL SECURITY FIX:
+ * The parser now validates that InputLength == (MBAP.Length + 6), preventing:
+ * - CVE-2019-14462 pattern (Length under-declaration → buffer overflow)
+ * - Trailing garbage injection attacks
+ * - Buffer content smuggling
+ *
+ * For implementation details, see ModbusTCP_v3_SimpleWrapper.h
  */
-#include "ModbusTCP_SimpleWrapper.h"
+#include "ModbusTCP_v3_SimpleWrapper.h"
 
 static inline bool everparse_validate(const uint8_t* payload, size_t length) {
     /* Guard against size_t to uint32_t conversion overflow */
@@ -234,11 +241,18 @@ static inline bool everparse_validate(const uint8_t* payload, size_t length) {
     }
 
     /*
-     * Use generic Modbus TCP frame validator
+     * Use v3 Modbus TCP frame validator with trailing byte detection
      * Validates: MBAP header, Protocol ID (0x0000), Length field (2-254),
-     *           Function Code (1-127), and overall frame structure
+     *           Function Code (1-127), overall frame structure,
+     *           AND InputLength == (MBAP.Length + 6) to detect trailing garbage
+     *
+     * Parameters:
+     *   - InputLength: Actual TCP payload size (passed to detect trailing bytes)
+     *   - base: Pointer to payload buffer
+     *   - len: Buffer length (same as InputLength for validation)
      */
-    return ModbusTcpSimpleCheckModbusTcpFrame((uint8_t*)payload, (uint32_t)length);
+    uint32_t input_length = (uint32_t)length;
+    return ModbusTcpV3SimpleCheckModbusTcpFrameV3(input_length, (uint8_t*)payload, input_length);
 }
 
 /*

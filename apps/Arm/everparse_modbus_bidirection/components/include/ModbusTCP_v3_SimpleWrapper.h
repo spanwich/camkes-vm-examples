@@ -19,15 +19,17 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-BOOLEAN ModbusTcpSimpleCheckModbusTcpFrame(uint8_t *base, uint32_t len);
+BOOLEAN ModbusTcpV3SimpleCheckModbusTcpFrameV3(uint32_t ___InputLength, uint8_t *base, uint32_t len);
 
-BOOLEAN ModbusTcpSimpleCheckModbusReadRequest(uint8_t *base, uint32_t len);
+BOOLEAN ModbusTcpV3SimpleCheckModbusReadRequestV3(uint32_t ___InputLength, uint8_t *base, uint32_t len);
 
-BOOLEAN ModbusTcpSimpleCheckModbusWriteSingleRequest(uint8_t *base, uint32_t len);
+BOOLEAN ModbusTcpV3SimpleCheckModbusWriteSingleRequestV3(uint32_t ___InputLength, uint8_t *base, uint32_t len);
 
-BOOLEAN ModbusTcpSimpleCheckModbusWriteMultipleRequest(uint8_t *base, uint32_t len);
+BOOLEAN ModbusTcpV3SimpleCheckModbusWriteMultipleRequestV3(uint32_t ___InputLength, uint8_t *base, uint32_t len);
 
-BOOLEAN ModbusTcpSimpleCheckModbusReadResponse(uint8_t *base, uint32_t len);
+BOOLEAN ModbusTcpV3SimpleCheckModbusReadResponseV3(uint32_t ___InputLength, uint8_t *base, uint32_t len);
+
+BOOLEAN ModbusTcpV3SimpleCheckModbusTcpFrameUnsafe(uint8_t *base, uint32_t len);
 #ifdef __cplusplus
 }
 #endif

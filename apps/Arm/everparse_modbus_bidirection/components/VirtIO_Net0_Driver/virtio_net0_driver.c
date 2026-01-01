@@ -2446,16 +2446,11 @@ static void process_rx_packets(void)
         /* Allocate pbuf and copy packet data (skipping header) */
         struct pbuf *p = pbuf_alloc(PBUF_RAW, packet_len, PBUF_POOL);
         if (p != NULL) {
-            /* v2.215: Track PBUF_POOL allocation with interface identification */
+            /* v2.215: Track PBUF_POOL allocation with interface identification
+             * v2.257: Changed to DEBUG level (too verbose at INFO) */
             pbuf_allocated_count++;  /* v2.203: Track allocation */
-            extern struct stats_ lwip_stats;
-            uint32_t pbuf_before_take = lwip_stats.memp[MEMP_PBUF_POOL]->used;
 
             pbuf_take(p, packet_data, packet_len);
-
-            uint32_t pbuf_after_take = lwip_stats.memp[MEMP_PBUF_POOL]->used;
-            DEBUG_INFO("[Net0][PBUF_POOL][RX-ALLOC] pbuf=%p, len=%u | PBUF: %u/800 (after take: %u/800)\n",
-                       (void*)p, packet_len, pbuf_before_take, pbuf_after_take);
 
             #if DEBUG_ENABLED_DEBUG
             DEBUG("   [OK] pbuf allocated, passing to lwIP input handler\n");
@@ -2470,13 +2465,12 @@ static void process_rx_packets(void)
             /* v2.137: Track after lwIP input call */
             BREADCRUMB(8009);  /* After lwIP input() */
 
-            /* v2.215: Track lwIP input acceptance/rejection */
-            uint32_t pbuf_after_input = lwip_stats.memp[MEMP_PBUF_POOL]->used;
-            if (lwip_result == ERR_OK) {
-                DEBUG_INFO("[Net0][PBUF_POOL][RX-ACCEPT] lwIP accepted pbuf=%p | PBUF: %u/800\n",
-                           (void*)p, pbuf_after_input);
-            } else {
-                DEBUG_WARN("[Net0][PBUF_POOL][RX-REJECT] lwIP rejected (err=%d), must free pbuf=%p | PBUF: %u/800\n",
+            /* v2.215: Track lwIP input acceptance/rejection
+             * v2.257: RX-ACCEPT at DEBUG level (too verbose), RX-REJECT stays at WARN */
+            if (lwip_result != ERR_OK) {
+                extern struct stats_ lwip_stats;
+                uint32_t pbuf_after_input = lwip_stats.memp[MEMP_PBUF_POOL]->used;
+                DEBUG_WARN("[Net0][PBUF_POOL][RX-REJECT] lwIP rejected (err=%d), pbuf=%p | PBUF: %u/800\n",
                            lwip_result, (void*)p, pbuf_after_input);
             }
 
@@ -2502,14 +2496,14 @@ static void process_rx_packets(void)
                             uint32_t daddr = ntohl(ip->daddr);
 
                             if (tcp->syn && !tcp->ack) {
-                                /* This is a SYN packet (connection attempt) */
-                                #if DEBUG_ENABLED_DEBUG
-                                DEBUG("%s: [FIND] SYN packet detected: Dest IP = %u.%u.%u.%u:%u (Interface IP = 192.168.95.2)\n",
+                                /* v2.257: ALWAYS log SYN packets at INFO level to diagnose connection issues */
+                                uint32_t saddr = ntohl(ip->saddr);
+                                DEBUG_INFO("%s: [SYN] TCP SYN from %u.%u.%u.%u:%u → %u.%u.%u.%u:%u\n",
                                        COMPONENT_NAME,
+                                       (saddr >> 24) & 0xFF, (saddr >> 16) & 0xFF, (saddr >> 8) & 0xFF, saddr & 0xFF,
+                                       ntohs(tcp->source),
                                        (daddr >> 24) & 0xFF, (daddr >> 16) & 0xFF, (daddr >> 8) & 0xFF, daddr & 0xFF,
                                        ntohs(tcp->dest));
-                                DEBUG("%s:    → If dest IP matches interface IP, lwIP should accept. Otherwise it rejects.\n", COMPONENT_NAME);
-                                #endif
                             }
                         }
                     }
@@ -3242,17 +3236,17 @@ static err_t tcp_echo_accept(void *arg, struct tcp_pcb *newpcb, err_t err)
     active_connections++;
     total_connections_created++;
 
-    #if DEBUG_TRAFFIC
-    DEBUG_INFO("%s: [OK] TCP connection ACCEPTED from %u.%u.%u.%u:%u\n",
+    /* v2.257: ALWAYS log TCP accept at INFO level - crucial for debugging */
+    DEBUG_INFO("%s: [ACCEPT] TCP from %u.%u.%u.%u:%u → port %u (active=%u)\n",
            COMPONENT_NAME,
            ip4_addr1(&newpcb->remote_ip), ip4_addr2(&newpcb->remote_ip),
-           ip4_addr3(&newpcb->remote_ip), ip4_addr4(&newpcb->remote_ip), newpcb->remote_port);
-    DEBUG("%s:    → Local port: %u\n", COMPONENT_NAME, newpcb->local_port);
-    DEBUG("%s:    → PCB address: %p\n", COMPONENT_NAME, newpcb);
-    DEBUG("%s:    → PCB state: %d\n", COMPONENT_NAME, newpcb->state);
-    DEBUG("%s:    → Active connections: %u | Total created: %u | Total closed: %u\n",
-           COMPONENT_NAME, active_connections, total_connections_created, total_connections_closed);
-    DEBUG("%s: ========================================\n\n", COMPONENT_NAME);
+           ip4_addr3(&newpcb->remote_ip), ip4_addr4(&newpcb->remote_ip),
+           newpcb->remote_port, newpcb->local_port, active_connections);
+
+    #if DEBUG_TRAFFIC
+    DEBUG("%s:    → PCB address: %p, state: %d\n", COMPONENT_NAME, newpcb, newpcb->state);
+    DEBUG("%s:    → Total created: %u | Total closed: %u\n",
+           COMPONENT_NAME, total_connections_created, total_connections_closed);
     #endif
 
     tcp_setprio(newpcb, TCP_PRIO_MIN);
@@ -3871,31 +3865,25 @@ void outbound_ready_handle(void)
     DEBUG_INFO("[N0-TX] session=%u, %u bytes → SCADA\n",
                meta->session_id, ics_msg->payload_length);
 
-    /* Check if SCADA sent FIN BEFORE clearing the flag */
-    bool scada_closed = meta->awaiting_response;
-
     /* Clear awaiting_response flag (response delivered) */
     meta->awaiting_response = false;
 
-    /* Only close if SCADA actually sent FIN */
-    if (scada_closed) {
-        /* SCADA closed first (half-close) - close both sides after response sent */
+    /* v2.258: FIX - Check metadata_close_pending (set when SCADA FIN received)
+     * NOT awaiting_response (which just means "waiting for PLC response")
+     * Bug: awaiting_response is always true after sending request, so connection
+     * was incorrectly closing after every response! */
+    if (meta->metadata_close_pending) {
+        /* SCADA sent FIN (half-close) - close both sides after response sent */
         meta->close_pending = true;
-        meta->close_timestamp = sys_now();  /* v2.181: Record timestamp for latency measurement */
         BREADCRUMB(3012);  /* Response sent, close pending */
 
-        #if DEBUG_TRAFFIC
-        DEBUG("%s: Response sent to half-closed connection - will close both sides (session %u)\n",
-               COMPONENT_NAME, meta->session_id);
-        #endif
+        DEBUG_INFO("[N0-TX] session=%u response sent to half-closed connection - closing\n",
+               meta->session_id);
     } else {
         /* SCADA still open - keep connection alive for reuse */
         BREADCRUMB(3014);  /* Response sent, connection stays open for reuse */
 
-        #if DEBUG_TRAFFIC
-        DEBUG("%s: Response sent - connection stays open for reuse (session %u)\n",
-               COMPONENT_NAME, meta->session_id);
-        #endif
+        DEBUG("[N0-TX] session=%u connection stays open for reuse\n", meta->session_id);
     }
 
     BREADCRUMB(3013);  /* Exit: outbound_ready_handle complete */

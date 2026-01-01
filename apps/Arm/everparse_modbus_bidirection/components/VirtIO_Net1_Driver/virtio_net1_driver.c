@@ -112,7 +112,9 @@ struct connection_metadata {
 
 static struct connection_metadata connection_table[MAX_CONNECTIONS];
 static int connection_count = 0;
-static uint32_t active_connections = 0;  
+static uint32_t active_connections = 0;
+static uint32_t total_connections_created = 0;  /* v2.256: Moved up for cleanup queue access */
+static uint32_t total_connections_closed = 0;   /* v2.256: Moved up for cleanup queue access */
 uint32_t sys_now(void);
 
 #define MAX_ICMP_METADATA 16  /* Track up to 16 concurrent pings */
@@ -1327,12 +1329,18 @@ static void process_cleanup_queue(void)
                        COMPONENT_NAME, req->session_id);
             }
 
-            if (active_connections > 0) {
-                active_connections--;
-            } else {
-                DEBUG_WARN("%s: [WARN] active_connections already 0 (prevented underflow for session %u)!\n",
-                       COMPONENT_NAME, req->session_id);
-            }
+            /* v2.256: REMOVED active_connections-- from cleanup queue
+             * ═══════════════════════════════════════════════════════════════
+             * Root cause of underflow: active_connections is only incremented
+             * in tcp_echo_accept() for INBOUND TCP connections (SCADA→Net1 server).
+             * But cleanup queue processes SESSION cleanup (Net0 session IDs),
+             * which are for OUTBOUND connections (Net1→PLC). These are NOT 1:1.
+             *
+             * active_connections should only be decremented when the corresponding
+             * tcp_echo_accept() connection closes (via tcp_err callback), NOT here.
+             * ═══════════════════════════════════════════════════════════════
+             */
+            total_connections_closed++;
 
             meta->active = false;
             meta->pcb = NULL;
@@ -1956,27 +1964,20 @@ static void process_rx_packets(void)
          * This deferred initialization code is no longer needed.
          */
 
-        /* Allocate pbuf and copy packet data (skipping header) */
+        /* Allocate pbuf and copy packet data (skipping header)
+         * v2.257: Removed verbose PBUF_POOL logs (RX-ALLOC, RX-ACCEPT) */
         struct pbuf *p = pbuf_alloc(PBUF_RAW, packet_len, PBUF_POOL);
         if (p != NULL) {
-            extern struct stats_ lwip_stats;
-            uint32_t pbuf_before_take = lwip_stats.memp[MEMP_PBUF_POOL]->used;
-
             pbuf_take(p, packet_data, packet_len);
-
-            uint32_t pbuf_after_take = lwip_stats.memp[MEMP_PBUF_POOL]->used;
-            DEBUG_INFO("[Net1][PBUF_POOL][RX-ALLOC] pbuf=%p, len=%u | PBUF: %u/800 (after take: %u/800)\n",
-                       (void*)p, packet_len, pbuf_before_take, pbuf_after_take);
 
             /* Feed packet to lwIP */
             err_t lwip_result = netif_data.input(p, &netif_data);
 
-            uint32_t pbuf_after_input = lwip_stats.memp[MEMP_PBUF_POOL]->used;
-            if (lwip_result == ERR_OK) {
-                DEBUG_INFO("[Net1][PBUF_POOL][RX-ACCEPT] lwIP accepted pbuf=%p | PBUF: %u/800\n",
-                           (void*)p, pbuf_after_input);
-            } else {
-                DEBUG_WARN("[Net1][PBUF_POOL][RX-REJECT] lwIP rejected (err=%d), must free pbuf=%p | PBUF: %u/800\n",
+            /* v2.257: Only log rejections (important), not acceptances (too verbose) */
+            if (lwip_result != ERR_OK) {
+                extern struct stats_ lwip_stats;
+                uint32_t pbuf_after_input = lwip_stats.memp[MEMP_PBUF_POOL]->used;
+                DEBUG_WARN("[Net1][PBUF_POOL][RX-REJECT] lwIP rejected (err=%d), pbuf=%p | PBUF: %u/800\n",
                            lwip_result, (void*)p, pbuf_after_input);
             }
 
@@ -2037,11 +2038,9 @@ static void process_rx_packets(void)
 }
 
 /*
- * Connection tracking
+ * Connection tracking counters moved to line ~115 (before cleanup queue functions)
+ * v2.256: total_connections_created and total_connections_closed declared earlier
  */
-/* active_connections moved to line 184 (before cleanup functions) */
-static uint32_t total_connections_created = 0;
-static uint32_t total_connections_closed = 0;
 
 /*
  * TCP Error callback - handles connection errors and cleanup
@@ -3146,18 +3145,91 @@ void inbound_ready_handle(void)
 
         struct tcp_pcb *existing_pcb = existing_meta->pcb;
 
-        DEBUG("%s: [FIND] Found existing connection for SCADA %u.%u.%u.%u:%u (PCB=%p)\n",
+        DEBUG("%s: [FIND] Found existing connection for SCADA %u.%u.%u.%u:%u (PCB=%p, state=%d)\n",
                COMPONENT_NAME,
                (ics_msg->metadata.src_ip >> 24) & 0xFF,
                (ics_msg->metadata.src_ip >> 16) & 0xFF,
                (ics_msg->metadata.src_ip >> 8) & 0xFF,
                ics_msg->metadata.src_ip & 0xFF,
                ics_msg->metadata.src_port,
-               (void*)existing_pcb);
+               (void*)existing_pcb, existing_pcb->state);
 
-        DEBUG("%s:   → Found existing metadata - cleaning up old connection\n", COMPONENT_NAME);
-        DEBUG("%s:   → Creating new connection for this request (safer than reuse)\n", COMPONENT_NAME);
-        goto cleanup_and_create_new;
+        /* v2.260: CONNECTION REUSE - Check if connection is in ESTABLISHED state
+         *
+         * Root cause of connection churn:
+         *   ModScan opens ONE connection, sends multiple Modbus requests on it.
+         *   Old code: Created NEW backend connection for EVERY request, sending RST to abort previous.
+         *   This overwhelmed the PLC's single-threaded accept loop.
+         *
+         * Fix: Reuse ESTABLISHED connections by sending data on existing PCB.
+         *   - If PCB state is ESTABLISHED (4), send request on existing connection
+         *   - If PCB state is anything else (connecting, closing, etc.), cleanup and create new
+         */
+        if (existing_pcb->state == ESTABLISHED) {
+            BREADCRUMB(2106);  /* Reusing ESTABLISHED connection */
+
+            DEBUG_INFO("[N1-REUSE] session=%u → Reusing ESTABLISHED connection to PLC (PCB=%p)\n",
+                   ics_msg->metadata.session_id, (void*)existing_pcb);
+
+            /* Get the existing pool state and update with new payload */
+            struct tcp_inbound_client_state *state = existing_meta->pool_state;
+
+            if (state == NULL) {
+                /* Pool state was freed but connection still up - allocate new state */
+                DEBUG_WARN("%s: [WARN]  Reuse: pool_state is NULL, allocating new state\n", COMPONENT_NAME);
+                state = inbound_alloc_state();
+                if (state == NULL) {
+                    DEBUG_ERROR("%s: [ERR] Failed to allocate state for connection reuse\n", COMPONENT_NAME);
+                    goto cleanup_and_create_new;
+                }
+                existing_meta->pool_state = state;
+                state->pcb = existing_pcb;
+                tcp_arg(existing_pcb, state);
+            }
+
+            /* Validate payload size */
+            if (ics_msg->payload_length > MAX_PAYLOAD_SIZE) {
+                DEBUG_WARN("%s: [WARN]  Reuse: Payload too large (%u > %u)\n",
+                       COMPONENT_NAME, ics_msg->payload_length, MAX_PAYLOAD_SIZE);
+                /* Don't abort connection - just drop this request */
+                return;
+            }
+
+            /* Copy new payload to state */
+            memcpy(state->payload_data, ics_msg->payload, ics_msg->payload_length);
+            state->payload_len = ics_msg->payload_length;
+            state->bytes_sent = 0;
+
+            /* Update session_id if needed (same SCADA connection, same session) */
+            existing_meta->session_id = ics_msg->metadata.session_id;
+            existing_meta->last_activity = sys_now();
+
+            /* Send the payload on existing connection */
+            uint16_t to_send = (state->payload_len > tcp_sndbuf(existing_pcb))
+                               ? tcp_sndbuf(existing_pcb) : state->payload_len;
+
+            if (to_send > 0) {
+                err_t write_err = tcp_write(existing_pcb, state->payload_data, to_send, TCP_WRITE_FLAG_COPY);
+                if (write_err == ERR_OK) {
+                    state->bytes_sent = to_send;
+                    tcp_output(existing_pcb);
+                    DEBUG_INFO("[N1-REUSE] Sent %u/%u bytes on existing connection\n",
+                           to_send, state->payload_len);
+                    return;  /* Done - request sent on reused connection */
+                } else {
+                    DEBUG_WARN("%s: [WARN]  tcp_write failed on reuse (err=%d), falling back to new connection\n",
+                           COMPONENT_NAME, write_err);
+                    /* Fall through to cleanup_and_create_new */
+                }
+            } else {
+                DEBUG_WARN("%s: [WARN]  Send buffer full on reuse, falling back to new connection\n",
+                       COMPONENT_NAME);
+                /* Fall through to cleanup_and_create_new */
+            }
+        } else {
+            DEBUG("%s:   → Connection not ESTABLISHED (state=%d), creating new\n",
+                   COMPONENT_NAME, existing_pcb->state);
+        }
 
 cleanup_and_create_new:
         /* ─────────────────────────────────────────────────────────────────────
@@ -3516,15 +3588,14 @@ cleanup_and_create_new:
     /* Use original destination port from metadata */
     uint16_t dest_port = ics_msg->metadata.dst_port;
 
-    #if DEBUG_TRAFFIC
-    DEBUG("%s: INBOUND: Binding to IP_ADDR_ANY and connecting to %u.%u.%u.%u:%u\n",
-           COMPONENT_NAME,
+    /* v2.259: Always log PLC connection attempt at INFO level for debugging */
+    DEBUG_INFO("[N1-CONNECT] session=%u → PLC %u.%u.%u.%u:%u\n",
+           ics_msg->metadata.session_id,
            (ics_msg->metadata.dst_ip >> 24) & 0xFF,
            (ics_msg->metadata.dst_ip >> 16) & 0xFF,
            (ics_msg->metadata.dst_ip >> 8) & 0xFF,
            ics_msg->metadata.dst_ip & 0xFF,
            dest_port);
-    #endif
 
     BREADCRUMB(2016);  /* Attempting tcp_connect */
 

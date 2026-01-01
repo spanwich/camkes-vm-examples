@@ -19,11 +19,45 @@
  */
 
 #define ICS_VERSION_MAJOR   2
-#define ICS_VERSION_MINOR   255
-#define ICS_VERSION_STRING  "2.255"
+#define ICS_VERSION_MINOR   260
+#define ICS_VERSION_STRING  "2.260"
 #define ICS_VERSION_DATE    "2026-01-02"
 
 /*
+ * v2.260 Changes (2026-01-02):
+ * - FIX: Backend connection reuse - stop creating new PLC connection per request
+ *   Root cause: Net1 created NEW backend TCP connection for EVERY Modbus request,
+ *   even when SCADA sent multiple requests on ONE persistent connection.
+ *   Old behavior: Request 1 → tcp_connect → Request 2 → tcp_abort + tcp_connect → ...
+ *   This RST flood overwhelmed PLC's single-threaded accept loop.
+ *   Fix: Check if existing connection is in ESTABLISHED state, if so reuse it
+ *   by sending new request on existing PCB instead of creating new connection.
+ *   New log: [N1-REUSE] shows when connection is being reused.
+ *
+ * v2.259 Changes (2026-01-02):
+ * - Add [N1-CONNECT] log to show PLC IP:port being connected to
+ *   Diagnose: ERR_ABRT on every request - is PLC reachable?
+ *
+ * v2.258 Changes (2026-01-02):
+ * - FIX: Connection closing after every response (ModScan socket error)
+ *   Root cause: Used awaiting_response to check if SCADA closed, but
+ *   awaiting_response means "waiting for PLC response" (always true after request)
+ *   Fix: Check metadata_close_pending instead (set when SCADA FIN received)
+ *
+ * v2.257 Changes (2026-01-02):
+ * - Diagnose ModScan socket error: no inbound connection logs appearing
+ * - Add unconditional [SYN] log at INFO level when TCP SYN received
+ * - Add unconditional [ACCEPT] log at INFO level when tcp_echo_accept succeeds
+ * - Remove verbose PBUF_POOL RX-ALLOC and RX-ACCEPT logs (changed to DEBUG)
+ * - Keep PBUF_POOL RX-REJECT at WARN level (important for debugging)
+ *
+ * v2.256 Changes (2026-01-02):
+ * - FIX: Remove active_connections decrement from Net1 cleanup queue
+ *   Root cause: active_connections tracks INBOUND TCP server connections
+ *   (incremented in tcp_echo_accept), but cleanup queue processes SESSION
+ *   cleanup for OUTBOUND connections (Net1→PLC). These are NOT 1:1.
+ *   Fix: Only decrement total_connections_closed in cleanup queue.
+ *
  * v2.255 Changes (2026-01-02):
  * - Reduce debug level to INFO (sentinel fix verified working)
  * - Remaining issue: Net1 active_connections counter underflow

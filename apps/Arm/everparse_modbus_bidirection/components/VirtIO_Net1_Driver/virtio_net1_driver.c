@@ -25,7 +25,7 @@
  */
 
 /* v2.207: New industry-standard 5-level debug system */
-#define DEBUG_LEVEL DEBUG_LEVEL_DEBUG  /* v2.253: Verbose for debugging sentinel issue */
+#define DEBUG_LEVEL DEBUG_LEVEL_INFO  /* v2.255: Reduced - sentinel fix verified */
 #include "debug_levels.h"
 
 #include <camkes.h>

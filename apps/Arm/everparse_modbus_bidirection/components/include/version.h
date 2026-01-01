@@ -19,11 +19,15 @@
  */
 
 #define ICS_VERSION_MAJOR   2
-#define ICS_VERSION_MINOR   254
-#define ICS_VERSION_STRING  "2.254"
+#define ICS_VERSION_MINOR   255
+#define ICS_VERSION_STRING  "2.255"
 #define ICS_VERSION_DATE    "2026-01-02"
 
 /*
+ * v2.255 Changes (2026-01-02):
+ * - Reduce debug level to INFO (sentinel fix verified working)
+ * - Remaining issue: Net1 active_connections counter underflow
+ *
  * v2.254 Changes (2026-01-02):
  * - FIX: Set metadata.payload_length=0 when sending sentinel messages
  *   Net0: 4 locations, Net1: 2 locations

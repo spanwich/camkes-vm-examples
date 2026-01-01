@@ -2717,6 +2717,7 @@ static void tcp_echo_err(void *arg, err_t err)
             meta->close_notified = true;  /* Set dedup flag */
 
             dp->request_msg.payload_length = 0;  /* Sentinel: close-only, no payload */
+            dp->request_msg.metadata.payload_length = 0;  /* v2.254: Must match payload_length! */
             dp->request_msg.metadata.session_id = meta->session_id;
             __sync_synchronize();  /* Memory barrier - ensure sentinel visible before signal */
 
@@ -2817,6 +2818,7 @@ static err_t tcp_echo_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t
 
                 /* v2.188-sentinel: Mark as close-only notification */
                 dp->request_msg.payload_length = 0;
+                dp->request_msg.metadata.payload_length = 0;  /* v2.254: Must match payload_length! */
                 dp->request_msg.metadata.session_id = meta->session_id;
                 __sync_synchronize();
 
@@ -3117,6 +3119,7 @@ static err_t tcp_echo_poll(void *arg, struct tcp_pcb *pcb)
             in_dp->close_queue.head = head + 1;
 
             in_dp->request_msg.payload_length = 0;  /* Sentinel: close-only, no payload */
+            in_dp->request_msg.metadata.payload_length = 0;  /* v2.254: Must match payload_length! */
             in_dp->request_msg.metadata.session_id = meta->session_id;
             __sync_synchronize();  /* Memory barrier - ensure sentinel visible before signal */
 
@@ -3656,6 +3659,7 @@ void outbound_ready_handle(void)
                     scada_meta->close_notified = true;  /* Set dedup flag */
 
                     dp->request_msg.payload_length = 0;  /* Sentinel: close-only, no payload */
+                    dp->request_msg.metadata.payload_length = 0;  /* v2.254: Must match payload_length! */
                     dp->request_msg.metadata.session_id = scada_meta->session_id;
                     __sync_synchronize();  /* Memory barrier - ensure sentinel visible before signal */
 

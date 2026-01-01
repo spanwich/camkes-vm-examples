@@ -19,11 +19,17 @@
  */
 
 #define ICS_VERSION_MAJOR   2
-#define ICS_VERSION_MINOR   253
-#define ICS_VERSION_STRING  "2.253"
+#define ICS_VERSION_MINOR   254
+#define ICS_VERSION_STRING  "2.254"
 #define ICS_VERSION_DATE    "2026-01-02"
 
 /*
+ * v2.254 Changes (2026-01-02):
+ * - FIX: Set metadata.payload_length=0 when sending sentinel messages
+ *   Net0: 4 locations, Net1: 2 locations
+ *   Root cause: msg.payload_length=0 but metadata.payload_length had stale value
+ *   This caused "Payload length mismatch" false positives in ICS validation
+ *
  * v2.253 Changes (2026-01-02):
  * - Enable DEBUG_LEVEL_DEBUG for all components to trace sentinel issue
  * - Net0, Net1, ICS_Inbound all set to verbose output

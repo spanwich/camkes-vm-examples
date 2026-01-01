@@ -2679,6 +2679,7 @@ static void inbound_tcp_err_callback(void *arg, err_t err)
                     meta->error_notified = true;  /* Set dedup flag */
 
                     dp->response_msg.payload_length = 0;  /* Sentinel: error-only, no payload */
+                    dp->response_msg.metadata.payload_length = 0;  /* v2.254: Must match payload_length! */
                     dp->response_msg.metadata.session_id = meta->session_id;
                     __sync_synchronize();  /* Memory barrier - ensure sentinel visible before signal */
 
@@ -2781,6 +2782,7 @@ static err_t inbound_tcp_connected_callback(void *arg, struct tcp_pcb *pcb, err_
                 meta->error_notified = true;
 
                 dp->response_msg.payload_length = 0;  /* Sentinel: error-only, no payload */
+                dp->response_msg.metadata.payload_length = 0;  /* v2.254: Must match payload_length! */
                 dp->response_msg.metadata.session_id = meta->session_id;
                 __sync_synchronize();  /* Memory barrier - ensure sentinel visible before signal */
 

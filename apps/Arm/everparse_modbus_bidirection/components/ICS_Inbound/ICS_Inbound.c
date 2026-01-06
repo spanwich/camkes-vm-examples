@@ -28,6 +28,19 @@
 /* Global timestamp counter definition */
 uint64_t global_timestamp_counter = 0;
 
+/*
+ * Policy Enforcement Configuration (v2.270)
+ *
+ * These globals control the address policy validation layer.
+ * Set g_policy_enabled = true to enforce address range checks.
+ *
+ * CVE-2022-0367 MITIGATION:
+ * When enabled, the policy layer validates that ALL Modbus addresses
+ * (including write_address in FC 0x17) are within the configured range.
+ */
+modbus_policy_t g_modbus_policy;
+bool g_policy_enabled = true;  /* Enable policy enforcement by default */
+
 /* Component statistics */
 static ComponentStats stats;
 
@@ -197,7 +210,24 @@ void in_ntfy_handle(void) {
 void pre_init(void) {
     memset(&stats, 0, sizeof(stats));
     tcp_messages = udp_messages = arp_messages = other_messages = 0;
+
+    /*
+     * Initialize Modbus address policy (v2.270)
+     *
+     * CVE-2022-0367 TEST CONFIGURATION:
+     * - Holding registers: 100-109 (matches PLC START_REGISTERS=100, NB_REGISTERS=10)
+     * - Attack with write_address=50 will be REJECTED
+     *
+     * For production, configure based on actual PLC memory mapping.
+     */
+    modbus_policy_init_cve_test(&g_modbus_policy);
+    g_policy_enabled = true;
+
     DEBUG_INFO("%s (%s) - Stable external→internal validation\n", ICS_INBOUND_VERSION, ICS_VERSION_DATE);
+    DEBUG_INFO("Policy: holding_reg=%u-%u, coil=%u-%u, enabled=%s\n",
+               g_modbus_policy.holding_reg_start, g_modbus_policy.holding_reg_end,
+               g_modbus_policy.coil_start, g_modbus_policy.coil_end,
+               g_policy_enabled ? "YES" : "NO");
 }
 
 int run(void) {

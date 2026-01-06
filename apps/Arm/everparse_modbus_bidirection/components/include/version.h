@@ -19,11 +19,21 @@
  */
 
 #define ICS_VERSION_MAJOR   2
-#define ICS_VERSION_MINOR   260
-#define ICS_VERSION_STRING  "2.260"
-#define ICS_VERSION_DATE    "2026-01-02"
+#define ICS_VERSION_MINOR   270
+#define ICS_VERSION_STRING  "2.270"
+#define ICS_VERSION_DATE    "2026-01-06"
 
 /*
+ * v2.270 Changes (2026-01-06):
+ * - NEW: Policy enforcement layer for CVE-2022-0367 mitigation
+ *   Added modbus_policy.h - runtime-configurable address range validation
+ *   Architecture: Stage 1 (EverParse) → Stage 2 (Policy)
+ *   CVE-2022-0367: libmodbus only validated read_address in FC 0x17,
+ *   allowing write_address to target memory outside PLC mapping.
+ *   Fix: Policy layer validates BOTH addresses in FC 0x17.
+ * - ICS_Inbound: Policy enabled, configured for CVE test (registers 100-109)
+ * - ICS_Outbound: Policy disabled (responses from trusted PLC don't need validation)
+ *
  * v2.260 Changes (2026-01-02):
  * - FIX: Backend connection reuse - stop creating new PLC connection per request
  *   Root cause: Net1 created NEW backend TCP connection for EVERY Modbus request,

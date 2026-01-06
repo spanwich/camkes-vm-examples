@@ -25,6 +25,16 @@
 /* Global timestamp counter definition */
 uint64_t global_timestamp_counter = 0;
 
+/*
+ * Policy Enforcement Configuration (v2.270)
+ *
+ * For OUTBOUND (PLC → SCADA responses), we typically don't enforce
+ * address policy since responses come from the trusted PLC.
+ * Policy enforcement is primarily for INBOUND requests to protect the PLC.
+ */
+modbus_policy_t g_modbus_policy;
+bool g_policy_enabled = false;  /* Disabled for outbound - responses don't need policy */
+
 /* Component statistics */
 static ComponentStats stats;
 

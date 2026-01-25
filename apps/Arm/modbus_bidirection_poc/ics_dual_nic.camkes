@@ -1,6 +1,8 @@
 /*
  * ICS Bidirectional Cross-Domain Security Gateway
  *
+ * v2.300: SYMMETRIC BIDIRECTIONAL VALIDATION (Zero Trust ICS)
+ *
  * ════════════════════════════════════════════════════════════════════════════
  * TRAFFIC FLOW LEGEND
  * ════════════════════════════════════════════════════════════════════════════
@@ -9,7 +11,7 @@
  * OUTBOUND = Internal Network → External Network (PLC → SCADA)
  *
  * External Network: SCADA systems, HMIs, engineering workstations (untrusted)
- * Internal Network: PLCs, RTUs, field devices (trusted)
+ * Internal Network: PLCs, RTUs, field devices (ALSO UNTRUSTED - Zero Trust)
  *
  * ════════════════════════════════════════════════════════════════════════════
  * BIDIRECTIONAL ARCHITECTURE
@@ -72,6 +74,7 @@
 
 import <std_connector.camkes>;
 import <global-connectors.camkes>;
+import "components/interfaces/ModbusValidate.idl4";
 
 /* ICS Message buffer size */
 #define ICS_BUFFER_SIZE 65536
@@ -158,9 +161,15 @@ component ICS_Inbound {
     /* Output to VirtIO_Net1_Driver (internal) */
     dataport Buf(ICS_BUFFER_SIZE) out_dp;
     emits Notification out_ntfy;
+
+    /* RPC to isolated ModbusParser */
+    uses ModbusValidate parser;
 }
 
-/* ICS_Outbound - Validates internal → external traffic */
+/* ICS_Outbound - Validates internal → external traffic
+ * v2.300: Symmetric F* response validation (Zero Trust ICS)
+ * Uses IN-PROCESS F* validators - no RPC to ModbusParser needed
+ */
 component ICS_Outbound {
     control;
 
@@ -171,6 +180,14 @@ component ICS_Outbound {
     /* Output to VirtIO_Net0_Driver (external) */
     dataport Buf(ICS_BUFFER_SIZE) out_dp;
     emits Notification out_ntfy;
+
+    /* v2.300: In-process F* validation - no RPC needed */
+}
+
+/* ModbusParser - Isolated formally verified parser (separate address space) */
+component ModbusParser {
+    control;
+    provides ModbusValidate parser;
 }
 
 assembly {
@@ -186,6 +203,9 @@ assembly {
         /* ═══ ICS Validation Instances ═══ */
         component ICS_Inbound ics_inbound;
         component ICS_Outbound ics_outbound;
+
+        /* ═══ Isolated Parser Instance ═══ */
+        component ModbusParser modbus_parser;
 
         /* ═══ Net0 Hardware Connections ═══ */
         connection seL4HardwareMMIO net0_mmio(
@@ -263,6 +283,13 @@ assembly {
             from net0_drv.net0_conn_state,
             to net1_drv.net0_conn_state
         );
+
+        /* ═══ Parser RPC: ICS_Inbound → ModbusParser ═══ */
+        /* Note: ICS_Outbound uses in-process F* validation (v2.300) */
+        connection seL4RPCDataport parser_rpc(
+            from ics_inbound.parser,
+            to modbus_parser.parser
+        );
     }
 
     configuration {
@@ -329,5 +356,15 @@ assembly {
         ics_outbound._priority = 150;
         ics_outbound.period = 10000;
         ics_outbound.budget = 2000;
+
+        /* ═══════════════════════════════════════════════════════════════════ */
+        /* ModbusParser Configuration (Isolated EverParse component)            */
+        /* ═══════════════════════════════════════════════════════════════════ */
+        modbus_parser.priority = 160;
+        modbus_parser._priority = 160;
+
+        /* Per-client shared memory for parser payload transfer */
+        ics_inbound.parser_shmem_size = 4096;
+        /* ics_outbound uses in-process F* validation (v2.300) - no RPC shmem needed */
     }
 }

@@ -1,0 +1,16 @@
+/*
+ * ModbusValidate - RPC interface for isolated EverParse parser
+ *
+ * Protocol:
+ * 1. Client writes payload bytes to shared buffer (parser_buf, offset 0)
+ * 2. Client calls validate(payload_length) - synchronous RPC
+ * 3. Server reads parser_buf(parser_get_sender_id()), validates, returns result
+ *
+ * Returns: 1=valid, 0=invalid, -1=input error
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+procedure ModbusValidate {
+    int validate(in int payload_length);
+};

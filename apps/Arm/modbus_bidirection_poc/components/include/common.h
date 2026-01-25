@@ -215,18 +215,6 @@ static inline bool basic_bounds_check(const ICS_Message* msg, size_t available_b
 }
 
 /*
- * EverParse validation function prototype
- * This is a stub function that will be replaced with real EverParse integration
- */
-static inline bool everparse_validate(const uint8_t* payload, size_t length) {
-    /* Phase 1: Always return true (no-op validation) */
-    /* TODO: Replace with actual EverParse validator */
-    (void)payload;  /* Suppress unused parameter warning */
-    (void)length;
-    return true;
-}
-
-/*
  * v2.208: ALL LOGGING MACROS MOVED TO debug_levels.h
  * =============================================================================
  * This file (common.h) now contains ONLY data structure definitions.

@@ -24,6 +24,7 @@ DefineCAmkESVMFileServer()
 CAmkESAddImportPath(${KernelARMPlatform})
 CAmkESAddImportPath(components/VirtIO_Net0_Driver)
 CAmkESAddImportPath(components/VirtIO_Net1_Driver)
+CAmkESAddImportPath(components/interfaces)
 
 # Enable lwIP
 set(LibLwip ON CACHE BOOL "Enable lwIP" FORCE)
@@ -102,10 +103,28 @@ DeclareCAmkESComponent(
 )
 
 # ICS_Outbound Component (Internal → External validation)
+# v2.300: Symmetric F*-verified response validation (Zero Trust ICS)
+# Response validators prevent data exfiltration, address confusion, and exception abuse.
 DeclareCAmkESComponent(
     ICS_Outbound
     SOURCES
         components/ICS_Outbound/ICS_Outbound.c
+        components/lib/modbus_response_policy_fstar.c
+        components/include/ModbusTCP_v5_ResponsePolicy.c
+        components/include/ModbusTCP_v5_ResponsePolicyWrapper.c
+        components/lib/everparse_error_handler.c
+    INCLUDES
+        components/include
+)
+
+# ModbusParser Component (Isolated EverParse validator - separate address space)
+DeclareCAmkESComponent(
+    ModbusParser
+    SOURCES
+        components/ModbusParser/ModbusParser.c
+        components/include/ModbusTCP_v3_Simple.c
+        components/include/ModbusTCP_v3_SimpleWrapper.c
+        components/lib/everparse_error_handler.c
     INCLUDES
         components/include
 )

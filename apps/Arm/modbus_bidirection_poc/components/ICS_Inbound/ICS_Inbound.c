@@ -93,10 +93,12 @@ static bool validate_message(const ICS_Message *msg) {
         return false;
     }
 
-    /* EverParse validation hook */
+    /* EverParse validation via isolated ModbusParser component (RPC) */
     if (msg->payload_length > 0) {
-        if (!everparse_validate(msg->payload, msg->payload_length)) {
-            DEBUG_ERROR("ICS_Inbound: REJECT - EverParse validation failed\n");
+        memcpy((void *)parser_buf, msg->payload, msg->payload_length);
+        int parse_result = parser_validate((int)msg->payload_length);
+        if (parse_result != 1) {
+            DEBUG_ERROR("ICS_Inbound: REJECT - Parser validation failed (result=%d)\n", parse_result);
             return false;
         }
     }

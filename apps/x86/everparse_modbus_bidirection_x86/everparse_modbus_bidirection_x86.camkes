@@ -1,0 +1,313 @@
+/*
+ * ICS Bidirectional Cross-Domain Security Gateway - x86_64 Port
+ *
+ * ============================================================================
+ * TRAFFIC FLOW LEGEND
+ * ============================================================================
+ *
+ * INBOUND  = External Network -> Internal Network (SCADA -> PLC)
+ * OUTBOUND = Internal Network -> External Network (PLC -> SCADA)
+ *
+ * External Network: SCADA systems, HMIs, engineering workstations (untrusted)
+ * Internal Network: PLCs, RTUs, field devices (trusted)
+ *
+ * ============================================================================
+ * BIDIRECTIONAL ARCHITECTURE
+ * ============================================================================
+ *
+ * REQUEST PATH (INBOUND: SCADA -> PLC):
+ *   +---------+         +-------------+         +---------+
+ *   |  SCADA  |-------->|   Net0_Drv  |-------->|ICS_In   |-------->
+ *   |(Ext Net)|  TCP    | (External)  | dataport|(Validate)|
+ *   +---------+         +-------------+         +---------+
+ *                                                      |
+ *                                                      v
+ *   +---------+         +-------------+         +---------+
+ *   |   PLC   |<--------|   Net1_Drv  |<--------|ICS_In   |
+ *   |(Int Net)|  TCP    | (Internal)  | dataport|(Validate)|
+ *   +---------+         +-------------+         +---------+
+ *
+ * RESPONSE PATH (OUTBOUND: PLC -> SCADA):
+ *   +---------+         +-------------+         +---------+
+ *   |   PLC   |-------->|   Net1_Drv  |-------->|ICS_Out  |-------->
+ *   |(Int Net)|  TCP    | (Internal)  | dataport|(Validate)|
+ *   +---------+         +-------------+         +---------+
+ *                                                      |
+ *                                                      v
+ *   +---------+         +-------------+         +---------+
+ *   |  SCADA  |<--------|   Net0_Drv  |<--------|ICS_Out  |
+ *   |(Ext Net)|  TCP    | (External)  | dataport|(Validate)|
+ *   +---------+         +-------------+         +---------+
+ *
+ * ============================================================================
+ * x86 PORT - Dual Intel e1000 NICs
+ * ============================================================================
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+import <std_connector.camkes>;
+import <global-connectors.camkes>;
+
+/* ICS Message buffer size */
+#define ICS_BUFFER_SIZE 65536
+
+/* Connection state sharing buffer size
+ * sizeof(struct connection_state_table) = 256 x 20 bytes + 8 bytes = 5128 bytes
+ * Round up to page size (4KB aligned) = 8KB for safety */
+#define CONNECTION_STATE_SIZE 8192
+
+/* ==========================================================================
+ * HARDWARE COMPONENTS - Dual Intel e1000 NICs (x86)
+ * ==========================================================================
+ * QEMU provides two e1000 NICs via -device e1000,netdev=net0/net1
+ * Each NIC has its own MMIO region and IOAPIC interrupt
+ */
+
+component HWEthDriver0 {
+    hardware;
+    emits IRQ irq;
+    dataport Buf(0x20000) mmio;  /* 128KB MMIO region for Intel 82574 */
+}
+
+component HWEthDriver1 {
+    hardware;
+    emits IRQ irq;
+    dataport Buf(0x20000) mmio;  /* 128KB MMIO region for Intel 82574 */
+}
+
+/* ==========================================================================
+ * NETWORK DRIVER COMPONENTS - Bidirectional with lwIP
+ * ==========================================================================
+ */
+
+/* Net0_Driver - External network (Modbus port 502, bidirectional) */
+component Net0_Driver {
+    control;
+
+    /* x86 Ethernet hardware access */
+    dataport Buf(0x20000) eth_mmio;
+    consumes IRQ eth_irq;
+
+    /* INBOUND path: External -> ICS_Inbound */
+    dataport Buf(ICS_BUFFER_SIZE) inbound_dp;
+    emits Notification inbound_ready;
+
+    /* OUTBOUND path: ICS_Outbound -> External */
+    dataport Buf(ICS_BUFFER_SIZE) outbound_dp;
+    consumes Notification outbound_ready;
+
+    /* Connection state sharing - read-only access to Net1's state */
+    dataport Buf(CONNECTION_STATE_SIZE) net0_conn_state;  /* Expose own state */
+    dataport Buf(CONNECTION_STATE_SIZE) net1_conn_state;  /* Read Net1's state */
+}
+
+/* Net1_Driver - Internal network (PLC connection, bidirectional) */
+component Net1_Driver {
+    control;
+
+    /* x86 Ethernet hardware access */
+    dataport Buf(0x20000) eth_mmio;
+    consumes IRQ eth_irq;
+
+    /* INBOUND path: ICS_Inbound -> Internal */
+    dataport Buf(ICS_BUFFER_SIZE) inbound_dp;
+    consumes Notification inbound_ready;
+
+    /* OUTBOUND path: Internal -> ICS_Outbound */
+    dataport Buf(ICS_BUFFER_SIZE) outbound_dp;
+    emits Notification outbound_ready;
+
+    /* Connection state sharing - read-only access to Net0's state */
+    dataport Buf(CONNECTION_STATE_SIZE) net1_conn_state;  /* Expose own state */
+    dataport Buf(CONNECTION_STATE_SIZE) net0_conn_state;  /* Read Net0's state */
+}
+
+/* ==========================================================================
+ * ICS VALIDATION COMPONENTS - NO lwIP, metadata-based validation only
+ * ==========================================================================
+ */
+
+/* ICS_Inbound - Validates external -> internal traffic */
+component ICS_Inbound {
+    control;
+
+    /* Input from Net0_Driver (external) */
+    dataport Buf(ICS_BUFFER_SIZE) in_dp;
+    consumes Notification in_ntfy;
+
+    /* Output to Net1_Driver (internal) */
+    dataport Buf(ICS_BUFFER_SIZE) out_dp;
+    emits Notification out_ntfy;
+}
+
+/* ICS_Outbound - Validates internal -> external traffic */
+component ICS_Outbound {
+    control;
+
+    /* Input from Net1_Driver (internal) */
+    dataport Buf(ICS_BUFFER_SIZE) in_dp;
+    consumes Notification in_ntfy;
+
+    /* Output to Net0_Driver (external) */
+    dataport Buf(ICS_BUFFER_SIZE) out_dp;
+    emits Notification out_ntfy;
+}
+
+assembly {
+    composition {
+        /* === Hardware Instances === */
+        component HWEthDriver0 eth0_hw;
+        component HWEthDriver1 eth1_hw;
+
+        /* === Network Driver Instances === */
+        component Net0_Driver net0_drv;
+        component Net1_Driver net1_drv;
+
+        /* === ICS Validation Instances === */
+        component ICS_Inbound ics_inbound;
+        component ICS_Outbound ics_outbound;
+
+        /* === Net0 Hardware Connections (External NIC) === */
+        connection seL4HardwareMMIO net0_mmio(
+            from net0_drv.eth_mmio,
+            to eth0_hw.mmio
+        );
+
+        connection seL4HardwareInterrupt net0_irq(
+            from eth0_hw.irq,
+            to net0_drv.eth_irq
+        );
+
+        /* === Net1 Hardware Connections (Internal NIC) === */
+        connection seL4HardwareMMIO net1_mmio(
+            from net1_drv.eth_mmio,
+            to eth1_hw.mmio
+        );
+
+        connection seL4HardwareInterrupt net1_irq(
+            from eth1_hw.irq,
+            to net1_drv.eth_irq
+        );
+
+        /* === INBOUND Data Path: Net0 -> ICS_Inbound -> Net1 === */
+        connection seL4SharedData net0_to_inbound_dp(
+            from net0_drv.inbound_dp,
+            to ics_inbound.in_dp
+        );
+
+        connection seL4Notification net0_to_inbound_ntfy(
+            from net0_drv.inbound_ready,
+            to ics_inbound.in_ntfy
+        );
+
+        connection seL4SharedData inbound_to_net1_dp(
+            from ics_inbound.out_dp,
+            to net1_drv.inbound_dp
+        );
+
+        connection seL4Notification inbound_to_net1_ntfy(
+            from ics_inbound.out_ntfy,
+            to net1_drv.inbound_ready
+        );
+
+        /* === OUTBOUND Data Path: Net1 -> ICS_Outbound -> Net0 === */
+        connection seL4SharedData net1_to_outbound_dp(
+            from net1_drv.outbound_dp,
+            to ics_outbound.in_dp
+        );
+
+        connection seL4Notification net1_to_outbound_ntfy(
+            from net1_drv.outbound_ready,
+            to ics_outbound.in_ntfy
+        );
+
+        connection seL4SharedData outbound_to_net0_dp(
+            from ics_outbound.out_dp,
+            to net0_drv.outbound_dp
+        );
+
+        connection seL4Notification outbound_to_net0_ntfy(
+            from ics_outbound.out_ntfy,
+            to net0_drv.outbound_ready
+        );
+
+        /* === Connection State Sharing - Net0 <-> Net1 === */
+        /* Net0 reads Net1's connection state (read-only) */
+        connection seL4SharedData net0_reads_net1_state(
+            from net1_drv.net1_conn_state,
+            to net0_drv.net1_conn_state
+        );
+
+        /* Net1 reads Net0's connection state (read-only) */
+        connection seL4SharedData net1_reads_net0_state(
+            from net0_drv.net0_conn_state,
+            to net1_drv.net0_conn_state
+        );
+    }
+
+    configuration {
+        /* ===================================================================
+         * Net0 Hardware Configuration (External NIC, first e1000)
+         * QEMU default: -device e1000,netdev=net0
+         * PCI address varies - using QEMU defaults for q35 machine
+         * ===================================================================
+         */
+        eth0_hw.mmio_paddr = 0xfebc0000;  /* QEMU e1000 MMIO base (first NIC) */
+        eth0_hw.mmio_size = 0x20000;      /* 128KB MMIO region */
+        eth0_hw.irq_irq_type = "pci";
+        eth0_hw.irq_irq_ioapic = 0;
+        eth0_hw.irq_irq_ioapic_pin = 11;  /* QEMU e1000 default IRQ */
+        eth0_hw.irq_irq_vector = 11;
+
+        /* ===================================================================
+         * Net1 Hardware Configuration (Internal NIC, second e1000)
+         * QEMU: -device e1000,netdev=net1
+         * ===================================================================
+         */
+        eth1_hw.mmio_paddr = 0xfebe0000;  /* QEMU e1000 MMIO base (second NIC) */
+        eth1_hw.mmio_size = 0x20000;      /* 128KB MMIO region */
+        eth1_hw.irq_irq_type = "pci";
+        eth1_hw.irq_irq_ioapic = 0;
+        eth1_hw.irq_irq_ioapic_pin = 10;  /* QEMU e1000 default IRQ (second NIC) */
+        eth1_hw.irq_irq_vector = 10;
+
+        /* ===================================================================
+         * Net0_Driver Configuration (External, Modbus port 502)
+         * ===================================================================
+         */
+        net0_drv.priority = 101;  /* Higher priority than validation components */
+        net0_drv._priority = 101;
+        net0_drv.cnode_size_bits = 18;
+        net0_drv.simple_untyped21_pool = 4;
+        net0_drv.heap_size = 0x100000;     /* 1MB heap for lwIP */
+        net0_drv.dma_pool = 0x200000;      /* 2MB DMA pool for e1000 descriptors */
+        net0_drv._stack_size = 0x20000;    /* 128KB stack (lwIP needs deep call stacks) */
+
+        /* ===================================================================
+         * Net1_Driver Configuration (Internal, PLC connection)
+         * ===================================================================
+         */
+        net1_drv.priority = 101;  /* Higher priority than validation components */
+        net1_drv._priority = 101;
+        net1_drv.cnode_size_bits = 18;
+        net1_drv.simple_untyped21_pool = 6;
+        net1_drv.heap_size = 0x100000;     /* 1MB heap for lwIP */
+        net1_drv.dma_pool = 0x200000;      /* 2MB DMA pool for e1000 descriptors */
+        net1_drv._stack_size = 0x20000;    /* 128KB stack */
+
+        /* ===================================================================
+         * ICS Validation Component Priorities
+         * ===================================================================
+         */
+        ics_inbound.priority = 150;
+        ics_inbound._priority = 150;
+        ics_inbound.period = 10000;
+        ics_inbound.budget = 2000;
+
+        ics_outbound.priority = 150;
+        ics_outbound._priority = 150;
+        ics_outbound.period = 10000;
+        ics_outbound.budget = 2000;
+    }
+}

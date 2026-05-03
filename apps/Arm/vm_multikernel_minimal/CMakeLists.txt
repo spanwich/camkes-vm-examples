@@ -62,7 +62,7 @@ if("${KernelARMPlatform}" STREQUAL "qemu-arm-virt")
     include(${CAMKES_VM_LINUX_HELPERS_PATH})
     set(cpp_flags "-DKERNELARMPLATFORM_QEMU-ARM-VIRT")
 
-    AddLoadImage("linux_kernel" "/tmp/tmp.3uICRi1C9y/tools/linux/arch/arm64/boot/Image")
+    AddLoadImage("linux_kernel" "${CAMKES_VM_IMAGES_DIR}/qemu-arm-virt/linux")
     set(rootfs_file "${CAMKES_VM_IMAGES_DIR}/qemu-arm-virt/rootfs.cpio.gz")
     AddLoadImage("linux_initrd" ${rootfs_file})
     # Updated dtb based on initrd

@@ -1,0 +1,5 @@
+0:	from all lookup local
+100:	from all iif ens224 lookup to_qemu_net0
+101:	from all iif ens256 lookup to_qemu_net1
+32766:	from all lookup main
+32767:	from all lookup default

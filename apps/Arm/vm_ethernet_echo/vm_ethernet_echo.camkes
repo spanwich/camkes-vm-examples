@@ -1,0 +1,129 @@
+/*
+ * vm_ethernet_echo.camkes - Stage 1: Dataport Packet Transfer Demo
+ *
+ * Minimal CAmkES assembly demonstrating zero-copy packet transfer
+ * between components using dataports.
+ *
+ * Architecture:
+ *   VirtIO-Net Hardware → EthernetDriver → [dataport] → EchoComponent → [dataport] → EthernetDriver
+ *
+ * NO VM components, NO SerialServer - just bare-metal driver + echo component.
+ * Printf output uses default console mechanism (PL011 UART).
+ */
+
+import <std_connector.camkes>;
+import <global-connectors.camkes>;
+
+/* Packet buffer size - must fit Ethernet MTU + VirtIO header */
+#define PACKET_BUFFER_SIZE 2048
+
+/* Hardware component definition for virtio-net */
+component virtio_net_hw {
+    hardware;
+    dataport Buf virtio_mmio_regs;
+    emits Interrupt virtio_irq;
+}
+
+/* EthernetDriver component - manages VirtIO device and forwards packets via dataport */
+component EthernetDriver {
+    control;
+
+    /* VirtIO hardware access */
+    dataport Buf virtio_mmio_regs;
+    consumes Interrupt virtio_irq;
+
+    /* Packet transfer dataports to EchoComponent */
+    dataport Buf(PACKET_BUFFER_SIZE) rx_packet_buffer;  /* Send packets TO echo */
+    dataport Buf(PACKET_BUFFER_SIZE) tx_packet_buffer;  /* Receive packets FROM echo */
+
+    /* Signaling */
+    emits PacketReady rx_packet_ready;       /* Signal: packet ready for echo */
+    consumes PacketProcessed tx_packet_done; /* Signal: echo processing complete */
+}
+
+/* EchoComponent - processes packets and generates echo responses */
+component EchoComponent {
+    control;
+
+    /* Packet transfer dataports from EthernetDriver */
+    dataport Buf(PACKET_BUFFER_SIZE) rx_packet_buffer;  /* Receive from driver */
+    dataport Buf(PACKET_BUFFER_SIZE) tx_packet_buffer;  /* Send to driver */
+
+    /* Signaling */
+    consumes PacketReady rx_packet_ready;   /* Notification: new packet available */
+    emits PacketProcessed tx_packet_done;   /* Notification: echo ready */
+}
+
+assembly {
+    composition {
+        /*
+         * Minimal Stage 1 system: Hardware + Driver + Echo Component
+         * NO SerialServer, NO TimeServer, NO VM infrastructure
+         * Printf uses default console (PL011 UART)
+         */
+
+        /* Hardware component instance */
+        component virtio_net_hw virtio_hw;
+
+        /* Driver and echo components */
+        component EthernetDriver eth_driver;
+        component EchoComponent echo_comp;
+
+        /* Hardware connections */
+        connection seL4HardwareMMIO eth_mmio(
+            from eth_driver.virtio_mmio_regs,
+            to virtio_hw.virtio_mmio_regs
+        );
+
+        connection seL4HardwareInterrupt eth_irq(
+            from virtio_hw.virtio_irq,
+            to eth_driver.virtio_irq
+        );
+
+        /* Dataport connections (zero-copy shared memory) */
+        connection seL4SharedDataWithCaps rx_buffer_conn(
+            from eth_driver.rx_packet_buffer,
+            to echo_comp.rx_packet_buffer
+        );
+
+        connection seL4SharedDataWithCaps tx_buffer_conn(
+            from eth_driver.tx_packet_buffer,
+            to echo_comp.tx_packet_buffer
+        );
+
+        /* Signaling connections */
+        connection seL4Notification rx_signal(
+            from eth_driver.rx_packet_ready,
+            to echo_comp.rx_packet_ready
+        );
+
+        connection seL4Notification tx_signal(
+            from echo_comp.tx_packet_done,
+            to eth_driver.tx_packet_done
+        );
+    }
+
+    configuration {
+        /* Hardware resource configuration */
+        /* QEMU allocates virtio-net-device to slot 31 at 0xa003e00 */
+        /* Map page-aligned 0xa003000 which contains slot 31 at offset +0xe00 */
+        virtio_hw.virtio_mmio_regs_paddr = 0xa003000;  /* Page containing slot 31 */
+        virtio_hw.virtio_mmio_regs_size = 0x1000;      /* 4KB page */
+        virtio_hw.virtio_irq_irq_number = 79;          /* IRQ for slot 31 (SPI 47) */
+
+        /* EthernetDriver configuration */
+        eth_driver.priority = 101;
+        eth_driver._priority = 101;
+        eth_driver.cnode_size_bits = 18;
+        eth_driver.simple_untyped21_pool = 4;
+        eth_driver.heap_size = 0x100000;  /* 1MB heap for lwIP */
+        eth_driver.dma_pool = 0x40000;    /* 256KB DMA pool for virtqueues */
+
+        /* EchoComponent configuration */
+        echo_comp.priority = 100;
+        echo_comp._priority = 100;
+        echo_comp.cnode_size_bits = 12;
+        echo_comp.simple_untyped12_pool = 2;
+        echo_comp.heap_size = 0x10000;    /* 64KB heap */
+    }
+}

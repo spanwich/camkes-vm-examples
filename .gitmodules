@@ -1,0 +1,3 @@
+[submodule "apps/Arm/vm_freertos"]
+	path = apps/Arm/vm_freertos
+	url = https://github.com/spanwich/camkes-vm-freertos.git

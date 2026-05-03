@@ -1,0 +1,90 @@
+/*
+ * ICS One-Way Normalizer V2 - Minimal Test Configuration
+ * Tests seL4 pipeline without VM components to isolate memory issues
+ */
+
+import <std_connector.camkes>;
+import <global-connectors.camkes>;
+
+/* Import component definitions from main icf.camkes */
+component NetworkNicDrv {
+    control;
+    dataport Buf(65536) out_dp;
+    emits Notification out_ntfy;
+    emits Callback self;
+    consumes Callback network_ready;
+}
+
+component ExtFrontend {
+    control;
+    dataport Buf(65536) in_dp;
+    consumes Notification in_ntfy;
+    dataport Buf(65536) out_dp;
+    emits Notification out_ntfy;
+}
+
+component ParserNorm {
+    control;
+    dataport Buf(65536) in_dp;
+    consumes Notification in_ntfy;
+    dataport Buf(65536) out_dp;
+    emits Notification out_ntfy;
+}
+
+component PolicyEmit {
+    control;
+    dataport Buf(65536) in_dp;
+    consumes Notification in_ntfy;
+    dataport Buf(65536) out_dp;
+    emits Notification out_ntfy;
+}
+
+component IntNicDrv {
+    control;
+    dataport Buf(65536) in_dp;
+    consumes Notification in_ntfy;
+}
+
+assembly {
+    composition {
+        /* ICS pipeline components only - NO VM */
+        component NetworkNicDrv network_nic;
+        component ExtFrontend ext_frontend;
+        component ParserNorm parser_norm;
+        component PolicyEmit policy_emit;
+        component IntNicDrv int_nic;
+
+        /* NetworkNicDrv callback connection */
+        connection seL4GlobalAsynchCallback network_callback(from network_nic.self,
+                                                             to network_nic.network_ready);
+
+        /* Pipeline connections: NetworkNicDrv -> ExtFrontend -> ParserNorm -> PolicyEmit -> IntNicDrv */
+        connection seL4SharedData net_fe_dp(from network_nic.out_dp, to ext_frontend.in_dp);
+        connection seL4Notification net_fe_ntfy(from network_nic.out_ntfy, to ext_frontend.in_ntfy);
+
+        connection seL4SharedData fe_par_dp(from ext_frontend.out_dp, to parser_norm.in_dp);
+        connection seL4Notification fe_par_ntfy(from ext_frontend.out_ntfy, to parser_norm.in_ntfy);
+
+        connection seL4SharedData par_pol_dp(from parser_norm.out_dp, to policy_emit.in_dp);
+        connection seL4Notification par_pol_ntfy(from parser_norm.out_ntfy, to policy_emit.in_ntfy);
+
+        connection seL4SharedData pol_int_dp(from policy_emit.out_dp, to int_nic.in_dp);
+        connection seL4Notification pol_int_ntfy(from policy_emit.out_ntfy, to int_nic.in_ntfy);
+    }
+
+    configuration {
+        /* Component priorities */
+        int_nic.priority = 250;
+        policy_emit.priority = 200;
+        parser_norm.priority = 150;
+        ext_frontend.priority = 100;
+        network_nic.priority = 50;
+
+        /* Small memory pools for components */
+        network_nic.simple_untyped12_pool = 8;
+        ext_frontend.simple_untyped12_pool = 8;
+        parser_norm.simple_untyped12_pool = 8;
+        policy_emit.simple_untyped12_pool = 8;
+        int_nic.simple_untyped12_pool = 8;
+    }
+}

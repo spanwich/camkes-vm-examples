@@ -1,0 +1,333 @@
+/*
+ * ICS Bidirectional Cross-Domain Security Gateway
+ *
+ * ════════════════════════════════════════════════════════════════════════════
+ * TRAFFIC FLOW LEGEND
+ * ════════════════════════════════════════════════════════════════════════════
+ *
+ * INBOUND  = External Network → Internal Network (SCADA → PLC)
+ * OUTBOUND = Internal Network → External Network (PLC → SCADA)
+ *
+ * External Network: SCADA systems, HMIs, engineering workstations (untrusted)
+ * Internal Network: PLCs, RTUs, field devices (trusted)
+ *
+ * ════════════════════════════════════════════════════════════════════════════
+ * BIDIRECTIONAL ARCHITECTURE
+ * ════════════════════════════════════════════════════════════════════════════
+ *
+ * REQUEST PATH (INBOUND: SCADA → PLC):
+ *   ┌─────────┐         ┌─────────────┐         ┌─────────┐
+ *   │  SCADA  │────────▶│   Net0_Drv  │────────▶│ICS_In   │────────▶
+ *   │(Ext Net)│  TCP    │ (External)  │ dataport│(Validate)│
+ *   └─────────┘         └─────────────┘         └─────────┘
+ *                                                      │
+ *                                                      ▼
+ *   ┌─────────┐         ┌─────────────┐         ┌─────────┐
+ *   │   PLC   │◀────────│   Net1_Drv  │◀────────│ICS_In   │
+ *   │(Int Net)│  TCP    │ (Internal)  │ dataport│(Validate)│
+ *   └─────────┘         └─────────────┘         └─────────┘
+ *
+ * RESPONSE PATH (OUTBOUND: PLC → SCADA):
+ *   ┌─────────┐         ┌─────────────┐         ┌─────────┐
+ *   │   PLC   │────────▶│   Net1_Drv  │────────▶│ICS_Out  │────────▶
+ *   │(Int Net)│  TCP    │ (Internal)  │ dataport│(Validate)│
+ *   └─────────┘         └─────────────┘         └─────────┘
+ *                                                      │
+ *                                                      ▼
+ *   ┌─────────┐         ┌─────────────┐         ┌─────────┐
+ *   │  SCADA  │◀────────│   Net0_Drv  │◀────────│ICS_Out  │
+ *   │(Ext Net)│  TCP    │ (External)  │ dataport│(Validate)│
+ *   └─────────┘         └─────────────┘         └─────────┘
+ *
+ * ════════════════════════════════════════════════════════════════════════════
+ * COMPONENT DESCRIPTIONS
+ * ════════════════════════════════════════════════════════════════════════════
+ *
+ * VirtIO_Net0_Driver (External Network Interface):
+ *   - Connects to SCADA systems on external network (192.168.96.x)
+ *   - TCP server on port 502 (Modbus)
+ *   - Receives SCADA requests → forwards to ICS_Inbound
+ *   - Receives PLC responses from ICS_Outbound → sends to SCADA
+ *
+ * VirtIO_Net1_Driver (Internal Network Interface):
+ *   - Connects to PLCs on internal network (192.168.95.x)
+ *   - TCP client to PLC port 502
+ *   - Receives validated requests from ICS_Inbound → forwards to PLC
+ *   - Receives PLC responses → forwards to ICS_Outbound
+ *
+ * ICS_Inbound (SCADA→PLC Validator):
+ *   - Validates SCADA requests before forwarding to internal network
+ *   - Metadata-based validation (NO lwIP, stateless)
+ *   - Protocol detection: Modbus TCP, DNP3, EtherNet/IP
+ *
+ * ICS_Outbound (PLC→SCADA Validator):
+ *   - Validates PLC responses before forwarding to external network
+ *   - Metadata-based validation (NO lwIP, stateless)
+ *   - Ensures only legitimate PLC responses return to SCADA
+ *
+ * ════════════════════════════════════════════════════════════════════════════
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+import <std_connector.camkes>;
+import <global-connectors.camkes>;
+
+/* ICS Message buffer size */
+#define ICS_BUFFER_SIZE 65536
+
+/* v2.117: Connection state sharing buffer size
+ * sizeof(struct connection_state_table) = 256 × 20 bytes + 8 bytes = 5128 bytes
+ * Round up to page size (4KB aligned) = 8KB for safety */
+#define CONNECTION_STATE_SIZE 8192
+
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* HARDWARE COMPONENTS - Dual VirtIO-Net Devices                            */
+/* ═══════════════════════════════════════════════════════════════════════ */
+
+component virtio_net0_hw {
+    hardware;
+    dataport Buf virtio_mmio_regs;
+    emits Interrupt virtio_irq;
+}
+
+component virtio_net1_hw {
+    hardware;
+    dataport Buf virtio_mmio_regs;
+    emits Interrupt virtio_irq;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* VIRTIO DRIVER COMPONENTS - Bidirectional with lwIP                       */
+/* ═══════════════════════════════════════════════════════════════════════ */
+
+/* VirtIO_Net0_Driver - External network (port 6000, bidirectional) */
+component VirtIO_Net0_Driver {
+    control;
+
+    /* VirtIO hardware access */
+    dataport Buf virtio_mmio_regs;
+    consumes Interrupt virtio_irq;
+
+    /* INBOUND path: External → ICS_Inbound */
+    dataport Buf(ICS_BUFFER_SIZE) inbound_dp;
+    emits Notification inbound_ready;
+
+    /* OUTBOUND path: ICS_Outbound → External */
+    dataport Buf(ICS_BUFFER_SIZE) outbound_dp;
+    consumes Notification outbound_ready;
+
+    /* v2.117: Connection state sharing - read-only access to Net1's state */
+    dataport Buf(CONNECTION_STATE_SIZE) net0_conn_state;  /* Expose own state */
+    dataport Buf(CONNECTION_STATE_SIZE) net1_conn_state;  /* Read Net1's state */
+}
+
+/* VirtIO_Net1_Driver - Internal network (port 7000, bidirectional) */
+component VirtIO_Net1_Driver {
+    control;
+
+    /* VirtIO hardware access */
+    dataport Buf virtio_mmio_regs;
+    consumes Interrupt virtio_irq;
+
+    /* INBOUND path: ICS_Inbound → Internal */
+    dataport Buf(ICS_BUFFER_SIZE) inbound_dp;
+    consumes Notification inbound_ready;
+
+    /* OUTBOUND path: Internal → ICS_Outbound */
+    dataport Buf(ICS_BUFFER_SIZE) outbound_dp;
+    emits Notification outbound_ready;
+
+    /* v2.117: Connection state sharing - read-only access to Net0's state */
+    dataport Buf(CONNECTION_STATE_SIZE) net1_conn_state;  /* Expose own state */
+    dataport Buf(CONNECTION_STATE_SIZE) net0_conn_state;  /* Read Net0's state */
+}
+
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* ICS VALIDATION COMPONENTS - NO lwIP, metadata-based validation only      */
+/* ═══════════════════════════════════════════════════════════════════════ */
+
+/* ICS_Inbound - Validates external → internal traffic */
+component ICS_Inbound {
+    control;
+
+    /* Input from VirtIO_Net0_Driver (external) */
+    dataport Buf(ICS_BUFFER_SIZE) in_dp;
+    consumes Notification in_ntfy;
+
+    /* Output to VirtIO_Net1_Driver (internal) */
+    dataport Buf(ICS_BUFFER_SIZE) out_dp;
+    emits Notification out_ntfy;
+}
+
+/* ICS_Outbound - Validates internal → external traffic */
+component ICS_Outbound {
+    control;
+
+    /* Input from VirtIO_Net1_Driver (internal) */
+    dataport Buf(ICS_BUFFER_SIZE) in_dp;
+    consumes Notification in_ntfy;
+
+    /* Output to VirtIO_Net0_Driver (external) */
+    dataport Buf(ICS_BUFFER_SIZE) out_dp;
+    emits Notification out_ntfy;
+}
+
+assembly {
+    composition {
+        /* ═══ Hardware Instances ═══ */
+        component virtio_net0_hw net0_hw;
+        component virtio_net1_hw net1_hw;
+
+        /* ═══ VirtIO Driver Instances ═══ */
+        component VirtIO_Net0_Driver net0_drv;
+        component VirtIO_Net1_Driver net1_drv;
+
+        /* ═══ ICS Validation Instances ═══ */
+        component ICS_Inbound ics_inbound;
+        component ICS_Outbound ics_outbound;
+
+        /* ═══ Net0 Hardware Connections ═══ */
+        connection seL4HardwareMMIO net0_mmio(
+            from net0_drv.virtio_mmio_regs,
+            to net0_hw.virtio_mmio_regs
+        );
+
+        connection seL4HardwareInterrupt net0_irq(
+            from net0_hw.virtio_irq,
+            to net0_drv.virtio_irq
+        );
+
+        /* ═══ Net1 Hardware Connections ═══ */
+        connection seL4HardwareMMIO net1_mmio(
+            from net1_drv.virtio_mmio_regs,
+            to net1_hw.virtio_mmio_regs
+        );
+
+        connection seL4HardwareInterrupt net1_irq(
+            from net1_hw.virtio_irq,
+            to net1_drv.virtio_irq
+        );
+
+        /* ═══ INBOUND Data Path: Net0 → ICS_Inbound → Net1 ═══ */
+        connection seL4SharedData net0_to_inbound_dp(
+            from net0_drv.inbound_dp,
+            to ics_inbound.in_dp
+        );
+
+        connection seL4Notification net0_to_inbound_ntfy(
+            from net0_drv.inbound_ready,
+            to ics_inbound.in_ntfy
+        );
+
+        connection seL4SharedData inbound_to_net1_dp(
+            from ics_inbound.out_dp,
+            to net1_drv.inbound_dp
+        );
+
+        connection seL4Notification inbound_to_net1_ntfy(
+            from ics_inbound.out_ntfy,
+            to net1_drv.inbound_ready
+        );
+
+        /* ═══ OUTBOUND Data Path: Net1 → ICS_Outbound → Net0 ═══ */
+        connection seL4SharedData net1_to_outbound_dp(
+            from net1_drv.outbound_dp,
+            to ics_outbound.in_dp
+        );
+
+        connection seL4Notification net1_to_outbound_ntfy(
+            from net1_drv.outbound_ready,
+            to ics_outbound.in_ntfy
+        );
+
+        connection seL4SharedData outbound_to_net0_dp(
+            from ics_outbound.out_dp,
+            to net0_drv.outbound_dp
+        );
+
+        connection seL4Notification outbound_to_net0_ntfy(
+            from ics_outbound.out_ntfy,
+            to net0_drv.outbound_ready
+        );
+
+        /* ═══ v2.117: Connection State Sharing - Net0 ↔ Net1 ═══ */
+        /* Net0 reads Net1's connection state (read-only) */
+        connection seL4SharedData net0_reads_net1_state(
+            from net1_drv.net1_conn_state,
+            to net0_drv.net1_conn_state
+        );
+
+        /* Net1 reads Net0's connection state (read-only) */
+        connection seL4SharedData net1_reads_net0_state(
+            from net0_drv.net0_conn_state,
+            to net1_drv.net0_conn_state
+        );
+    }
+
+    configuration {
+        /* ═══════════════════════════════════════════════════════════════════ */
+        /* Net0 Hardware Configuration (External, SLOT 31 @ 0xa003e00)         */
+        /* QEMU allocates first -device virtio-net-device to slot 31           */
+        /* Matches vm_ethernet_echo working configuration                      */
+        /* ═══════════════════════════════════════════════════════════════════ */
+        net0_hw.virtio_mmio_regs_paddr = 0xa003000;  /* Page containing slot 31 */
+        net0_hw.virtio_mmio_regs_size = 0x1000;      /* 4KB page */
+        net0_hw.virtio_irq_irq_number = 79;          /* IRQ for slot 31 (SPI 47) */
+
+        /* CRITICAL: Set MMIO region as uncached device memory */
+        net0_drv.virtio_mmio_regs_hardware_cached = false;
+
+        /* ═══════════════════════════════════════════════════════════════════ */
+        /* Net1 Hardware Configuration (Internal, SLOT 30 @ 0xa003c00)         */
+        /* QEMU allocates second -device virtio-net-device to slot 30          */
+        /* Same page as slot 31, different offset                              */
+        /* ═══════════════════════════════════════════════════════════════════ */
+        net1_hw.virtio_mmio_regs_paddr = 0xa003000;  /* Same page as slot 31 */
+        net1_hw.virtio_mmio_regs_size = 0x1000;      /* 4KB page */
+        net1_hw.virtio_irq_irq_number = 78;          /* IRQ for slot 30 (SPI 46) */
+
+        /* CRITICAL: Set MMIO region as uncached device memory */
+        net1_drv.virtio_mmio_regs_hardware_cached = false;
+
+        /* ═══════════════════════════════════════════════════════════════════ */
+        /* VirtIO_Net0_Driver Configuration (External, port 6000)              */
+        /* ═══════════════════════════════════════════════════════════════════ */
+        net0_drv.priority = 101;  /* Higher priority than validation components */
+        net0_drv._priority = 101;
+        net0_drv.cnode_size_bits = 18;
+        net0_drv.simple_untyped21_pool = 4;
+        net0_drv.heap_size = 0x100000;  /* 1MB heap for lwIP */
+        net0_drv.dma_pool = 0x40000;    /* 256KB DMA pool for virtqueues */
+        net0_drv._stack_size = 0x20000;  /* v2.117: 128KB stack (lwIP needs deep call stacks) */
+        /* NO period/budget - run as interrupt-driven passive component */
+
+        /* ═══════════════════════════════════════════════════════════════════ */
+        /* VirtIO_Net1_Driver Configuration (Internal, port 7000)              */
+        /* ═══════════════════════════════════════════════════════════════════ */
+        net1_drv.priority = 101;  /* Higher priority than validation components */
+        net1_drv._priority = 101;
+        net1_drv.cnode_size_bits = 18;
+        net1_drv.simple_untyped21_pool = 6;  /* v2.110: Increased from 4 to 6 (8MB→12MB)
+                                               * Reason: 100-slot pool with 60KB/slot = 6MB
+                                               * Total needs: BSS 8.9MB + heap 1MB + stack 128KB = ~10.3MB
+                                               * 6×2MB = 12MB provides sufficient headroom */
+        net1_drv.heap_size = 0x100000;  /* 1MB heap for lwIP */
+        net1_drv.dma_pool = 0x40000;    /* 256KB DMA pool for virtqueues */
+        net1_drv._stack_size = 0x20000;  /* v2.117: 128KB stack (lwIP needs deep call stacks) */
+        /* NO period/budget - run as interrupt-driven passive component */
+
+        /* ═══════════════════════════════════════════════════════════════════ */
+        /* ICS Validation Component Priorities                                 */
+        /* ═══════════════════════════════════════════════════════════════════ */
+        ics_inbound.priority = 150;
+        ics_inbound._priority = 150;
+        ics_inbound.period = 10000;
+        ics_inbound.budget = 2000;
+
+        ics_outbound.priority = 150;
+        ics_outbound._priority = 150;
+        ics_outbound.period = 10000;
+        ics_outbound.budget = 2000;
+    }
+}

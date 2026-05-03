@@ -1,0 +1,68 @@
+/*
+ * vm_ethernet_test.camkes - Tier 1 Test Assembly
+ *
+ * Minimal CAmkES assembly to test VirtIO device discovery.
+ * This boots WITHOUT the VM, just the EthernetDriver component
+ * to prove virtio device can be discovered.
+ */
+
+import <std_connector.camkes>;
+
+/* Import our EthernetDriver component */
+import <EthernetDriver.camkes>;
+
+/* Hardware component definition for virtio-net */
+component virtio_net_hw {
+    hardware;
+    dataport Buf virtio_mmio_regs;  /* 16KB to cover multiple VirtIO slots */
+    emits Interrupt virtio_irq;
+}
+
+assembly {
+    composition {
+        /*
+         * Minimal Tier 1 system: ONLY hardware and driver
+         * No SerialServer, no TimeServer, no VM - just the driver talking to hardware
+         * Printf output will use default console mechanism
+         */
+
+        /* Hardware component instance */
+        component virtio_net_hw virtio_hw;
+
+        /* Our EthernetDriver component */
+        component EthernetDriver eth_driver;
+
+        /* Connect to hardware: VirtIO MMIO registers */
+        connection seL4HardwareMMIO eth_mmio(
+            from eth_driver.virtio_mmio_regs,
+            to virtio_hw.virtio_mmio_regs
+        );
+
+        /* Connect to hardware: VirtIO interrupt */
+        connection seL4HardwareInterrupt eth_irq(
+            from virtio_hw.virtio_irq,
+            to eth_driver.virtio_irq
+        );
+    }
+
+    configuration {
+        /* Hardware resource configuration */
+        /* QEMU allocates virtio-net-device to slot 31 at 0xa003e00 (sDDF confirmed!) */
+        /* Map page-aligned 0xa003000 which contains slot 31 at offset +0xe00 */
+        virtio_hw.virtio_mmio_regs_paddr = 0xa003000;  /* Page containing slot 31 */
+        virtio_hw.virtio_mmio_regs_size = 0x1000;      /* 4KB page */
+        virtio_hw.virtio_irq_irq_number = 79;          /* IRQ for slot 31 (SPI 47 = 16+47+16) */
+
+        /* EthernetDriver configuration */
+        eth_driver.priority = 101;
+
+        /* DMA pool for camkes_dma_alloc() - required for virtqueue DMA buffers */
+        eth_driver.dma_pool = 0x40000;  /* 256KB DMA pool for virtqueue rings, packet buffers, and TX headers */
+
+        /* Give driver some memory capabilities */
+        eth_driver._priority = 101;
+        eth_driver.cnode_size_bits = 18;
+        eth_driver.simple_untyped21_pool = 4;
+        eth_driver.heap_size = 0x100000;  /* 1MB heap for driver */
+    }
+}

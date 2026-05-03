@@ -1,0 +1,26 @@
+/*
+ * EthernetDriver.camkes - VirtIO Network Driver Component
+ *
+ * CAmkES component definition for the virtio-net driver.
+ * This component directly accesses QEMU's virtio-mmio device.
+ */
+
+component EthernetDriver {
+    /* Control thread for initialization */
+    control;
+
+    /* Hardware MMIO access: VirtIO registers - map 16KB to cover multiple slots */
+    /* Note: Size is configured in assembly (0x4000 = 16KB) */
+    dataport Buf virtio_mmio_regs;
+
+    /* Hardware ring buffer: Memory for virtqueues (64KB) */
+    /* Note: CAmkES will generate hw_ring_buffer_paddr() function */
+    /* Size is configured in assembly via hw_ring_buffer_size attribute */
+    maybe dataport Buf hw_ring_buffer;
+
+    /* Interrupt from virtio-net device */
+    consumes Interrupt virtio_irq;
+
+    /* Component priority (high for driver) */
+    attribute int priority = 101;
+}

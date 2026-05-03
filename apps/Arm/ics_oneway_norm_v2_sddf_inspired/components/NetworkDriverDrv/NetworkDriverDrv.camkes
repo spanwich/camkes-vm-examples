@@ -1,0 +1,19 @@
+/*
+ * Copyright 2024, PhD Research Project
+ * Network Driver Component - sDDF-Inspired Implementation
+ *
+ * Based on sDDF virtio ethernet driver but adapted for CAmkES framework
+ * Provides direct hardware network access without VM/VirtQueue overhead
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+import <std_connector.camkes>;
+
+component NetworkDriverDrv {
+    control;
+
+    /* Output to ExtFrontend (same interface as original ExtNicDrv) */
+    dataport Buf(65536) out_dp;
+    emits Notification out_ntfy;
+}

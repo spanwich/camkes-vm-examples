@@ -1,0 +1,2 @@
+default via 10.2.0.2 dev tap0 linkdown 
+192.168.95.0/24 via 10.2.0.2 dev tap0 linkdown 

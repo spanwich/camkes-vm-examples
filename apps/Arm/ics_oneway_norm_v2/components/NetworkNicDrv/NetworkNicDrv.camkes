@@ -1,0 +1,28 @@
+/*
+ * Network NIC Driver Component Interface - V2
+ *
+ * Receives ICS protocol messages from VM via VirtQueue
+ * Converts VM messages to seL4 pipeline format
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+import <std_connector.camkes>;
+import <global-connectors.camkes>;
+import <vm-connectors.camkes>;
+
+component NetworkNicDrv {
+    control;
+
+    /* VirtQueue interfaces for VM communication */
+    uses VirtQueueDev recv;
+    uses VirtQueueDrv send;
+    emits Callback self;
+    consumes Callback network_ready;
+
+    /* Output dataport to ExtFrontend (SAME interface as ExtNicDrv) */
+    dataport Buf out_dp;
+
+    /* Output notification to signal ExtFrontend (SAME interface as ExtNicDrv) */
+    emits Notification out_ntfy;
+}

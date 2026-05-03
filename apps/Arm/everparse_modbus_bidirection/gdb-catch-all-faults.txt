@@ -1,0 +1,246 @@
+# GDB Commands for Catching ALL seL4 Memory Faults
+#
+# This configuration catches ANY memory fault, not just specific addresses.
+# Key insight: Break on fault locations, not fault addresses.
+
+# ARM architecture setup
+set architecture arm
+set endian little
+
+# Disable pagination for long output
+set pagination off
+set print pretty on
+set print array on
+
+# Enable comprehensive logging
+set logging file gdb-fault-log.txt
+set logging on
+set logging overwrite off
+set logging redirect off
+
+# Verbose debugging
+set verbose on
+set debug remote 0
+
+# ═══════════════════════════════════════════════════════════════
+# CATCH ALL EXCEPTIONS - Not just specific signals
+# ═══════════════════════════════════════════════════════════════
+catch exception
+catch signal all
+
+# ═══════════════════════════════════════════════════════════════
+# HARDWARE BREAKPOINTS - Catch faults at specific PCs
+# ═══════════════════════════════════════════════════════════════
+
+# From crash log: pc = 0x39868 (inside tcp_output)
+# This is the instruction that tries to dereference NULL
+break *0x39868
+commands
+    echo \n
+    echo ╔═══════════════════════════════════════════════════════╗\n
+    echo ║  CAUGHT FAULT AT PC 0x39868 (tcp_output)             ║\n
+    echo ╚═══════════════════════════════════════════════════════╝\n
+    echo \n
+    echo PC:
+    info registers pc
+    echo \n
+    echo Disassembly around fault:\n
+    x/20i $pc-16
+    echo \n
+    echo All registers:\n
+    info registers
+    echo \n
+    echo Stack backtrace:\n
+    backtrace 20
+    echo \n
+    echo Memory at fault address (if accessible):\n
+    # Try to read the faulting address from register
+    # From disassembly: ldr r3, [r3, #16] where r3=NULL
+    echo r3 register (likely NULL):
+    info registers r3
+    echo \n
+    echo Attempting to read [$r3 + 16]:\n
+    # This will fail if r3=0, but shows the issue
+    set $fault_addr = $r3 + 16
+    printf "Fault address: 0x%x\n", $fault_addr
+    echo \n
+    echo Press 'c' to continue or 'quit' to exit\n
+end
+
+# ═══════════════════════════════════════════════════════════════
+# SEL4 FAULT HANDLER - Catch kernel fault handler
+# ═══════════════════════════════════════════════════════════════
+
+# These breakpoints catch faults in the kernel BEFORE they're logged
+# This gives us the EXACT fault context before seL4 handles it
+
+# Primary data fault handler - catches all data aborts
+break *0xe0010274
+commands
+    echo \n
+    echo ╔═══════════════════════════════════════════════════════╗\n
+    echo ║  KERNEL: c_handle_data_fault() CALLED                ║\n
+    echo ║  This is THE data abort handler in seL4 kernel       ║\n
+    echo ╚═══════════════════════════════════════════════════════╝\n
+    echo \n
+    echo Fault address register (DFAR):\n
+    # ARM fault registers
+    info registers
+    echo \n
+    echo Faulting instruction:\n
+    # The faulting PC is saved in LR
+    printf "Fault PC (from LR): 0x%x\n", $lr
+    x/10i $lr
+    echo \n
+end
+
+# Main fault handler
+break handleFault
+commands
+    echo \n
+    echo ║  KERNEL: handleFault() - Main fault handler          ║\n
+end
+
+# User-level fault handler (component crashes)
+break handleUserLevelFault
+commands
+    echo \n
+    echo ║  KERNEL: handleUserLevelFault() - Component fault    ║\n
+    echo ║  This means a CAmkES component crashed               ║\n
+end
+
+# VM fault handler
+break handleVMFault
+commands
+    echo \n
+    echo ║  KERNEL: handleVMFault() - Memory fault              ║\n
+end
+
+# ═══════════════════════════════════════════════════════════════
+# MEMORY WATCHPOINTS - Catch invalid memory regions
+# ═══════════════════════════════════════════════════════════════
+
+# Watch for NULL pointer dereferences (0x0 - 0x100 region)
+# Note: Can only set limited hardware watchpoints
+watch *(int*)0x0
+watch *(int*)0x10
+watch *(int*)0x20
+
+# ═══════════════════════════════════════════════════════════════
+# HOOK - Display info every time execution stops
+# ═══════════════════════════════════════════════════════════════
+define hook-stop
+    echo \n
+    echo ╔════════════════════════════════════════════════════════════╗\n
+    echo ║  EXECUTION STOPPED - FAULT DETECTED                        ║\n
+    echo ╚════════════════════════════════════════════════════════════╝\n
+    shell date
+    echo \n
+
+    echo ┌─── Program Counter ───────────────────────────────────────┐\n
+    printf "  PC = 0x%x\n", $pc
+    echo \n
+    echo   Disassembly:\n
+    x/10i $pc
+    echo └───────────────────────────────────────────────────────────┘\n
+    echo \n
+
+    echo ┌─── All Registers ─────────────────────────────────────────┐\n
+    info registers
+    echo └───────────────────────────────────────────────────────────┘\n
+    echo \n
+
+    echo ┌─── Call Stack ────────────────────────────────────────────┐\n
+    backtrace 15
+    echo └───────────────────────────────────────────────────────────┘\n
+    echo \n
+
+    echo ┌─── Stack Memory (32 words from SP) ───────────────────────┐\n
+    x/32xw $sp
+    echo └───────────────────────────────────────────────────────────┘\n
+    echo \n
+
+    echo ┌─── Memory Around PC ──────────────────────────────────────┐\n
+    x/32xw $pc
+    echo └───────────────────────────────────────────────────────────┘\n
+    echo \n
+end
+
+# ═══════════════════════════════════════════════════════════════
+# CUSTOM COMMANDS
+# ═══════════════════════════════════════════════════════════════
+
+define dump-fault-context
+    echo \n
+    echo === FULL FAULT CONTEXT DUMP ===\n
+    echo \n
+    printf "PC: 0x%x\n", $pc
+    printf "SP: 0x%x\n", $sp
+    printf "LR: 0x%x\n", $lr
+    echo \n
+    echo Disassembly at PC:\n
+    x/30i $pc-20
+    echo \n
+    echo All Registers:\n
+    info all-registers
+    echo \n
+    echo Stack dump (128 bytes):\n
+    x/128xb $sp
+    echo \n
+    echo Locals:\n
+    info locals
+    echo \n
+    echo Arguments:\n
+    info args
+    echo \n
+end
+
+define find-null-deref
+    echo \n
+    echo === Searching for NULL dereference ===\n
+    echo \n
+    # Check common registers for NULL
+    printf "r0 = 0x%x %s\n", $r0, ($r0 == 0 ? "[NULL]" : "")
+    printf "r1 = 0x%x %s\n", $r1, ($r1 == 0 ? "[NULL]" : "")
+    printf "r2 = 0x%x %s\n", $r2, ($r2 == 0 ? "[NULL]" : "")
+    printf "r3 = 0x%x %s\n", $r3, ($r3 == 0 ? "[NULL]" : "")
+    printf "r4 = 0x%x %s\n", $r4, ($r4 == 0 ? "[NULL]" : "")
+    printf "r5 = 0x%x %s\n", $r5, ($r5 == 0 ? "[NULL]" : "")
+    printf "r6 = 0x%x %s\n", $r6, ($r6 == 0 ? "[NULL]" : "")
+    printf "r7 = 0x%x %s\n", $r7, ($r7 == 0 ? "[NULL]" : "")
+    echo \n
+end
+
+# ═══════════════════════════════════════════════════════════════
+# CONNECT TO QEMU
+# ═══════════════════════════════════════════════════════════════
+target remote localhost:1234
+
+# ═══════════════════════════════════════════════════════════════
+# STARTUP MESSAGE
+# ═══════════════════════════════════════════════════════════════
+echo \n
+echo ╔════════════════════════════════════════════════════════════╗\n
+echo ║  seL4 CATCH-ALL FAULT DEBUGGER                             ║\n
+echo ╚════════════════════════════════════════════════════════════╝\n
+shell date
+echo \n
+echo Configuration:\n
+echo   ✓ ARM architecture configured\n
+echo   ✓ Logging to gdb-fault-log.txt\n
+echo   ✓ Catching ALL signals and exceptions\n
+echo   ✓ Breakpoint at 0x39868 (known crash PC)\n
+echo   ✓ Watchpoints on NULL region (0x0, 0x10, 0x20)\n
+echo \n
+echo Active Breakpoints:\n
+info breakpoints
+echo \n
+echo Custom Commands:\n
+echo   - dump-fault-context : Full fault analysis\n
+echo   - find-null-deref    : Check registers for NULL\n
+echo   - check-fault        : Quick PC examination\n
+echo \n
+echo Ready! Type 'continue' to start execution.\n
+echo GDB will stop BEFORE any memory fault occurs.\n
+echo ════════════════════════════════════════════════════════════\n
+echo \n

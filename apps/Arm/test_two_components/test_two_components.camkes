@@ -1,0 +1,53 @@
+/*
+ * test_two_components.camkes - Progressive test: adding notification connection
+ *
+ * Stage 3: Add notification connection to test blocking behavior
+ * - ComponentA writes to dataport then emits notification
+ * - ComponentB waits on notification, reads dataport, processes data
+ *
+ * CRITICAL TEST: Does ComponentB print startup message BEFORE blocking on wait()?
+ *
+ * Goal: Determine if notification wait() prevents startup message from appearing
+ */
+
+import <std_connector.camkes>;
+
+/* Component definitions */
+component ComponentA {
+    control;
+    dataport Buf(4096) shared_buffer;
+    emits DataReady data_ready;  /* Signal when data is written */
+}
+
+component ComponentB {
+    control;
+    dataport Buf(4096) shared_buffer;
+    consumes DataReady data_ready;  /* Wait for data ready signal */
+}
+
+/* System assembly */
+assembly {
+    composition {
+        /* Instantiate the two components */
+        component ComponentA comp_a;
+        component ComponentB comp_b;
+
+        /* Dataport connection (shared memory) */
+        connection seL4SharedData data_conn(from comp_a.shared_buffer,
+                                             to comp_b.shared_buffer);
+
+        /* Notification connection (async event signaling) */
+        connection seL4Notification event_conn(from comp_a.data_ready,
+                                                to comp_b.data_ready);
+    }
+
+    configuration {
+        /* Set priorities - both equal so they can run concurrently */
+        comp_a.priority = 100;
+        comp_b.priority = 100;
+
+        /* Small heap for each component */
+        comp_a.heap_size = 0x10000;  /* 64KB */
+        comp_b.heap_size = 0x10000;  /* 64KB */
+    }
+}

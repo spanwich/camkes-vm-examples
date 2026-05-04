@@ -36,6 +36,15 @@ DeclareCAmkESComponent(
     LIBS sel4_autoconf utils
 )
 
+# Define ComponentC — cross-kernel user-space mailbox via paddr-anchored
+# MMIO dataport at 0x6FFFE000. Same paddr in both K0 and K1 builds, so
+# both ComponentC instances map the same physical 4 KiB page.
+DeclareCAmkESComponent(
+    ComponentC
+    SOURCES components/ComponentC/component_c.c
+    LIBS sel4_autoconf utils
+)
+
 # Declare root server with our simple assembly
 DeclareCAmkESRootserver(
     test_two_components.camkes

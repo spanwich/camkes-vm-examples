@@ -25,29 +25,56 @@ component ComponentB {
     consumes DataReady data_ready;  /* Wait for data ready signal */
 }
 
+/* Hardware "device" representing the cross-kernel shared pool.
+ * paddr is set in configuration; both kernels' builds use the same paddr,
+ * so each kernel's ComponentC instance maps the SAME physical page. */
+component cross_kernel_pool_hw {
+    hardware;
+    dataport Buf cross_kernel_pool;
+}
+
+/* ComponentC — cross-kernel user-space mailbox endpoint.
+ * Each kernel's rootserver runs one instance. Both instances share the
+ * same physical 4 KiB page via paddr-anchored MMIO dataport — proving
+ * user-space cap-mediated cross-kernel communication. */
+component ComponentC {
+    control;
+    dataport Buf cross_kernel_pool;
+}
+
 /* System assembly */
 assembly {
     composition {
-        /* Instantiate the two components */
         component ComponentA comp_a;
         component ComponentB comp_b;
+        component ComponentC comp_c;
+        component cross_kernel_pool_hw ckp_hw;
 
-        /* Dataport connection (shared memory) */
         connection seL4SharedData data_conn(from comp_a.shared_buffer,
                                              to comp_b.shared_buffer);
-
-        /* Notification connection (async event signaling) */
         connection seL4Notification event_conn(from comp_a.data_ready,
                                                 to comp_b.data_ready);
+
+        /* Paddr-anchored MMIO dataport. The "hardware" side fixes the
+         * physical address; ComponentC gets a virtual mapping pointing
+         * to that physical page. Identical config in both kernel builds
+         * means both ComponentCs see the SAME physical 4 KiB. */
+        connection seL4HardwareMMIO ckp_mmio(from comp_c.cross_kernel_pool,
+                                              to ckp_hw.cross_kernel_pool);
     }
 
     configuration {
-        /* Set priorities - both equal so they can run concurrently */
         comp_a.priority = 100;
         comp_b.priority = 100;
+        comp_c.priority = 100;
 
-        /* Small heap for each component */
-        comp_a.heap_size = 0x10000;  /* 64KB */
-        comp_b.heap_size = 0x10000;  /* 64KB */
+        comp_a.heap_size = 0x10000;
+        comp_b.heap_size = 0x10000;
+        comp_c.heap_size = 0x10000;
+
+        /* Cross-kernel pool: same paddr in both kernel builds. */
+        ckp_hw.cross_kernel_pool_paddr = 0x6FFFE000;
+        ckp_hw.cross_kernel_pool_size = 0x1000;
+        comp_c.cross_kernel_pool_hardware_cached = true;
     }
 }

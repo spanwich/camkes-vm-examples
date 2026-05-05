@@ -26,20 +26,24 @@ component ComponentB {
 }
 
 /* Hardware "device" representing the cross-kernel shared pool.
+ * 64 KiB = 16 × 4 KiB frames per Multikernel-AMP architecture §8.1:
+ *   Frame 0: control ring (kid→kid inbound, from this kernel's view)
+ *   Frame 1: control ring (kid→kid outbound)
+ *   Frames 2..15: EP data channels (assigned by vDTU library)
  * paddr is set in configuration; both kernels' builds use the same paddr,
- * so each kernel's ComponentC instance maps the SAME physical page. */
+ * so each kernel's ComponentC instance maps the SAME 64 KiB physical region. */
 component cross_kernel_pool_hw {
     hardware;
-    dataport Buf cross_kernel_pool;
+    dataport Buf(0x10000) cross_kernel_pool;
 }
 
 /* ComponentC — cross-kernel user-space mailbox endpoint.
  * Each kernel's rootserver runs one instance. Both instances share the
- * same physical 4 KiB page via paddr-anchored MMIO dataport — proving
- * user-space cap-mediated cross-kernel communication. */
+ * same physical 64 KiB pool via paddr-anchored MMIO dataport — the
+ * primitive that SemperKernel's vDTU library + KernelcallHandler build on. */
 component ComponentC {
     control;
-    dataport Buf cross_kernel_pool;
+    dataport Buf(0x10000) cross_kernel_pool;
 }
 
 /* System assembly */
@@ -57,8 +61,8 @@ assembly {
 
         /* Paddr-anchored MMIO dataport. The "hardware" side fixes the
          * physical address; ComponentC gets a virtual mapping pointing
-         * to that physical page. Identical config in both kernel builds
-         * means both ComponentCs see the SAME physical 4 KiB. */
+         * to that physical region. Identical config in both kernel builds
+         * means both ComponentCs see the SAME 64 KiB (16 frames). */
         connection seL4HardwareMMIO ckp_mmio(from comp_c.cross_kernel_pool,
                                               to ckp_hw.cross_kernel_pool);
     }
@@ -70,11 +74,15 @@ assembly {
 
         comp_a.heap_size = 0x10000;
         comp_b.heap_size = 0x10000;
-        comp_c.heap_size = 0x10000;
+        comp_c.heap_size = 0x200000;  /* 2 MiB — multiple cooperative-thread stacks */
 
-        /* Cross-kernel pool: same paddr in both kernel builds. */
-        ckp_hw.cross_kernel_pool_paddr = 0x6FFFE000;
-        ckp_hw.cross_kernel_pool_size = 0x1000;
+        /* Cross-kernel pool: same paddr in both kernel builds. 64 KiB
+         * starting at 0x6FFE0000. K0 picks frames from RAM untyped (pool
+         * lies in K0's RAM region); K1 picks from the device-untyped hole
+         * below 0x70000000. Stays clear of 0x6FFFE000 (legacy ComponentC
+         * frame) and 0x6FFFF000 (kernel debug mailbox). */
+        ckp_hw.cross_kernel_pool_paddr = 0x6FFE0000;
+        ckp_hw.cross_kernel_pool_size = 0x10000;
         comp_c.cross_kernel_pool_hardware_cached = true;
     }
 }

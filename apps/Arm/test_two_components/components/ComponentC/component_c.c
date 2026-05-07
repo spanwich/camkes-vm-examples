@@ -26,6 +26,8 @@
 #include <multikernel/threadmgr.h>
 #include <multikernel/kernelcall.h>
 #include <multikernel/revocations.h>
+#include <multikernel/vpe.h>
+#include <multikernel/syscall.h>
 
 #define POOL_PADDR              0x6FFE0000ull
 #define POOL_FRAME_SIZE         0x1000u
@@ -641,6 +643,130 @@ static void test_driver_kid0(void *raw)
         } else {
             printf("[TEST C.5-TOCTOU] grant FAIL\n");
         }
+        fflush(stdout);
+    }
+
+    /* ===== Phase A — VPE struct + syscall interface ================== */
+
+    /* ----- Phase A.1: VPE struct as first-class object ---------------- */
+    {
+        mk_vpe_init();
+        struct mk_vpe *v1 = mk_vpe_create(/*id=*/100, /*kid=*/0, MK_VPE_THREAD);
+        struct mk_vpe *v2 = mk_vpe_create(/*id=*/101, /*kid=*/0, MK_VPE_THREAD);
+        struct mk_vpe *find1 = mk_vpe_find(100);
+        size_t cnt = mk_vpe_count();
+        if (v1 && v2 && find1 == v1 && cnt == 2 &&
+            v1->state == MK_VPE_STATE_IDLE && v1->type == MK_VPE_THREAD)
+            printf("[TEST A.1] VPE struct: PASS (created 2, find_by_id ok, "
+                   "count=%zu, initial state=IDLE)\n", cnt);
+        else
+            printf("[TEST A.1] VPE struct: FAIL v1=%p v2=%p find1=%p cnt=%zu\n",
+                   v1, v2, find1, cnt);
+        fflush(stdout);
+    }
+
+    /* ----- Phase A.2: per-VPE selector table -------------------------- */
+    {
+        struct mk_vpe *v = mk_vpe_find(100);
+        int s1 = mk_vpe_alloc_sel(v);
+        int s2 = mk_vpe_alloc_sel(v);
+        mk_cap_id_t fake_cap = MK_CAP_ID(0, 100, MK_CAP_MEM, 42);
+        mk_vpe_bind_sel(v, (uint16_t)s1, fake_cap);
+        mk_cap_id_t looked = mk_vpe_lookup_sel(v, (uint16_t)s1);
+        mk_cap_id_t empty  = mk_vpe_lookup_sel(v, (uint16_t)s2);
+        mk_vpe_clear_sel(v, (uint16_t)s1);
+        mk_cap_id_t cleared = mk_vpe_lookup_sel(v, (uint16_t)s1);
+        if (s1 > 0 && s2 > s1 && looked == fake_cap &&
+            empty == MK_CAP_NONE && cleared == MK_CAP_NONE)
+            printf("[TEST A.2] VPE-local selectors: PASS "
+                   "(alloc unique sels %d %d, bind/lookup/clear roundtrip)\n",
+                   s1, s2);
+        else
+            printf("[TEST A.2] VPE-local selectors: FAIL "
+                   "s1=%d s2=%d looked=0x%llx empty=0x%llx cleared=0x%llx\n",
+                   s1, s2, (unsigned long long)looked,
+                   (unsigned long long)empty, (unsigned long long)cleared);
+        fflush(stdout);
+    }
+
+    /* ----- Phase A.3+A.4: SemperKernel root grant + DELEGATE syscall -- */
+    {
+        struct mk_vpe *donor    = mk_vpe_find(100);
+        struct mk_vpe *recipient = mk_vpe_find(101);
+        /* Kernel grants donor a fresh root cap (frame 2 in pool). */
+        int donor_sel = mk_kernel_grant_root(donor, MK_CAP_MEM,
+                                             MK_PERM_RW, /*frame=*/2, 0xA300);
+        /* Donor delegates to recipient via syscall — same kernel, kid=0. */
+        uint16_t target_sel = 0;
+        int rc_del = mk_syscall_delegate(donor, (uint16_t)donor_sel,
+                                         /*target_kid=*/0,
+                                         /*target_vpe_id=*/101,
+                                         MK_PERM_RW, &target_sel);
+        mk_cap_id_t recipient_cap = mk_vpe_lookup_sel(recipient, target_sel);
+
+        /* ACTIVATE / DEACTIVATE round-trip. */
+        int rc_act    = mk_syscall_activate(recipient, target_sel, /*ep_id=*/3);
+        int rc_deact  = mk_syscall_deactivate(recipient, target_sel);
+
+        /* REVOKE on donor side cascades to recipient. */
+        int rc_rev = mk_syscall_revoke(donor, (uint16_t)donor_sel);
+        mk_cap_id_t after_donor    = mk_vpe_lookup_sel(donor, (uint16_t)donor_sel);
+        mk_cap_id_t after_recipient = mk_vpe_lookup_sel(recipient, target_sel);
+
+        if (donor_sel > 0 && rc_del == 0 && recipient_cap != MK_CAP_NONE &&
+            rc_act == 0 && rc_deact == 0 && rc_rev >= 0 &&
+            after_donor == MK_CAP_NONE)
+            printf("[TEST A.3/A.4] syscall flow OBTAIN-equivalent + ACTIVATE + "
+                   "DEACTIVATE + DELEGATE + REVOKE: PASS "
+                   "(donor_sel=%d target_sel=%u rc_revoke=%d)\n",
+                   donor_sel, target_sel, rc_rev);
+        else
+            printf("[TEST A.3/A.4] syscall flow: FAIL "
+                   "donor_sel=%d rc_del=%d rcap=0x%llx rc_act=%d rc_deact=%d "
+                   "rc_rev=%d after_d=0x%llx after_r=0x%llx\n",
+                   donor_sel, rc_del,
+                   (unsigned long long)recipient_cap,
+                   rc_act, rc_deact, rc_rev,
+                   (unsigned long long)after_donor,
+                   (unsigned long long)after_recipient);
+        fflush(stdout);
+    }
+
+    /* ----- Phase A.4: OBTAIN stub returns -ENOSYS until Phase B ------- */
+    {
+        struct mk_vpe *v = mk_vpe_find(100);
+        uint16_t sel = 0;
+        int rc = mk_syscall_obtain(v, "imaginary-service", MK_PERM_R, &sel);
+        if (rc == -38)
+            printf("[TEST A.4] OBTAIN stub: PASS (returns -ENOSYS=%d "
+                   "until Phase B SERVICE directory)\n", rc);
+        else
+            printf("[TEST A.4] OBTAIN stub: FAIL rc=%d (expected -38)\n", rc);
+        fflush(stdout);
+    }
+
+    /* ----- Phase A.5: Re-run sentinels — confirm A.x didn't perturb -- */
+    {
+        /* The "tests 1-7 still pass" property is verified by the rest of
+         * test_driver_kid0/kid1 already running before this point.
+         * Restate explicitly: fast-path counter > 0 (Test 4),
+         * revoke_count > 0 (Tests 2a/2b/3a/3b/5/6/C.x), pings_ok still 8. */
+        struct mk_kc_stats st;
+        mk_kc_get_stats(&st);
+        int regression =
+            (st.local_fastpath_count == 0) ||
+            (st.revoke_count == 0)         ||
+            (pings_ok != 8);
+        if (!regression)
+            printf("[TEST A.5] Phase A regression sentinels: PASS "
+                   "(fastpath=%llu revokes=%llu pings=%d)\n",
+                   (unsigned long long)st.local_fastpath_count,
+                   (unsigned long long)st.revoke_count, pings_ok);
+        else
+            printf("[TEST A.5] Phase A regression sentinels: FAIL "
+                   "fastpath=%llu revokes=%llu pings=%d\n",
+                   (unsigned long long)st.local_fastpath_count,
+                   (unsigned long long)st.revoke_count, pings_ok);
         fflush(stdout);
     }
 

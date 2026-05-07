@@ -167,6 +167,13 @@ static void mk_thread_trampoline(void)
         for (;;) {}
     }
     g_current = next;
+    /* If `next` has never been started (still has fn != NULL), arm the
+     * trampoline so its first instruction reads g_starting correctly.
+     * Without this, longjmp into a freshly-crafted ctx falls through to
+     * the trampoline body with g_starting==NULL → null deref. */
+    if (next->fn) {
+        g_starting = next;
+    }
     longjmp(next->ctx, 1);
 }
 

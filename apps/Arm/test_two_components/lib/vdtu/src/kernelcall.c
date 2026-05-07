@@ -332,7 +332,17 @@ static int do_revoke_subtree(int root_idx)
     int removed = 0;
     for (int i = csp - 1; i >= 0; --i) {
         struct mk_cap *c = mk_captable_at(collected[i]);
-        if (c) { mk_captable_remove(c->id); removed++; }
+        if (c) {
+            /* Phase C.5 — per-type revoke action runs BEFORE removing
+             * the entry, so the action sees the full struct (frame_idx,
+             * label, perms, parent linkage). For MEM_CAP this will unmap
+             * the frame; for SEND_EP/RECV_EP it deletes the endpoint cap
+             * from the VPE's CNode; for SESSION it cascades. In Phase C
+             * the registered actions are stubs that bump a counter. */
+            mk_cap_invoke_revoke_action(c);
+            mk_captable_remove(c->id);
+            removed++;
+        }
     }
     return removed;
 }

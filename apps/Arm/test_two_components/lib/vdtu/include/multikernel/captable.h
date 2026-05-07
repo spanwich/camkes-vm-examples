@@ -83,6 +83,29 @@ size_t mk_captable_size(void);
  * through any cap (requires MK_PERM_D on the parent), etc. */
 bool mk_cap_check_perms(mk_cap_id_t cap_id, uint16_t requested_perms);
 
+/* C.5 — per-type revoke action.
+ *
+ * Each cap type may register a "release the underlying resource" hook
+ * that runs immediately before do_revoke_subtree removes the cap entry.
+ * For MEM_CAP this will unmap the frame from the VPE's page table; for
+ * SEND_EP/RECV_EP it will delete the seL4 endpoint cap from the VPE's
+ * CNode; for SESSION it will tear down the session and notify the other
+ * end. In Phase C the actions are no-ops (we have no separate VPE yet);
+ * they're filled in during Phase A/B as the structural foundation lands.
+ *
+ * Registration: mk_cap_register_revoke_action(MK_CAP_MEM, &mem_unmap);
+ * Invocation:   automatic — do_revoke_subtree calls the hook for each
+ *               cap it removes, in post-order (leaves first).
+ * Diagnostic:   mk_cap_revoke_action_count(type) returns the number of
+ *               times the action fired, useful for tests.
+ */
+typedef void (*mk_revoke_action_fn)(struct mk_cap *cap);
+
+void   mk_cap_register_revoke_action(uint16_t type, mk_revoke_action_fn fn);
+void   mk_cap_invoke_revoke_action(struct mk_cap *cap);
+size_t mk_cap_revoke_action_count(uint16_t type);
+void   mk_cap_revoke_action_reset_counters(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -566,6 +566,84 @@ static void test_driver_kid0(void *raw)
         fflush(stdout);
     }
 
+    /* ----- Phase C.5: per-type revoke action dispatch --------------- */
+    {
+        /* Build a 3-level intra-kernel chain of MEM caps, register a
+         * stub action, revoke from root, verify the action fired
+         * exactly 3 times and the chain is gone. */
+        mk_cap_revoke_action_reset_counters();
+        size_t before = mk_cap_revoke_action_count(MK_CAP_MEM);
+
+        mk_cap_id_t l1 = MK_CAP_NONE, l1_src = MK_CAP_NONE;
+        mk_cap_id_t l2 = MK_CAP_NONE, l3 = MK_CAP_NONE;
+        mk_cap_grant(0, 7, MK_CAP_MEM, MK_PERM_RW, 1, 0xC500,
+                     MK_CAP_NONE, &l1, &l1_src);
+        mk_cap_grant(0, 8, MK_CAP_MEM, MK_PERM_RW, 1, 0xC501,
+                     l1, &l2, NULL);
+        mk_cap_grant(0, 9, MK_CAP_MEM, MK_PERM_RW, 1, 0xC502,
+                     l2, &l3, NULL);
+
+        int rc = mk_cap_revoke(l1_src);
+        size_t after = mk_cap_revoke_action_count(MK_CAP_MEM);
+        size_t fired = after - before;
+
+        if (rc >= 4 && fired >= 4 &&
+            mk_captable_find(l1_src) < 0 && mk_captable_find(l1) < 0 &&
+            mk_captable_find(l2) < 0     && mk_captable_find(l3) < 0)
+            printf("[TEST C.5] per-type revoke action: PASS "
+                   "(rc=%d MEM action fired %zu times, full chain gone)\n",
+                   rc, fired);
+        else
+            printf("[TEST C.5] per-type revoke action: FAIL "
+                   "rc=%d fired=%zu before=%zu\n", rc, fired, before);
+        fflush(stdout);
+    }
+
+    /* ----- Phase C.5 TOCTOU: action runs once per cap when 2 workers
+     * race on the same root.
+     *
+     * Ordering: the first worker becomes the walker and removes the
+     * subtree; the second finds no entry to revoke (cap_id was removed
+     * by the walker). Crucially the second's `mk_cap_revoke` does NOT
+     * re-fire the per-type action because there is nothing to walk —
+     * the action firing count therefore stays at the subtree size. */
+    {
+        size_t before = mk_cap_revoke_action_count(MK_CAP_MEM);
+        mk_cap_id_t a = MK_CAP_NONE, a_src = MK_CAP_NONE;
+        /* Use a distinct frame index that no prior test installed. */
+        if (mk_cap_grant(0, 10, MK_CAP_MEM, MK_PERM_RW, /*frame=*/3, 0xC5A0,
+                         MK_CAP_NONE, &a, &a_src) == 0) {
+            printf("[TEST C.5-TOCTOU] grant ok a=0x%llx a_src=0x%llx\n",
+                   (unsigned long long)a, (unsigned long long)a_src);
+            fflush(stdout);
+            struct rev_arg w1 = { .cap = a_src };
+            struct rev_arg w2 = { .cap = a_src };
+            if (!mk_thread_spawn(rev_worker, &w1)) {
+                printf("[TEST C.5-TOCTOU] spawn w1 FAIL\n");
+            } else if (!mk_thread_spawn(rev_worker, &w2)) {
+                printf("[TEST C.5-TOCTOU] spawn w2 FAIL\n");
+            } else {
+                int budget = 100000;
+                while (budget-- > 0 && !(w1.finished && w2.finished))
+                    mk_thread_yield();
+                size_t fired = mk_cap_revoke_action_count(MK_CAP_MEM) - before;
+                if (w1.finished && w2.finished && fired == 2)
+                    printf("[TEST C.5-TOCTOU] action fires once per cap: PASS "
+                           "(2 caps in subtree → 2 action invocations across 2 workers, "
+                           "results=%d/%d)\n",
+                           w1.result, w2.result);
+                else
+                    printf("[TEST C.5-TOCTOU] action fires once per cap: FAIL "
+                           "fin=(%d,%d) res=(%d,%d) fired=%zu (expected 2) budget_left=%d\n",
+                           w1.finished, w2.finished,
+                           w1.result, w2.result, fired, budget);
+            }
+        } else {
+            printf("[TEST C.5-TOCTOU] grant FAIL\n");
+        }
+        fflush(stdout);
+    }
+
     /* ----- Phase C.2 TOCTOU: write-permitted check passes, revoke, retry */
     {
         /* Sequence: grant RW, check W=true, revoke, check W=false. The

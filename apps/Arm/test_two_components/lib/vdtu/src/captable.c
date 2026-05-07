@@ -156,3 +156,55 @@ bool mk_cap_check_perms(mk_cap_id_t cap_id, uint16_t requested_perms)
     if (c->id == MK_CAP_NONE) return false;
     return (c->perms & requested_perms) == requested_perms;
 }
+
+/* ---- Phase C.5: per-type revoke action dispatch ---- */
+
+/* Use a small fixed array indexed by 4-bit nibble of the type field. The
+ * v3.0 cap-type enum currently uses bits 0x01..0x80, well within range. */
+#define MK_REVACT_SLOTS 16
+
+static mk_revoke_action_fn g_revact_fn[MK_REVACT_SLOTS];
+static size_t              g_revact_count[MK_REVACT_SLOTS];
+
+static inline int revact_slot(uint16_t type)
+{
+    /* Map each canonical cap type to a unique slot. */
+    switch (type) {
+    case MK_CAP_MEM:     return 0;
+    case MK_CAP_MSG:     return 1;
+    case MK_CAP_SEND_EP: return 2;
+    case MK_CAP_RECV_EP: return 3;
+    case MK_CAP_SESSION: return 4;
+    case MK_CAP_SERVICE: return 5;
+    case MK_CAP_VPE:     return 6;
+    default:             return -1;
+    }
+}
+
+void mk_cap_register_revoke_action(uint16_t type, mk_revoke_action_fn fn)
+{
+    int slot = revact_slot(type);
+    if (slot < 0) return;
+    g_revact_fn[slot] = fn;
+}
+
+void mk_cap_invoke_revoke_action(struct mk_cap *cap)
+{
+    if (!cap) return;
+    int slot = revact_slot(cap->type);
+    if (slot < 0) return;
+    g_revact_count[slot]++;
+    if (g_revact_fn[slot]) g_revact_fn[slot](cap);
+}
+
+size_t mk_cap_revoke_action_count(uint16_t type)
+{
+    int slot = revact_slot(type);
+    if (slot < 0) return 0;
+    return g_revact_count[slot];
+}
+
+void mk_cap_revoke_action_reset_counters(void)
+{
+    for (int i = 0; i < MK_REVACT_SLOTS; ++i) g_revact_count[i] = 0;
+}

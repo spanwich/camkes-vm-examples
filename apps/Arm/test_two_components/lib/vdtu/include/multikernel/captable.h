@@ -71,6 +71,18 @@ void mk_captable_walk_children(int parent_idx, mk_cap_walker cb, void *ctx);
 /* Diagnostic: count live entries. */
 size_t mk_captable_size(void);
 
+/* C.2 — use-time permission check.
+ *
+ * Returns true if the capability with `cap_id` exists AND its perms
+ * field is a superset of `requested_perms` (i.e. all requested bits are
+ * set). Returns false if the cap does not exist OR its perms are
+ * insufficient.
+ *
+ * Use this gate every time a VPE-facing operation might consume a cap's
+ * authority — read/write through MEM_CAP, send through SEND_EP, derive
+ * through any cap (requires MK_PERM_D on the parent), etc. */
+bool mk_cap_check_perms(mk_cap_id_t cap_id, uint16_t requested_perms);
+
 #ifdef __cplusplus
 }
 #endif

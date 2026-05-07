@@ -501,6 +501,13 @@ int mk_cap_grant(uint16_t dst_kid, uint16_t dst_vpe,
         if (p) effective_perms &= p->perms;
     }
 
+    /* C.2 — at-use permission gate. Empty effective perms means every
+     * bit was masked away by the AND; reject as no-op grant. The full
+     * delegation (MK_PERM_D) check is enforced at the syscall boundary
+     * once Phase A.4 is in place. For Phase C, callers using
+     * mk_cap_check_perms directly self-gate. */
+    if (effective_perms == 0) return -5;
+
     /* Local fast path — avoid the ring entirely. */
     if (dst_kid == g_self_kid) {
         mk_cap_id_t local_dst = MK_CAP_ID(g_self_kid, dst_vpe, type, frame_idx);

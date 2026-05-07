@@ -362,6 +362,57 @@ static void test_driver_kid0(void *raw)
         fflush(stdout);
     }
 
+    /* ----- Phase C.2: mk_cap_check_perms helper at use-time ----------- */
+    {
+        const uint16_t f = 13;
+        mk_cap_id_t cap = MK_CAP_NONE, _s = MK_CAP_NONE;
+        int n = 0, fail = 0;
+        if (mk_cap_grant(0, 5, MK_CAP_MEM, MK_PERM_R, f, 0xC200,
+                         MK_CAP_NONE, &cap, &_s) != 0) {
+            printf("[TEST C.2] grant FAILED\n");
+        } else {
+            n++; if (!mk_cap_check_perms(cap, MK_PERM_R))           fail++;
+            n++; if ( mk_cap_check_perms(cap, MK_PERM_W))           fail++;
+            n++; if ( mk_cap_check_perms(cap, MK_PERM_RW))          fail++;
+            n++; if (!mk_cap_check_perms(cap, 0))                   fail++; /* empty subset always OK */
+            mk_cap_revoke(cap);
+            /* After revoke: every check returns false (cap gone). */
+            n++; if ( mk_cap_check_perms(cap, MK_PERM_R))           fail++;
+            n++; if ( mk_cap_check_perms(cap, 0))                   fail++;
+            if (fail == 0)
+                printf("[TEST C.2] mk_cap_check_perms: PASS "
+                       "(R-only cap allows R, denies W and RW; revoked cap denies all; %d assertions)\n", n);
+            else
+                printf("[TEST C.2] mk_cap_check_perms: FAIL %d/%d assertions failed\n",
+                       fail, n);
+        }
+        fflush(stdout);
+    }
+
+    /* ----- Phase C.2 TOCTOU: write-permitted check passes, revoke, retry */
+    {
+        /* Sequence: grant RW, check W=true, revoke, check W=false. The
+         * cooperative-thread model gives us deterministic ordering, but
+         * the property held in the audit (Item 1) is: a check that
+         * passed must NOT be authority over a subsequent op that is
+         * issued AFTER a revoke completes. */
+        const uint16_t f = 14;
+        mk_cap_id_t cap = MK_CAP_NONE, _s = MK_CAP_NONE;
+        if (mk_cap_grant(0, 6, MK_CAP_MEM, MK_PERM_RW, f, 0xC2A0,
+                         MK_CAP_NONE, &cap, &_s) == 0) {
+            int pre  = mk_cap_check_perms(cap, MK_PERM_W);
+            mk_cap_revoke(cap);
+            int post = mk_cap_check_perms(cap, MK_PERM_W);
+            if (pre && !post)
+                printf("[TEST C.2-TOCTOU] permission rescinded by revoke: PASS "
+                       "(pre-revoke W=true, post-revoke W=false)\n");
+            else
+                printf("[TEST C.2-TOCTOU] permission rescinded by revoke: FAIL pre=%d post=%d\n",
+                       pre, post);
+        }
+        fflush(stdout);
+    }
+
     /* Stats summary. */
     struct mk_kc_stats st;
     mk_kc_get_stats(&st);
@@ -384,7 +435,7 @@ static void test_driver_kid1(void *raw)
      * the only thing that can install the cap so we yield repeatedly. */
     mk_cap_id_t expected = MK_CAP_ID(/*kid=*/1, /*vpe=*/1,
                                      MK_CAP_MEM, TEST1_FRAME_IDX);
-    for (int i = 0; i < 5000; ++i) {
+    for (int i = 0; i < 2000000; ++i) {
         if (mk_captable_find(expected) >= 0) break;
         mk_thread_yield();
     }

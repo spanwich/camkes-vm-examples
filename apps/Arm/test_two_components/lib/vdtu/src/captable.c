@@ -147,3 +147,12 @@ void mk_captable_walk_children(int parent_idx, mk_cap_walker cb, void *ctx)
 }
 
 size_t mk_captable_size(void) { return g_size; }
+
+bool mk_cap_check_perms(mk_cap_id_t cap_id, uint16_t requested_perms)
+{
+    int idx = mk_captable_find(cap_id);
+    if (idx < 0) return false;
+    struct mk_cap *c = &g_table[idx];
+    if (c->id == MK_CAP_NONE) return false;
+    return (c->perms & requested_perms) == requested_perms;
+}

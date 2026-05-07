@@ -6,13 +6,45 @@
 #include "multikernel/syscall.h"
 #include "multikernel/kernelcall.h"
 #include "multikernel/captable.h"
+#include "multikernel/service.h"
 
 int mk_syscall_obtain(struct mk_vpe *vpe,
                       const char *service_name, uint16_t perms,
                       uint16_t *out_sel)
 {
-    (void)vpe; (void)service_name; (void)perms; (void)out_sel;
-    return -38;  /* -ENOSYS until Phase B SERVICE directory */
+    if (!vpe || !service_name || !out_sel) return -1;
+    const struct mk_service_entry *svc = mk_service_find(service_name);
+    if (!svc) return -2;       /* service not found */
+
+    /* Concern 4 — selector reservation. alloc_sel marks the slot before
+     * we install anything, so a concurrent OBTAIN/DELEGATE on the same
+     * VPE cannot race for the same selector. */
+    int sel = mk_vpe_alloc_sel(vpe);
+    if (sel < 0) return -3;
+
+    /* Create a SESSION cap as the result of OBTAIN. The session is the
+     * holder's handle to the service; sub-caps (EP + MEM) are created
+     * lazily by the application via DELEGATE. Monotonic perms applies:
+     * effective = svc->perms ∩ requested. */
+    uint16_t effective_perms = (uint16_t)(svc->perms & perms);
+    if (effective_perms == 0) {
+        mk_vpe_clear_sel(vpe, (uint16_t)sel);
+        return -4;
+    }
+    mk_cap_id_t dst = MK_CAP_NONE, src = MK_CAP_NONE;
+    int rc = mk_cap_grant(vpe->kid, vpe->vpe_id,
+                          MK_CAP_SESSION, effective_perms,
+                          /*frame_idx=*/(uint16_t)sel,
+                          /*label=*/(uint64_t)svc->kid << 32 |
+                                    (uint32_t)svc->vpe_id,
+                          MK_CAP_NONE, &dst, &src);
+    if (rc != 0) {
+        mk_vpe_clear_sel(vpe, (uint16_t)sel);
+        return rc;
+    }
+    mk_vpe_bind_sel(vpe, (uint16_t)sel, dst);
+    *out_sel = (uint16_t)sel;
+    return 0;
 }
 
 int mk_syscall_activate(struct mk_vpe *vpe, uint16_t sel, uint16_t ep_id)

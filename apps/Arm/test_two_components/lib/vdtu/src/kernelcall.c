@@ -17,6 +17,7 @@
 #include <string.h>
 #include "multikernel/kernelcall.h"
 #include "multikernel/revocations.h"
+#include "multikernel/service.h"
 
 /* This module learns its own kid at runtime from the MHT (mht->self_kid).
  * No compile-time MULTIKERNEL_KID dependency here — ComponentC carries it. */
@@ -347,6 +348,61 @@ static int do_revoke_subtree(int root_idx)
     return removed;
 }
 
+/* Concern 5 — service announcement / withdraw broadcast. Sends one
+ * message per peer kernel. When self_kid is the sender, peers iterate
+ * 0..MULTIKERNEL_NUM_KIDS-1 and skip self. We don't have a num_kids
+ * value at this layer; in the 2-kernel topology the only peer is
+ * `1 - self`. For an N-kernel future, this becomes a loop over the
+ * MHT. */
+void mk_kc_broadcast_service_announce(const char *name,
+                                      uint16_t kid, uint16_t vpe_id,
+                                      uint16_t recv_ep_sel, uint16_t perms)
+{
+    /* Send to peer (the not-self kid). 2-kernel topology assumed. */
+    uint16_t peer = (uint16_t)(g_self_kid == 0 ? 1 : 0);
+    struct mk_msg_service_announce m;
+    memset(&m, 0, sizeof(m));
+    m.hdr.msg_type   = MK_MSG_SERVICE_ANNOUNCE;
+    m.hdr.src_kid    = (uint8_t)g_self_kid;
+    m.hdr.dst_kid    = (uint8_t)peer;
+    m.hdr.req_id     = mk_kc_next_req_id();
+    strncpy(m.name, name, MK_SERVICE_NAME_MAX_WIRE - 1);
+    m.name[MK_SERVICE_NAME_MAX_WIRE - 1] = '\0';
+    m.owner_kid    = kid;
+    m.owner_vpe    = vpe_id;
+    m.recv_ep_sel  = recv_ep_sel;
+    m.perms        = perms;
+    send_msg(peer, &m, sizeof(m));
+}
+
+void mk_kc_broadcast_service_withdraw(const char *name)
+{
+    uint16_t peer = (uint16_t)(g_self_kid == 0 ? 1 : 0);
+    /* Reuse the announce body shape; perms=0 sentinel = withdraw if
+     * receiver is older. We use the dedicated MK_MSG_SERVICE_WITHDRAW
+     * type for clarity. */
+    struct mk_msg_service_announce m;
+    memset(&m, 0, sizeof(m));
+    m.hdr.msg_type = MK_MSG_SERVICE_WITHDRAW;
+    m.hdr.src_kid  = (uint8_t)g_self_kid;
+    m.hdr.dst_kid  = (uint8_t)peer;
+    m.hdr.req_id   = mk_kc_next_req_id();
+    strncpy(m.name, name, MK_SERVICE_NAME_MAX_WIRE - 1);
+    m.name[MK_SERVICE_NAME_MAX_WIRE - 1] = '\0';
+    send_msg(peer, &m, sizeof(m));
+}
+
+static void handle_service_announce(const struct mk_msg_service_announce *m)
+{
+    mk_service_handle_announce(m->name, m->owner_kid, m->owner_vpe,
+                               m->recv_ep_sel, m->perms);
+}
+
+static void handle_service_withdraw(const struct mk_msg_service_announce *m)
+{
+    mk_service_handle_withdraw(m->name);
+}
+
 static void handle_revoke_finish(const struct mk_msg_revoke_finish *m)
 {
     struct mk_kc_reply_slot *s = find_pending(m->hdr.req_id);
@@ -397,6 +453,12 @@ static void handler_thread(void *arg)
         case MK_MSG_REVOKE_FINISH:
             handle_revoke_finish((const struct mk_msg_revoke_finish *)vm->data);
             break;
+        case MK_MSG_SERVICE_ANNOUNCE:
+            handle_service_announce((const struct mk_msg_service_announce *)vm->data);
+            break;
+        case MK_MSG_SERVICE_WITHDRAW:
+            handle_service_withdraw((const struct mk_msg_service_announce *)vm->data);
+            break;
         default:
             fprintf(stderr, "kid=%u: unknown msg_type=0x%x req_id=%u\n",
                     g_self_kid, h->msg_type, h->req_id);
@@ -441,6 +503,7 @@ int mk_kc_init(void *pool_vaddr, struct mht *mht)
 
     mk_captable_init();
     mk_rev_init();
+    mk_service_init();
     memset(g_pending, 0, sizeof(g_pending));
     memset(&g_stats, 0, sizeof(g_stats));
 

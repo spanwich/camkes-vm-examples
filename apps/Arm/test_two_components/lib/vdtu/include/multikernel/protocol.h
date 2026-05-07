@@ -130,6 +130,18 @@ struct __attribute__((packed)) mk_msg_revoke_finish {
     uint64_t          _pad;
 };
 
+/* SERVICE_ANNOUNCE — broadcast a newly registered service to all peer
+ * kernels (Concern 5). SERVICE_WITHDRAW reverses it. */
+#define MK_SERVICE_NAME_MAX_WIRE 32
+struct __attribute__((packed)) mk_msg_service_announce {
+    struct mk_msg_hdr hdr;
+    char              name[MK_SERVICE_NAME_MAX_WIRE];
+    uint16_t          owner_kid;
+    uint16_t          owner_vpe;
+    uint16_t          recv_ep_sel;
+    uint16_t          perms;
+};
+
 /* Helper: fixed slot size for the control ring on frame 0/1 of the pool.
  * 4 KiB per ring frame minus 64 B ctrl = 4032 B, divided by 64 B/slot
  * gives 63 slots; round down to a power of two = 32. Each slot must

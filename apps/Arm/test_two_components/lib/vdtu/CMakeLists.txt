@@ -18,6 +18,7 @@ add_library(multikernel_vdtu STATIC EXCLUDE_FROM_ALL
     src/revocations.c
     src/vpe.c
     src/syscall.c
+    src/service.c
 )
 
 target_include_directories(multikernel_vdtu PUBLIC include)

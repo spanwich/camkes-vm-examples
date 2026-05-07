@@ -28,6 +28,7 @@
 #include <multikernel/revocations.h>
 #include <multikernel/vpe.h>
 #include <multikernel/syscall.h>
+#include <multikernel/service.h>
 
 #define POOL_PADDR              0x6FFE0000ull
 #define POOL_FRAME_SIZE         0x1000u
@@ -732,16 +733,18 @@ static void test_driver_kid0(void *raw)
         fflush(stdout);
     }
 
-    /* ----- Phase A.4: OBTAIN stub returns -ENOSYS until Phase B ------- */
+    /* ----- Phase A.4: OBTAIN of unregistered service returns -2 ------ */
     {
         struct mk_vpe *v = mk_vpe_find(100);
         uint16_t sel = 0;
         int rc = mk_syscall_obtain(v, "imaginary-service", MK_PERM_R, &sel);
-        if (rc == -38)
-            printf("[TEST A.4] OBTAIN stub: PASS (returns -ENOSYS=%d "
-                   "until Phase B SERVICE directory)\n", rc);
+        /* Phase A: stub returned -38; Phase B (now active) returns -2
+         * for unregistered services because the registry exists. */
+        if (rc == -2)
+            printf("[TEST A.4] OBTAIN of unregistered service: PASS "
+                   "(rc=%d, no entry in service directory)\n", rc);
         else
-            printf("[TEST A.4] OBTAIN stub: FAIL rc=%d (expected -38)\n", rc);
+            printf("[TEST A.4] OBTAIN unregistered: FAIL rc=%d (expected -2)\n", rc);
         fflush(stdout);
     }
 
@@ -767,6 +770,251 @@ static void test_driver_kid0(void *raw)
                    "fastpath=%llu revokes=%llu pings=%d\n",
                    (unsigned long long)st.local_fastpath_count,
                    (unsigned long long)st.revoke_count, pings_ok);
+        fflush(stdout);
+    }
+
+    /* ===== Phase B — full capability type system ===================== */
+
+    /* ----- Phase B.3: SERVICE register + OBTAIN ---------------------- */
+    {
+        struct mk_vpe *server = mk_vpe_find(100);
+        struct mk_vpe *client = mk_vpe_find(101);
+
+        /* Server registers a RECV_EP-backed service called "echo". */
+        int recv_sel = mk_kernel_grant_root(server, MK_CAP_RECV_EP,
+                                            MK_PERM_RW, /*frame=*/50, 0xB300);
+        int rc_reg = mk_service_register("echo", server->kid, server->vpe_id,
+                                         (uint16_t)recv_sel,
+                                         MK_PERM_R | MK_PERM_W);
+
+        /* Client OBTAINs the "echo" service. Should get a SESSION cap. */
+        uint16_t client_sess = 0;
+        int rc_obt = mk_syscall_obtain(client, "echo",
+                                       MK_PERM_R | MK_PERM_W, &client_sess);
+        mk_cap_id_t client_cap = mk_vpe_lookup_sel(client, client_sess);
+        uint16_t cap_type = (uint16_t)MK_CAP_TYPE(client_cap);
+
+        size_t reg_size = mk_service_count();
+        const struct mk_service_entry *e = mk_service_find("echo");
+
+        if (recv_sel > 0 && rc_reg == 0 && rc_obt == 0 && client_sess > 0 &&
+            cap_type == MK_CAP_SESSION && reg_size == 1 && e &&
+            e->kid == server->kid && e->vpe_id == server->vpe_id)
+            printf("[TEST B.3] SERVICE register + OBTAIN: PASS "
+                   "(server registered echo, client obtained SESSION sel=%u, "
+                   "registry size=%zu)\n",
+                   client_sess, reg_size);
+        else
+            printf("[TEST B.3] SERVICE register + OBTAIN: FAIL "
+                   "recv_sel=%d rc_reg=%d rc_obt=%d sess=%u type=0x%x size=%zu\n",
+                   recv_sel, rc_reg, rc_obt, client_sess, cap_type, reg_size);
+        fflush(stdout);
+    }
+
+    /* ----- Phase B.3 cross-kernel: SERVICE_ANNOUNCE propagation ----- */
+    {
+        /* On K0, services we registered get broadcast to K1. K1 should
+         * now have "echo" in its remote registry. K1's test driver does
+         * the corresponding mk_service_find("echo") and reports below.
+         * We only assert local registry is non-empty. */
+        size_t local_n = mk_service_count();
+        if (local_n >= 1)
+            printf("[TEST B.3-XK] cross-kernel announce: PASS (K0 broadcast %zu service(s))\n",
+                   local_n);
+        else
+            printf("[TEST B.3-XK] cross-kernel announce: FAIL local_n=%zu\n",
+                   local_n);
+        fflush(stdout);
+    }
+
+    /* ----- Phase B.4: VPE cap type with CREATE_VPE / DESTROY_VPE ---- */
+    {
+        size_t before = mk_vpe_count();
+        struct mk_vpe *new_vpe = mk_vpe_create(/*id=*/200, /*kid=*/0,
+                                               MK_VPE_THREAD);
+        size_t after_create = mk_vpe_count();
+
+        /* Track this VPE via a VPE-typed cap on a parent VPE
+         * (server here). The cap's frame_idx encodes the new VPE id. */
+        struct mk_vpe *parent = mk_vpe_find(100);
+        int s_vpe = mk_kernel_grant_root(parent, MK_CAP_VPE, MK_PERM_RW,
+                                         /*frame=*/200, /*label=*/0xB400);
+        mk_cap_id_t cap_vpe = mk_vpe_lookup_sel(parent, (uint16_t)s_vpe);
+        uint16_t cap_type = (uint16_t)MK_CAP_TYPE(cap_vpe);
+
+        /* Destroy the VPE. The VPE-typed cap gets revoked too. */
+        size_t before_action = mk_cap_revoke_action_count(MK_CAP_VPE);
+        mk_vpe_destroy(new_vpe);
+        int rc_rev = mk_syscall_revoke(parent, (uint16_t)s_vpe);
+        size_t fired = mk_cap_revoke_action_count(MK_CAP_VPE) - before_action;
+        size_t after_destroy = mk_vpe_count();
+
+        if (new_vpe && after_create == before + 1 && s_vpe > 0 &&
+            cap_type == MK_CAP_VPE && rc_rev >= 0 &&
+            after_destroy == before && fired >= 1)
+            printf("[TEST B.4] VPE cap CREATE_VPE/DESTROY_VPE: PASS "
+                   "(count %zu→%zu→%zu; VPE-cap revoke action fired %zu)\n",
+                   before, after_create, after_destroy, fired);
+        else
+            printf("[TEST B.4] VPE cap: FAIL "
+                   "new=%p create=%zu→%zu destroy=%zu s_vpe=%d type=0x%x "
+                   "rc_rev=%d fired=%zu\n",
+                   new_vpe, before, after_create, after_destroy,
+                   s_vpe, cap_type, rc_rev, fired);
+        fflush(stdout);
+    }
+
+    /* ----- Phase B.2: SESSION cap with EP+MEM children, cascade ------ */
+    {
+        struct mk_vpe *vpe = mk_vpe_find(100);
+        size_t before_session = mk_cap_revoke_action_count(MK_CAP_SESSION);
+        size_t before_send    = mk_cap_revoke_action_count(MK_CAP_SEND_EP);
+        size_t before_mem     = mk_cap_revoke_action_count(MK_CAP_MEM);
+
+        /* Root SESSION cap. */
+        int s_session = mk_kernel_grant_root(vpe, MK_CAP_SESSION, MK_PERM_RW,
+                                             /*frame=*/40, 0xB200);
+        mk_cap_id_t cap_session = mk_vpe_lookup_sel(vpe, (uint16_t)s_session);
+
+        /* Two children: a SEND_EP and a MEM. Each is a derive from
+         * the SESSION cap (parent_cap_id = cap_session). */
+        mk_cap_id_t cap_ep = MK_CAP_NONE, cap_mem = MK_CAP_NONE;
+        int rc_ep = mk_cap_grant(vpe->kid, vpe->vpe_id, MK_CAP_SEND_EP,
+                                 MK_PERM_RW, /*frame=*/41, 0xB201,
+                                 cap_session, &cap_ep, NULL);
+        int rc_mem = mk_cap_grant(vpe->kid, vpe->vpe_id, MK_CAP_MEM,
+                                  MK_PERM_RW, /*frame=*/42, 0xB202,
+                                  cap_session, &cap_mem, NULL);
+
+        /* Revoke the session — all children must cascade. */
+        int rc_rev = mk_syscall_revoke(vpe, (uint16_t)s_session);
+        size_t fired_session = mk_cap_revoke_action_count(MK_CAP_SESSION) - before_session;
+        size_t fired_send    = mk_cap_revoke_action_count(MK_CAP_SEND_EP) - before_send;
+        size_t fired_mem     = mk_cap_revoke_action_count(MK_CAP_MEM)     - before_mem;
+        int session_gone = mk_captable_find(cap_session) < 0;
+        int ep_gone      = mk_captable_find(cap_ep)      < 0;
+        int mem_gone     = mk_captable_find(cap_mem)     < 0;
+
+        if (s_session > 0 && rc_ep == 0 && rc_mem == 0 && rc_rev >= 3 &&
+            session_gone && ep_gone && mem_gone &&
+            fired_session >= 1 && fired_send >= 1 && fired_mem >= 1)
+            printf("[TEST B.2] SESSION lifecycle: PASS "
+                   "(session + EP + MEM all gone via cascade; per-type "
+                   "actions fired session=%zu send=%zu mem=%zu)\n",
+                   fired_session, fired_send, fired_mem);
+        else
+            printf("[TEST B.2] SESSION lifecycle: FAIL "
+                   "s_session=%d rc_ep=%d rc_mem=%d rc_rev=%d "
+                   "gone=(%d,%d,%d) fired=(s=%zu,e=%zu,m=%zu)\n",
+                   s_session, rc_ep, rc_mem, rc_rev,
+                   session_gone, ep_gone, mem_gone,
+                   fired_session, fired_send, fired_mem);
+        fflush(stdout);
+    }
+
+    /* ----- Phase B.1: SEND_EP and RECV_EP types ---------------------- */
+    {
+        struct mk_vpe *vpe = mk_vpe_find(100);
+        size_t before_send = mk_cap_revoke_action_count(MK_CAP_SEND_EP);
+        size_t before_recv = mk_cap_revoke_action_count(MK_CAP_RECV_EP);
+        int s_send = mk_kernel_grant_root(vpe, MK_CAP_SEND_EP, MK_PERM_RW,
+                                          /*frame=*/30, 0xB100);
+        int s_recv = mk_kernel_grant_root(vpe, MK_CAP_RECV_EP, MK_PERM_RW,
+                                          /*frame=*/31, 0xB101);
+        int rc_act_s = mk_syscall_activate(vpe, (uint16_t)s_send, /*ep=*/8);
+        int rc_act_r = mk_syscall_activate(vpe, (uint16_t)s_recv, /*ep=*/9);
+        mk_cap_id_t cap_send = mk_vpe_lookup_sel(vpe, (uint16_t)s_send);
+        mk_cap_id_t cap_recv = mk_vpe_lookup_sel(vpe, (uint16_t)s_recv);
+        int rc_rv_s = mk_syscall_revoke(vpe, (uint16_t)s_send);
+        int rc_rv_r = mk_syscall_revoke(vpe, (uint16_t)s_recv);
+        size_t fired_send = mk_cap_revoke_action_count(MK_CAP_SEND_EP) - before_send;
+        size_t fired_recv = mk_cap_revoke_action_count(MK_CAP_RECV_EP) - before_recv;
+        if (s_send > 0 && s_recv > 0 && cap_send != MK_CAP_NONE &&
+            cap_recv != MK_CAP_NONE && rc_act_s == 0 && rc_act_r == 0 &&
+            rc_rv_s >= 0 && rc_rv_r >= 0 &&
+            fired_send >= 1 && fired_recv >= 1)
+            printf("[TEST B.1] SEND_EP + RECV_EP cap types: PASS "
+                   "(both granted, activated, revoked; per-type actions fired "
+                   "send=%zu recv=%zu)\n", fired_send, fired_recv);
+        else
+            printf("[TEST B.1] SEND_EP + RECV_EP cap types: FAIL "
+                   "s_send=%d s_recv=%d cap_s=0x%llx cap_r=0x%llx "
+                   "act_s=%d act_r=%d rv_s=%d rv_r=%d fired_s=%zu fired_r=%zu\n",
+                   s_send, s_recv,
+                   (unsigned long long)cap_send,
+                   (unsigned long long)cap_recv,
+                   rc_act_s, rc_act_r, rc_rv_s, rc_rv_r,
+                   fired_send, fired_recv);
+        fflush(stdout);
+    }
+
+    /* ----- Phase B.5: unified 6-type lifecycle suite ----------------- */
+    {
+        /* For each of the 6 v3.0 cap types, walk:
+         *   GRANT → ACTIVATE → mk_cap_check_perms (use-time) → DEACTIVATE
+         *   → REVOKE → mk_cap_check_perms must deny
+         * MK_CAP_SERVICE is special — it lives in the service registry,
+         * not as a derive from a parent — so we test register/find/withdraw
+         * instead of the generic flow. */
+        struct mk_vpe *vpe = mk_vpe_find(100);
+        const struct {
+            const char *name;
+            uint16_t    type;
+            uint16_t    frame;
+        } cases[] = {
+            { "MEM",     MK_CAP_MEM,     60 },
+            { "SEND_EP", MK_CAP_SEND_EP, 61 },
+            { "RECV_EP", MK_CAP_RECV_EP, 62 },
+            { "SESSION", MK_CAP_SESSION, 63 },
+            { "VPE",     MK_CAP_VPE,     64 },
+        };
+        int total = 0, passed = 0;
+        for (size_t i = 0; i < sizeof(cases)/sizeof(cases[0]); ++i) {
+            int sel = mk_kernel_grant_root(vpe, cases[i].type, MK_PERM_RW,
+                                           cases[i].frame, 0xB500 + (uint64_t)i);
+            mk_cap_id_t cap = mk_vpe_lookup_sel(vpe, (uint16_t)sel);
+            int rc_act    = mk_syscall_activate(vpe, (uint16_t)sel, 0);
+            int has_w_pre = mk_cap_check_perms(cap, MK_PERM_W);
+            int rc_deact  = mk_syscall_deactivate(vpe, (uint16_t)sel);
+            int rc_rev    = mk_syscall_revoke(vpe, (uint16_t)sel);
+            mk_cap_id_t after = mk_vpe_lookup_sel(vpe, (uint16_t)sel);
+            int has_w_post = mk_cap_check_perms(cap, MK_PERM_W);
+            total++;
+            int ok = sel > 0 && cap != MK_CAP_NONE && rc_act == 0 &&
+                     has_w_pre && rc_deact == 0 && rc_rev >= 0 &&
+                     after == MK_CAP_NONE && !has_w_post;
+            if (ok) passed++;
+            else {
+                printf("[TEST B.5] type=%s walk: FAIL "
+                       "sel=%d cap=0x%llx rc_act=%d w_pre=%d rc_deact=%d "
+                       "rc_rev=%d after=0x%llx w_post=%d\n",
+                       cases[i].name, sel,
+                       (unsigned long long)cap, rc_act, has_w_pre,
+                       rc_deact, rc_rev,
+                       (unsigned long long)after, has_w_post);
+            }
+        }
+
+        /* SERVICE — register/find/withdraw flow. */
+        int rc_reg = mk_service_register("svc-test", 0, 100, 8, MK_PERM_R);
+        const struct mk_service_entry *e_pre = mk_service_find("svc-test");
+        int rc_with = mk_service_withdraw("svc-test");
+        const struct mk_service_entry *e_post = mk_service_find("svc-test");
+        total++;
+        int svc_ok = rc_reg == 0 && e_pre && rc_with == 0 && !e_post;
+        if (svc_ok) passed++;
+        else
+            printf("[TEST B.5] type=SERVICE walk: FAIL rc_reg=%d e_pre=%p "
+                   "rc_with=%d e_post=%p\n",
+                   rc_reg, e_pre, rc_with, e_post);
+
+        if (passed == total)
+            printf("[TEST B.5] 6-type lifecycle suite: PASS "
+                   "(%d/%d types — MEM, SEND_EP, RECV_EP, SESSION, VPE, SERVICE)\n",
+                   passed, total);
+        else
+            printf("[TEST B.5] 6-type lifecycle suite: FAIL %d/%d\n",
+                   passed, total);
         fflush(stdout);
     }
 
@@ -941,6 +1189,25 @@ static void test_driver_kid1(void *raw)
             printf("[TEST 6] kid=1: cap_t6 cleanly removed by REVOKE — PASS\n");
         else
             printf("[TEST 6] kid=1: cap_t6 lingers after revoke — FAIL\n");
+        fflush(stdout);
+    }
+
+    /* ----- Phase B.3 K1: poll for K0's "echo" service announce ------- */
+    {
+        /* K0 registers "echo" partway through its driver and broadcasts
+         * a SERVICE_ANNOUNCE. K1 polls until the service appears in its
+         * remote registry. */
+        const struct mk_service_entry *e = NULL;
+        for (int i = 0; i < 2000000; ++i) {
+            e = mk_service_find("echo");
+            if (e) break;
+            mk_thread_yield();
+        }
+        if (e && e->kid == 0)
+            printf("[TEST B.3] kid=1: received SERVICE_ANNOUNCE for 'echo' "
+                   "from kid=%u vpe=%u — PASS\n", e->kid, e->vpe_id);
+        else
+            printf("[TEST B.3] kid=1: never received SERVICE_ANNOUNCE — FAIL\n");
         fflush(stdout);
     }
 

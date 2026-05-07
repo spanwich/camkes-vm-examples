@@ -305,6 +305,63 @@ static void test_driver_kid0(void *raw)
         printf("[TEST 7] Ping-pong: FAIL (only %d/8)\n", pings_ok);
     fflush(stdout);
 
+    /* ----- Phase C.1: Monotonic permission restriction (intra-kernel) -- */
+    {
+        /* Grant parent with R-only at frame_idx=11. Derive a child to
+         * vpe=4 requesting RW (3). Child's perms must end up R (1). */
+        const uint16_t f = 11;
+        mk_cap_id_t parent_id = MK_CAP_NONE, _src = MK_CAP_NONE;
+        int rcp = mk_cap_grant(/*dst_kid=*/0, /*dst_vpe=*/3,
+                               MK_CAP_MEM, MK_PERM_R, f, 0xC100,
+                               MK_CAP_NONE, &parent_id, &_src);
+        if (rcp != 0) {
+            printf("[TEST C.1] parent grant FAILED rc=%d\n", rcp);
+        } else {
+            mk_cap_id_t child_id = MK_CAP_NONE;
+            int rcc = mk_cap_grant(/*dst_kid=*/0, /*dst_vpe=*/4,
+                                   MK_CAP_MEM, MK_PERM_RW, f, 0xC110,
+                                   parent_id, &child_id, NULL);
+            int idx = mk_captable_find(child_id);
+            struct mk_cap *child = idx >= 0 ? mk_captable_at(idx) : NULL;
+            if (rcc == 0 && child && child->perms == MK_PERM_R)
+                printf("[TEST C.1] Monotonic perms: PASS "
+                       "(requested RW, parent R-only → child perms=R)\n");
+            else
+                printf("[TEST C.1] Monotonic perms: FAIL rc=%d child.perms=%d "
+                       "(expected %d=R)\n",
+                       rcc, child ? child->perms : -1, MK_PERM_R);
+            mk_cap_revoke(parent_id);  /* clean up subtree */
+        }
+        fflush(stdout);
+    }
+
+    /* ----- Phase C.1 TOCTOU: parent revoked while derivation in flight -- */
+    {
+        /* Local fast-path: the AND happens BEFORE installing, so revoking
+         * the parent right after grant should not leave the child with
+         * un-ANDed perms. Simulate by: grant parent R, derive child RW
+         * (gets R), revoke parent, verify child also gone (cascade). */
+        const uint16_t f = 12;
+        mk_cap_id_t p = MK_CAP_NONE, _s = MK_CAP_NONE;
+        if (mk_cap_grant(0, 3, MK_CAP_MEM, MK_PERM_R, f, 0xC1A0,
+                         MK_CAP_NONE, &p, &_s) == 0) {
+            mk_cap_id_t c = MK_CAP_NONE;
+            mk_cap_grant(0, 4, MK_CAP_MEM, MK_PERM_RW, f, 0xC1A1,
+                         p, &c, NULL);
+            int rc = mk_cap_revoke(p);  /* parent + child gone */
+            int p_gone = mk_captable_find(p) < 0;
+            int c_gone = mk_captable_find(c) < 0;
+            if (rc >= 0 && p_gone && c_gone)
+                printf("[TEST C.1-TOCTOU] cascade revoke: PASS "
+                       "(parent + child both gone, no orphan with un-ANDed perms)\n");
+            else
+                printf("[TEST C.1-TOCTOU] cascade revoke: FAIL "
+                       "rc=%d p_gone=%d c_gone=%d\n",
+                       rc, p_gone, c_gone);
+        }
+        fflush(stdout);
+    }
+
     /* Stats summary. */
     struct mk_kc_stats st;
     mk_kc_get_stats(&st);

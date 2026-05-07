@@ -479,23 +479,33 @@ int mk_cap_grant(uint16_t dst_kid, uint16_t dst_vpe,
      * a fresh donor cap and install it locally; for a derived grant we
      * use the caller-supplied parent_cap_id (which must already be in
      * the donor's CapTable — typically because we received it earlier
-     * via EXCHANGE_OFFER from another kernel). */
+     * via EXCHANGE_OFFER from another kernel).
+     *
+     * Phase C.1 — monotonic perm restriction: derived grants MUST have
+     * perms ⊆ parent's perms. AND requested perms with parent's perms.
+     * Enforced at grant-time, before OFFER goes out (sender side is the
+     * security boundary; receiver trusts the OFFER's perms field). */
     mk_cap_id_t src_cap;
+    uint16_t effective_perms = perms;
     if (parent_cap_id == MK_CAP_NONE) {
         src_cap = MK_CAP_ID(g_self_kid, /* donor vpe */ 0, type, frame_idx);
         if (mk_captable_find(src_cap) < 0) {
-            mk_captable_install(src_cap, MK_CAP_NONE, type, perms,
+            mk_captable_install(src_cap, MK_CAP_NONE, type, effective_perms,
                                 frame_idx, g_self_kid, label);
         }
     } else {
         src_cap = parent_cap_id;
+        int pidx = mk_captable_find(parent_cap_id);
+        if (pidx < 0) return -3;   /* parent must exist locally */
+        struct mk_cap *p = mk_captable_at(pidx);
+        if (p) effective_perms &= p->perms;
     }
 
     /* Local fast path — avoid the ring entirely. */
     if (dst_kid == g_self_kid) {
         mk_cap_id_t local_dst = MK_CAP_ID(g_self_kid, dst_vpe, type, frame_idx);
-        if (mk_captable_install(local_dst, src_cap, type, perms, frame_idx,
-                                g_self_kid, label) < 0) {
+        if (mk_captable_install(local_dst, src_cap, type, effective_perms,
+                                frame_idx, g_self_kid, label) < 0) {
             return -1;
         }
         g_stats.local_fastpath_count++;
@@ -518,7 +528,7 @@ int mk_cap_grant(uint16_t dst_kid, uint16_t dst_vpe,
     m.type         = type;
     m.dst_vpe      = dst_vpe;
     m.frame_idx    = frame_idx;
-    m.perms        = perms;
+    m.perms        = effective_perms;
     m.label        = label;
     if (send_msg(dst_kid, &m, sizeof(m)) != 0) {
         free_pending(s);
@@ -534,7 +544,7 @@ int mk_cap_grant(uint16_t dst_kid, uint16_t dst_vpe,
      * through it. parent_id is `src_cap` — which is either our freshly
      * installed donor root, or (for derived grants) the existing parent
      * we received earlier; both are guaranteed in our CapTable. */
-    mk_captable_install(dst_id, src_cap, type, perms, frame_idx,
+    mk_captable_install(dst_id, src_cap, type, effective_perms, frame_idx,
                         dst_kid, label);
 
     if (out_dst_cap_id) *out_dst_cap_id = dst_id;

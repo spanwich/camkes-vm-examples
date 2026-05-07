@@ -37,12 +37,28 @@ typedef uint64_t mk_cap_id_t;
 #define MK_CAP_TYPE(id) ((uint16_t)(((id) >> 16) & 0xFFFFu))
 #define MK_CAP_SEL(id)  ((uint16_t)( (id)        & 0xFFFFu))
 
-/* Capability types. */
+/* Capability types (v3.0 §2.1, six total). */
 enum mk_cap_type {
-    MK_CAP_NONE  = 0x0000,
-    MK_CAP_MEM   = 0x0008,   /* shared frame                 */
-    MK_CAP_MSG   = 0x0004,   /* DTU message endpoint          */
+    MK_CAP_NONE     = 0x0000,
+    MK_CAP_MEM      = 0x0008,   /* MEM_CAP — shared frame                 */
+    MK_CAP_MSG      = 0x0004,   /* legacy SEND-EP synonym (kept for tests) */
+    MK_CAP_SEND_EP  = 0x0040,   /* SEND_EP — invoke a service              */
+    MK_CAP_RECV_EP  = 0x0080,   /* RECV_EP — provide a service             */
+    MK_CAP_SESSION  = 0x0002,   /* SESSION — composite EP+MEM parent       */
+    MK_CAP_SERVICE  = 0x0001,   /* SERVICE — registry entry                */
+    MK_CAP_VPE      = 0x0020,   /* VPE — PE-slot lifecycle                 */
     MK_CAP_NULL_TYPE = 0xFFFF,
+};
+
+/* Permission bits (v3.0 §2.2). */
+enum mk_perm {
+    MK_PERM_R = 0x1,
+    MK_PERM_W = 0x2,
+    MK_PERM_X = 0x4,
+    MK_PERM_D = 0x8,             /* delegate                                */
+    MK_PERM_RW = MK_PERM_R | MK_PERM_W,
+    MK_PERM_RWX = MK_PERM_R | MK_PERM_W | MK_PERM_X,
+    MK_PERM_ALL = MK_PERM_R | MK_PERM_W | MK_PERM_X | MK_PERM_D,
 };
 
 /* Control-plane message types. */
@@ -55,6 +71,8 @@ enum mk_msg_type {
     MK_MSG_REVOKE        = 0x20,
     MK_MSG_REVOKE_BATCH  = 0x21,
     MK_MSG_REVOKE_FINISH = 0x22,
+    MK_MSG_SERVICE_ANNOUNCE = 0x30, /* Concern 5: cross-kernel service registry */
+    MK_MSG_SERVICE_WITHDRAW = 0x31,
 };
 
 /* Wire-format header for every cross-kernel control message. Total 16 B

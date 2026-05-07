@@ -141,6 +141,22 @@ int vdtu_ring_init(struct vdtu_ring *ring, void *mem,
 
 int vdtu_ring_attach(struct vdtu_ring *ring, void *mem);
 
+/* Phase C.3: explicit lifecycle transitions via vdtu_ep_state_transition
+ * (the F*-verified function). Any out-of-order transition is rejected.
+ *
+ * vdtu_ring_init drives UNCONFIGURED → CONFIGURED → ACTIVE internally,
+ * so existing call sites work unchanged. vdtu_ring_detach drives
+ * ACTIVE → TERMINATED (requires blocked=true). After TERMINATED, send
+ * and fetch must fail. */
+int vdtu_ring_detach(struct vdtu_ring *ring);
+
+/* Direct access to the EP state for tests + state-aware code paths. */
+static inline vdtu_ep_state_t vdtu_ring_get_state(const struct vdtu_ring *ring)
+{
+    if (!ring || !ring->ctrl) return VDTU_EP_UNCONFIGURED;
+    return __atomic_load_n(&ring->ctrl->ep_state, __ATOMIC_ACQUIRE);
+}
+
 static inline size_t vdtu_ring_total_size(uint32_t slot_count, uint32_t slot_size) {
     return VDTU_RING_CTRL_SIZE + (size_t)slot_count * slot_size;
 }

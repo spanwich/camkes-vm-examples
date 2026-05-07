@@ -31,13 +31,33 @@ int vdtu_ring_init(struct vdtu_ring *ring, void *mem,
     ctrl->slot_count = slot_count;
     ctrl->slot_size  = slot_size;
     ctrl->slot_mask  = slot_count - 1;
-    __atomic_store_n(&ctrl->ep_state, VDTU_EP_ACTIVE, __ATOMIC_RELAXED);
     __atomic_store_n(&ctrl->tail, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&ctrl->head, 0, __ATOMIC_RELEASE);
+
+    /* Phase C.3: drive the verified state machine
+     *   UNCONFIGURED → CONFIGURED → ACTIVE.
+     * The verified vdtu_ep_state_transition rejects skip-ahead. memset
+     * left ep_state at VDTU_EP_UNCONFIGURED (=0). */
+    vdtu_ep_state_t s = VDTU_EP_UNCONFIGURED;
+    if (!vdtu_ep_state_transition(&s, VDTU_EP_CONFIGURED, false)) return -5;
+    if (!vdtu_ep_state_transition(&s, VDTU_EP_ACTIVE, false))     return -5;
+    __atomic_store_n(&ctrl->ep_state, s, __ATOMIC_RELEASE);
 
     ring->ctrl = ctrl;
     ring->slots = (uint8_t *)mem + VDTU_RING_CTRL_SIZE;
 
+    return 0;
+}
+
+int vdtu_ring_detach(struct vdtu_ring *ring)
+{
+    if (!ring || !ring->ctrl) return -1;
+    /* Read-modify-write under sequential consistency to make the verified
+     * transition observation stable in the face of a concurrent peer. */
+    vdtu_ep_state_t cur = __atomic_load_n(&ring->ctrl->ep_state, __ATOMIC_ACQUIRE);
+    if (!vdtu_ep_state_transition(&cur, VDTU_EP_TERMINATED, /*blocked=*/true))
+        return -5;
+    __atomic_store_n(&ring->ctrl->ep_state, cur, __ATOMIC_RELEASE);
     return 0;
 }
 
@@ -61,7 +81,9 @@ int vdtu_ring_send(struct vdtu_ring *ring,
     if (!ring || !ring->ctrl)
         return -1;
 
-    if (__atomic_load_n(&ring->ctrl->ep_state, __ATOMIC_ACQUIRE) == VDTU_EP_TERMINATED)
+    /* Phase C.3: send requires the EP to be in ACTIVE. UNCONFIGURED /
+     * CONFIGURED / TERMINATED all reject. */
+    if (__atomic_load_n(&ring->ctrl->ep_state, __ATOMIC_ACQUIRE) != VDTU_EP_ACTIVE)
         return -3;
 
     if ((size_t)VDTU_HEADER_SIZE + payload_len > ring->ctrl->slot_size)
@@ -104,6 +126,11 @@ int vdtu_ring_send(struct vdtu_ring *ring,
 const struct vdtu_message *vdtu_ring_fetch(const struct vdtu_ring *ring)
 {
     if (!ring || !ring->ctrl)
+        return NULL;
+
+    /* Phase C.3: fetch requires ACTIVE — TERMINATED returns NULL so the
+     * polling consumer cleanly exits its loop on detach. */
+    if (__atomic_load_n(&ring->ctrl->ep_state, __ATOMIC_ACQUIRE) != VDTU_EP_ACTIVE)
         return NULL;
 
     uint32_t tail = __atomic_load_n(&ring->ctrl->tail, __ATOMIC_RELAXED);

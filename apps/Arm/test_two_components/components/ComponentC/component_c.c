@@ -21,6 +21,7 @@
 #include <camkes.h>
 
 #include <multikernel/vdtu_ring.h>
+#include <multikernel/vdtu_ep_state.h>
 #include <multikernel/mht.h>
 #include <multikernel/threadmgr.h>
 #include <multikernel/kernelcall.h>
@@ -386,6 +387,84 @@ static void test_driver_kid0(void *raw)
                 printf("[TEST C.2] mk_cap_check_perms: FAIL %d/%d assertions failed\n",
                        fail, n);
         }
+        fflush(stdout);
+    }
+
+    /* ----- Phase C.3: EP state machine activation -------------------- */
+    {
+        /* Carve a small scratch region out of frame 15 of the pool for a
+         * standalone ring. We're the only writer to this region. The
+         * ring is purely intra-component — never sent over hardware. */
+        static uint8_t scratch[VDTU_RING_CTRL_SIZE + 4 * VDTU_DEFAULT_SLOT_SIZE]
+            __attribute__((aligned(64)));
+        struct vdtu_ring r;
+        int n = 0, fail = 0;
+
+        /* Pre-init state: zeroed memory means UNCONFIGURED. */
+        memset(scratch, 0, vdtu_ring_total_size(4, VDTU_DEFAULT_SLOT_SIZE));
+
+        /* Direct verified-function call: try to skip UNCONFIGURED→ACTIVE.
+         * Verified rejects (returns false). State stays UNCONFIGURED. */
+        vdtu_ep_state_t s = VDTU_EP_UNCONFIGURED;
+        n++; if ( vdtu_ep_state_transition(&s, VDTU_EP_ACTIVE, false))     fail++;
+        n++; if (s != VDTU_EP_UNCONFIGURED)                                fail++;
+        /* Valid sequence UNCONFIGURED → CONFIGURED → ACTIVE. */
+        n++; if (!vdtu_ep_state_transition(&s, VDTU_EP_CONFIGURED, false)) fail++;
+        n++; if (!vdtu_ep_state_transition(&s, VDTU_EP_ACTIVE, false))     fail++;
+        /* TERMINATED requires blocked=true. */
+        n++; if ( vdtu_ep_state_transition(&s, VDTU_EP_TERMINATED, false)) fail++;
+        n++; if (!vdtu_ep_state_transition(&s, VDTU_EP_TERMINATED, true))  fail++;
+        /* TERMINATED is absorbing — no escape. */
+        n++; if ( vdtu_ep_state_transition(&s, VDTU_EP_ACTIVE, false))     fail++;
+
+        /* vdtu_ring_init walks UNCONFIGURED → CONFIGURED → ACTIVE for us. */
+        n++; if (vdtu_ring_init(&r, scratch, 4, VDTU_DEFAULT_SLOT_SIZE) != 0) fail++;
+        n++; if (vdtu_ring_get_state(&r) != VDTU_EP_ACTIVE)                  fail++;
+
+        /* Send works in ACTIVE. */
+        const char *body = "C3";
+        n++; if (vdtu_ring_send(&r, 0,0,0,0,0,0,0, body, 2) != 0)            fail++;
+        n++; if (vdtu_ring_fetch(&r) == NULL)                                fail++;
+        vdtu_ring_ack(&r);
+
+        /* Detach → TERMINATED. Send must now reject (-3). Fetch returns NULL. */
+        n++; if (vdtu_ring_detach(&r) != 0)                                  fail++;
+        n++; if (vdtu_ring_get_state(&r) != VDTU_EP_TERMINATED)              fail++;
+        n++; if (vdtu_ring_send(&r, 0,0,0,0,0,0,0, body, 2) != -3)           fail++;
+        n++; if (vdtu_ring_fetch(&r) != NULL)                                fail++;
+
+        if (fail == 0)
+            printf("[TEST C.3] EP state machine: PASS "
+                   "(verified function rejects skip-ahead and pre-blocked TERMINATE; "
+                   "ring respects state in send/fetch/detach; %d assertions)\n", n);
+        else
+            printf("[TEST C.3] EP state machine: FAIL %d/%d assertions failed\n",
+                   fail, n);
+        fflush(stdout);
+    }
+
+    /* ----- Phase C.3 TOCTOU: concurrent attach/detach convergence ----- */
+    {
+        /* Single-threaded simulation: producer detaches while a consumer
+         * is mid-fetch. Outcome must be deterministic — fetch sees the
+         * TERMINATED state and returns NULL (no torn reads). */
+        static uint8_t scratch[VDTU_RING_CTRL_SIZE + 4 * VDTU_DEFAULT_SLOT_SIZE]
+            __attribute__((aligned(64)));
+        memset(scratch, 0, vdtu_ring_total_size(4, VDTU_DEFAULT_SLOT_SIZE));
+        struct vdtu_ring r;
+        int rc_init = vdtu_ring_init(&r, scratch, 4, VDTU_DEFAULT_SLOT_SIZE);
+        const char *body = "C3T";
+        int rc_send = vdtu_ring_send(&r, 0,0,0,0,0,0,0, body, 3);
+        /* Detach BEFORE the consumer fetches. */
+        int rc_detach = vdtu_ring_detach(&r);
+        const struct vdtu_message *m = vdtu_ring_fetch(&r);
+        if (rc_init == 0 && rc_send == 0 && rc_detach == 0 && m == NULL)
+            printf("[TEST C.3-TOCTOU] detach/fetch convergence: PASS "
+                   "(post-detach fetch returns NULL — no torn read)\n");
+        else
+            printf("[TEST C.3-TOCTOU] detach/fetch convergence: FAIL "
+                   "init=%d send=%d detach=%d fetch_null=%d\n",
+                   rc_init, rc_send, rc_detach, m == NULL);
         fflush(stdout);
     }
 

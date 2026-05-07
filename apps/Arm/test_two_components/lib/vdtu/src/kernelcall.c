@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "multikernel/kernelcall.h"
+#include "multikernel/revocations.h"
 
 /* This module learns its own kid at runtime from the MHT (mht->self_kid).
  * No compile-time MULTIKERNEL_KID dependency here — ComponentC carries it. */
@@ -429,6 +430,7 @@ int mk_kc_init(void *pool_vaddr, struct mht *mht)
     }
 
     mk_captable_init();
+    mk_rev_init();
     memset(g_pending, 0, sizeof(g_pending));
     memset(&g_stats, 0, sizeof(g_stats));
 
@@ -561,9 +563,48 @@ int mk_cap_grant(uint16_t dst_kid, uint16_t dst_vpe,
 
 int mk_cap_revoke(mk_cap_id_t cap_id)
 {
+    /* Phase C.4 — RevocationList: serialize concurrent revokers of the
+     * same cap. The first caller becomes the walker; subsequent callers
+     * subscribe, block on their own notify key, and inherit the walker's
+     * result on completion. Without this serialization, two threads
+     * (especially across kernels) could fan out duplicate REVOKE_BATCH
+     * messages and double-process the local subtree. */
+    bool is_walker = false;
+    struct mk_revocation *rev =
+        mk_rev_attach(cap_id, /*parent=*/MK_CAP_NONE, &is_walker);
+    if (!rev) {
+        /* Table full — fall back to direct walk; lose the convergence
+         * guarantee but don't deadlock. */
+        int idx = mk_captable_find(cap_id);
+        if (idx < 0) return -1;
+        int removed = do_revoke_subtree(idx);
+        g_stats.revoke_count++;
+        return removed;
+    }
+
+    if (!is_walker) {
+        /* Subscribe and wait for the walker. Our notify key is the
+         * address of a local stack variable — uniquely identifies this
+         * waiter to mk_thread_notify. */
+        volatile int my_notify_slot = 0;
+        if (mk_rev_subscribe(rev, (void *)&my_notify_slot) != 0) {
+            return -2;
+        }
+        while (!rev->done) {
+            mk_thread_wait_for((void *)&my_notify_slot);
+        }
+        return rev->result;
+    }
+
+    /* Walker path. */
     int idx = mk_captable_find(cap_id);
-    if (idx < 0) return -1;
-    int removed = do_revoke_subtree(idx);
-    g_stats.revoke_count++;
+    int removed;
+    if (idx < 0) {
+        removed = -1;
+    } else {
+        removed = do_revoke_subtree(idx);
+        g_stats.revoke_count++;
+    }
+    mk_rev_complete(rev, removed);
     return removed;
 }

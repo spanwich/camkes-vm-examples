@@ -25,6 +25,7 @@
 #include <multikernel/mht.h>
 #include <multikernel/threadmgr.h>
 #include <multikernel/kernelcall.h>
+#include <multikernel/revocations.h>
 
 #define POOL_PADDR              0x6FFE0000ull
 #define POOL_FRAME_SIZE         0x1000u
@@ -64,6 +65,22 @@ static inline int sync_wait(uint8_t *pool, uint16_t peer_kid,
 #endif
 
 static struct mht g_mht;
+
+/* Phase C.4 — concurrent revoke worker. The two-thread test launches
+ * this with the same cap_id; first thread becomes the walker, second
+ * subscribes via RevocationList and waits. */
+struct rev_arg {
+    mk_cap_id_t cap;
+    int         result;
+    int         finished;
+};
+
+static void rev_worker(void *raw)
+{
+    struct rev_arg *a = (struct rev_arg *)raw;
+    a->result   = mk_cap_revoke(a->cap);
+    a->finished = 1;
+}
 
 static void test_driver_kid0(void *raw)
 {
@@ -468,6 +485,87 @@ static void test_driver_kid0(void *raw)
         fflush(stdout);
     }
 
+    /* ----- Phase C.4: RevocationList — concurrent-revoke convergence -- */
+    {
+        /* Grant a parent cap with a cross-kernel child so the revoke
+         * walker yields (waits on K1's REVOKE_FINISH). While yielded,
+         * a second worker enters mk_cap_revoke on the same cap and
+         * must subscribe rather than start a duplicate walk. */
+        const uint16_t f = 0;  /* unused — root grant uses fresh cap */
+        (void)f;
+        mk_cap_id_t parent = MK_CAP_NONE, _src = MK_CAP_NONE;
+        if (mk_cap_grant(/*dst_kid=*/1, /*dst_vpe=*/2,
+                         MK_CAP_MEM, MK_PERM_RW, /*frame=*/4, 0xC400,
+                         MK_CAP_NONE, &parent, &_src) != 0) {
+            printf("[TEST C.4] cross-kernel grant FAILED\n");
+        } else {
+            /* Use the donor (src) cap — it's the parent of the placeholder
+             * for the K1 child, so revoking src walks to the placeholder
+             * and sends REVOKE_BATCH (yielding the walker). */
+            struct rev_arg a1 = { .cap = _src };
+            struct rev_arg a2 = { .cap = _src };
+            size_t before = mk_rev_size();
+            if (!mk_thread_spawn(rev_worker, &a1)) {
+                printf("[TEST C.4] spawn worker A FAILED\n");
+            } else if (!mk_thread_spawn(rev_worker, &a2)) {
+                printf("[TEST C.4] spawn worker B FAILED\n");
+            } else {
+                /* Yield repeatedly until both workers finish. The first
+                 * worker becomes the walker, the second subscribes. */
+                int budget = 2000000;
+                while (budget-- > 0 && !(a1.finished && a2.finished))
+                    mk_thread_yield();
+                size_t after = mk_rev_size();
+                /* Both must finish, both must report the same result
+                 * (subscriber inherits walker's result), and the table
+                 * must be empty post-completion. */
+                int both = a1.finished && a2.finished;
+                int same = both && (a1.result == a2.result);
+                if (both && same && a1.result >= 0 && after == before)
+                    printf("[TEST C.4] RevocationList converge: PASS "
+                           "(both workers got result=%d, RevList post-size=%zu)\n",
+                           a1.result, after);
+                else
+                    printf("[TEST C.4] RevocationList converge: FAIL "
+                           "fin=(%d,%d) res=(%d,%d) rev_size=%zu→%zu\n",
+                           a1.finished, a2.finished, a1.result, a2.result,
+                           before, after);
+            }
+        }
+        fflush(stdout);
+    }
+
+    /* ----- Phase C.4 TOCTOU: K0+K1 revoking overlapping subtrees ------ */
+    {
+        /* K0 holds donor of a chain to K1. K0 revokes its donor while
+         * K1's worker (set up in test_driver_kid1) revokes the placeholder
+         * locally. With RevocationList both kernels' walks converge:
+         * - K0's revoke triggers REVOKE_BATCH to K1
+         * - K1's local revoke (started ~simultaneously) collides with the
+         *   incoming REVOKE_BATCH; the second to attempt mk_rev_attach
+         *   subscribes rather than walking again
+         * - Final state: subtree fully revoked, no orphans, no double-frees. */
+        mk_cap_id_t p = MK_CAP_NONE, _src = MK_CAP_NONE;
+        if (mk_cap_grant(/*dst_kid=*/1, /*dst_vpe=*/2,
+                         MK_CAP_MEM, MK_PERM_RW, /*frame=*/4, 0xC4A0,
+                         MK_CAP_NONE, &p, &_src) == 0) {
+            /* Tell K1 to start its own revoke now. */
+            sync_set(pool, /*my_kid=*/0, /*go_c4_toctou=*/0xC4A1);
+            int rc_k0 = mk_cap_revoke(_src);
+            int p_gone = mk_captable_find(_src) < 0;
+            int placeholder_gone = mk_captable_find(p) < 0;
+            sync_wait(pool, /*peer_kid=*/1, /*done_c4=*/0xC4A2, 2000000);
+            if (rc_k0 >= 0 && p_gone && placeholder_gone)
+                printf("[TEST C.4-TOCTOU] overlapping concurrent revoke: PASS "
+                       "(K0 rc=%d, donor + placeholder both gone)\n", rc_k0);
+            else
+                printf("[TEST C.4-TOCTOU] overlapping concurrent revoke: FAIL "
+                       "rc=%d donor_gone=%d placeholder_gone=%d\n",
+                       rc_k0, p_gone, placeholder_gone);
+        }
+        fflush(stdout);
+    }
+
     /* ----- Phase C.2 TOCTOU: write-permitted check passes, revoke, retry */
     {
         /* Sequence: grant RW, check W=true, revoke, check W=false. The
@@ -640,6 +738,23 @@ static void test_driver_kid1(void *raw)
         else
             printf("[TEST 6] kid=1: cap_t6 lingers after revoke — FAIL\n");
         fflush(stdout);
+    }
+
+    /* ----- Phase C.4 TOCTOU on K1: race K0's revoke ------------------ */
+    {
+        /* Wait for K0 to signal "go" — at that moment K0's
+         * revoke is about to fire. We immediately try to revoke
+         * the same subtree on our side. Whichever side calls
+         * mk_rev_attach first walks; the other subscribes. */
+        if (sync_wait(pool, /*peer_kid=*/0, /*go_c4=*/0xC4A1, 2000000) == 0) {
+            mk_cap_id_t local = MK_CAP_ID(/*kid=*/1, /*vpe=*/2,
+                                          MK_CAP_MEM, /*frame=*/4);
+            /* Wait briefly for the cap to land. */
+            for (int i = 0; i < 1000 && mk_captable_find(local) < 0; ++i)
+                mk_thread_yield();
+            (void)mk_cap_revoke(local);
+            sync_set(pool, /*my_kid=*/1, /*done_c4=*/0xC4A2);
+        }
     }
 
     struct mk_kc_stats st;
